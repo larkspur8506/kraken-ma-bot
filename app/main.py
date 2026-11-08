@@ -570,18 +570,23 @@ def _mr_identity() -> tuple:
 
 
 def _build_mr_leg() -> Optional[Any]:
-    """装配 HL MR 腿。mode=off / 无地址 / 装配失败 → None（纯提醒模式不跑 MR）。"""
+    """装配 MR 腿。mode=off / 装配失败 → None（纯提醒模式不跑 MR）。"""
     p = hl_params()
     if p.mode == "off":
         return None
     try:
         from app.kr.exchange import KrExchange
-        from app.hl.mr import HlMrLeg
+        from app.hl.mr import HlMrConfig, HlMrLeg
         info = get_hl_info()
         ex = KrExchange(api_key=kr_api_key(), secret_b64=p.private_key,
                         base_url=p.base_url, dry_run=(p.mode == "dry"),
                         max_slippage_pct=p.max_slippage_pct, info=info)
-        return HlMrLeg(db=db, info=info, exchange=ex,
+        # Kraken 侧无 dex 限定名：coin 直接用 display coin「QQQ」（registry/specs/
+        # fills 全按 QQQ 口径）。复用 HlMrLeg 全部逻辑（唯一 1005 行 MR 执行器，
+        # 双线硬化不再分叉）；cross 语义由 KrExchange.update_leverage no-op +
+        # flex 全仓现实兜底（futures 钱包隔离替代逐仓）。
+        cfg = HlMrConfig(coin="QQQ", dex="kr")
+        return HlMrLeg(db=db, info=info, exchange=ex, config=cfg,
                        address_fn=lambda: hl_params().account_address,
                        notifier=notifier)
     except Exception as e:                                            # noqa: BLE001
