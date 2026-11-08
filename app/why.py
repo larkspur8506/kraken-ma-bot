@@ -16,8 +16,10 @@
 这里按 tick 同口径现取 K 线再算。
 
 缓存分三层，各自解决不同的问题：
-- `_FEED_CACHE`（K 线，TTL 120s）：面板连刷/多 Tab 不该每次都打行情接口。4h 级别的数据
-  120s 内不会变（新 bar 也在下一个 tick 才被处理），过期即重新取。
+- `_FEED_CACHE`（K 线，TTL 900s = `FEED_TTL_S`）：面板连刷/多 Tab 不该每次都打行情接口。
+  4h 级别的信号数据 900s 内不会变（新 bar 也在下一个 tick 才被处理），过期即重新取。
+  注意它只缓存**信号用的 K 线**；现价在本模块的缓存命中路径上仍取这份 K 线的最新一行
+  （见 build_rows），所以六步冻结、现价的最旧程度是 900s 而不是「一根 bar」。
 - `_WHY_CACHE`（六步，键 = 标的 + 最后一根已收盘 bar + 阈值指纹）：250 根分位计算
   ~0.4s/标的，只在「新 bar 收盘」或「参数变了」时重算 —— 参数指纹少一项就会出现
   「面板改完阈值，/why 还按旧门槛解释」这种最难自查的不一致。
@@ -284,6 +286,11 @@ def build_rows(db: Any, cfg: Any, symbols: Optional[Sequence[str]] = None,
             pos, note = _position_part(db, symbol)
             row = dict(cached)
             row["position"], row["note"] = pos, note
+            # 现价同样现读覆盖（审核 C5）：缓存键是「最后一根**已收盘** bar」，一根 4h，
+            # 而 `price` 存的是当时**未收盘**那根 bar 的 close —— 让缓存的 price 跟着六步
+            # 一起冻 4 小时，面板会显示一个几小时前的价格，而去查看盘面却对不上。
+            # 现价取本轮 feeds 的最新一根（它有自己的 900s TTL），六步结论仍走缓存。
+            row["price"] = float(bars[-1].close)
         else:
             try:
                 row = why_row(db, cfg, symbol, bars)

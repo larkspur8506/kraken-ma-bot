@@ -721,6 +721,28 @@ class TestWhyRows(WhyRowsBase):
         self.assertEqual(second["position"]["status"], "open")
         self.assertEqual(second["gate_side"], 1)
 
+    def test_price_not_frozen_by_six_step_cache(self):
+        """审核 C5：六步缓存按「最后一根已收盘 bar」命中（最长 4h），现价不能被它冻住。
+
+        缓存键是 bars[-2]（4h 一根），而 price 存的是当时那根**未收盘** bar 的 close；
+        缓存命中路径必须用本轮 feeds 的最新一根覆盖价格，否则面板会显示几小时前的价。
+        """
+        bars = _squeezed_breakout()[0]
+        first = self.rows(bars)[0]
+        self.assertAlmostEqual(first["price"], bars[-1].close, places=6)
+        self.assertEqual(len(why_mod._WHY_CACHE), 1)
+
+        # 模拟：行情 TTL 到了重新取了一根（同一根未收盘 bar 内价格在动），六步 bar 未变
+        newer = list(bars)
+        newer[-1] = _bar(len(bars) - 1, bars[-1].close * 1.37)
+        why_mod._FEED_CACHE["BTC_USDT"] = (time.time(), newer)
+        second = why_mod.build_rows(self.db, self.cfg, symbols=["BTC_USDT"],
+                                    fetch=lambda s, now=None: self._feed(newer))[0]
+        self.assertEqual(len(why_mod._WHY_CACHE), 1, "六步仍应命中缓存（同一根已收盘 bar）")
+        self.assertAlmostEqual(second["price"], newer[-1].close, places=6,
+                               msg="现价必须取本轮 feeds 的最新一根，不能被六步缓存冻住")
+        self.assertEqual(second["why"], first["why"], "六步结论本身仍走缓存（现价不参与判定）")
+
 
 class TestPanels(WhyRowsBase):
     """面板渲染：/why 的数据现在长在「三标的动态」卡片里（原「为什么没开仓」表格已合并掉）。"""

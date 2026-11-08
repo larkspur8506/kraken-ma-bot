@@ -595,9 +595,19 @@ def _mr_margin_used() -> float:
 
 
 def _mr_identity() -> tuple:
+    """MR 腿的装配指纹：**模式 / base_url / Kraken 凭据变了就重建**。
+
+    之前用 `sha256(private_key)` —— Kraken 版里 `hl_private_key` 是**遗留**入口
+    （只在 kr_secret 回落时读），把执行器的 HL 私钥塞进指纹意味着：换 Kraken key
+    不会重建腿（旧凭据继续用），而改动一个与 MR 无关的 HL 私钥却会重建。
+    改成 `(mode, base_url, sha256(kr_api_key:kr_secret))`：两者正是 MR 腿真正用的凭据，
+    且只留哈希前缀（明文不进内存指纹/日志）。地址不进指纹：Kraken 侧它是占位常量
+    （见 `KR_ADDRESS`），换地址不会换账户。
+    """
     p = hl_params()
-    fp = hashlib.sha256((p.private_key or "").encode()).hexdigest()[:12]
-    return (p.mode, p.account_address, fp, p.base_url)
+    secret = f"{kr_api_key()}:{kr_secret()}"
+    fp = hashlib.sha256(secret.encode()).hexdigest()[:12]
+    return (p.mode, p.base_url, fp)
 
 
 def _build_mr_leg() -> Optional[Any]:
@@ -616,7 +626,12 @@ def _build_mr_leg() -> Optional[Any]:
         # fills 全按 QQQ 口径）。复用 HlMrLeg 全部逻辑（唯一 1005 行 MR 执行器，
         # 双线硬化不再分叉）；cross 语义由 KrExchange.update_leverage no-op +
         # flex 全仓现实兜底（futures 钱包隔离替代逐仓）。
-        cfg = HlMrConfig(coin="QQQ", dex="kr")
+        # 手续费口径必须跟随配置（KR_TAKER_FEE）：`HlMrConfig.taker_fee_rate` 的默认值是
+        # 模块常量（写死的档位），改账号费率档时只改 env/配置不会生效 —— 显式传，让
+        # fee_est / funding 门槛与实际扣费同源。用关键字参数传（不动 dataclass 字段顺序，
+        # 位置参数不会错位）。
+        cfg = HlMrConfig(coin="QQQ", dex="kr",
+                         taker_fee_rate=float(getattr(current_config(), "kr_taker_fee", 0.000275)))
         return HlMrLeg(db=db, info=info, exchange=ex, config=cfg,
                        address_fn=lambda: hl_params().account_address,
                        notifier=notifier)
@@ -877,17 +892,19 @@ def _mount_hl_views() -> None:
 
 
 def _mount_hl_keyform() -> None:
-    """一次性私钥录入页：给「手机连不上 oracle1:22」时用的 HTTPS 通道。
+    """【已退役】一次性私钥录入页（原给「手机连不上 oracle1:22」时用 HTTPS 通道）。
 
-    注意鉴权方式不同：它用自己的一次性令牌（15 分钟、用过即废），**不是** ADMIN_TOKEN，
-    所以**不能**挂 hl_guard（否则还得带上 admin token）。
+    **Kraken 构建不挂载**（2026-11-08 审核 B10）：这个页面写的是 **HL 代理钱包私钥**
+    （`HL_PRIVATE_KEY` / env 文件）。切到 Kraken 后 `kr_secret()` 的兜底链是
+    「env KRAKEN_API_SECRET → DB kr_api_secret → **hl_private_key()**」，于是从这个页面
+    录进去的 HL 私钥会变成 Kraken 的 API secret：签名全错（每张单都以鉴权失败告终），
+    而页面还显示「✅ 已写入」。Kraken key 的唯一入口是面板「更新 API」（`_kr_renew`，
+    写 DB + 校验 base64），它没有 env 文件回退，也不需要这条隧道。
+
+    保留这个函数（而不是删掉装配调用）只为让装配层有一处显式开关与日志：将来若回到
+    HL 形态，恢复 include_router 那两行即可（`app/hl/keyform.py` 本身未改动）。
     """
-    try:
-        from app.hl.keyform import KeyFormDeps, build_router as build_key_router
-        app.include_router(build_key_router(KeyFormDeps.from_env(db)))
-        logger.info("已挂载 /admin/hl/key 私钥录入页（一次性令牌）")
-    except Exception as e:                                           # noqa: BLE001
-        logger.warning("挂载私钥录入页失败（不影响其他功能）：%s", e)
+    logger.info("跳过 /admin/hl/key 私钥录入页：Kraken 构建下该页会污染 kr_secret 回落链")
 
 
 # ---------------------------------------------------------------- 合并管理面板

@@ -260,7 +260,8 @@ class TestStatusPayload(BaseCase):
     def test_network_and_account_field_types(self):
         p = self.payload()
         n = p["network"]
-        self.assertEqual(n["base_url"], "https://api.hyperliquid.xyz")
+        # 2026-11-08 审核 C1：默认基址跟随线上 venue（Kraken 期货）
+        self.assertEqual(n["base_url"], "https://futures.kraken.com")
         self.assertIsInstance(n["testnet"], bool)
         self.assertTrue(n["reachable"])
         self.assertIsInstance(n["latency_ms"], (int, float))
@@ -531,7 +532,9 @@ class TestSystemAndReconcile(BaseCase):
         self.assertIsInstance(s["feed"], list)
         self.assertIsInstance(s["last_bar"], dict)
         self.assertIsInstance(s["stuck_orders"], int)
-        self.assertIsInstance(s["mismatch"], bool)
+        # 2026-11-08 审核 C1：对账改三态（True 不一致 / False 一致 / None 无法核对）。
+        # 这里快照可达，所以只能是前两种。
+        self.assertIn(s["mismatch"], (True, False))
 
     def test_mismatch_false_when_db_matches_snapshot(self):
         self.insert_position()      # BTC open + hl_stop_oid=7；快照有 BTC 和 BTC 触发单
@@ -586,17 +589,22 @@ class TestFailureModes(BaseCase):
         p = r.json()
         self.assertFalse(p["network"]["reachable"])
         self.assertIn("boom", p["network"]["error"])
-        self.assertEqual(p["network"]["base_url"], "https://api.hyperliquid.xyz")
+        # 2026-11-08 审核 C1：默认 base_url 跟随线上 venue（Kraken 期货），不再是 HL。
+        self.assertEqual(p["network"]["base_url"], "https://futures.kraken.com")
         self.assertEqual(p["positions"], [])
         self.assertEqual(p["orders_open"], [])
-        for k, v in p["account"].items():
-            if k == "address":
-                self.assertEqual(v, "0xTESTADDRESS123456")
-            elif isinstance(v, bool):
-                continue          # spot_ok 等标志位不是金额
-            else:
-                self.assertEqual(v, 0.0, f"account.{k} 应为 0")
-        self.assertEqual(p["account"]["funding_total"], 0.0)
+        # 读不到交易所时 account 的金额键必须是 None（不是 0.0）：0 会渲染成
+        # 「账户权益 0.00 U」，等于告诉用户「钱没了」
+        for k in ("equity", "perp_equity", "withdrawable", "margin_used", "notional",
+                  "spot_usdc", "spot_hold", "today_realized", "total_realized",
+                  "fees_total", "funding_total"):
+            self.assertIn(k, p["account"], f"缺少 {k}")
+            self.assertIsNone(p["account"][k], f"account.{k} 应为 None（未知，不是 0）")
+        self.assertEqual(p["account"]["address"], "0xTESTADDRESS123456")
+        self.assertIsInstance(p["account"]["spot_ok"], bool)
+        self.assertIsInstance(p["account"]["unified"], bool)
+        # 对账三态：快照没读到 → None（渲染层显示「无法核对」），不是 False
+        self.assertIsNone(p["system"]["mismatch"])
 
     def test_html_and_json_endpoints_match_on_failure(self):
         self.info.raise_ = True
@@ -612,7 +620,8 @@ class TestFailureModes(BaseCase):
         n = status_payload(deps)["network"]
         self.assertFalse(n["reachable"])
         self.assertEqual(n["error"], "未配置钱包地址")
-        self.assertEqual(status_payload(deps)["account"]["equity"], 0.0)
+        # 未知 ≠ 0（审核 C1）
+        self.assertIsNone(status_payload(deps)["account"]["equity"])
 
     def test_none_info_is_unreachable(self):
         from app.hl.views import status_payload
@@ -998,3 +1007,111 @@ class TestKrExecParams(unittest.TestCase):
         self.assertFalse(p0.below_min_notional, "0 = 不设限，必须放行")
         self.assertFalse([w for w in p0.warnings if "下限" in w],
                          "0 下限不该再冒「小于交易所下限」的告警")
+
+
+# ---------------------------------------------------------------- 2026-11-08 审核 C 组
+class TestAuditCPanelHonesty(BaseCase):
+    """审核 C 组回归：读不到交易所时，面板不许把「不知道」说成 0 / 说成「一致」。"""
+
+    def test_unreachable_page_shows_dash_not_zero_money(self):
+        self.info.raise_ = True
+        html = self.client.get("/hl").text
+        self.assertIn("可用保证金 <b>—</b>", html)
+        self.assertIn("账户权益 <b>— U</b>", html)
+        self.assertNotIn("可用保证金 <b>0.00 U</b>", html)
+        self.assertNotIn("账户权益 <b>0.00 U</b>", html)
+        # 对账三态：没读到 → 「无法核对」（不是「一致」）
+        self.assertIn("对账 <b>无法核对</b>", html)
+        self.assertNotIn("对账 <b>一致</b>", html)
+
+    def test_reconcile_three_states(self):
+        from app.hl.views import _reconcile
+        self.assertFalse(_reconcile(True, [], [], {}, []), "两边都空 = 一致")
+        self.assertTrue(_reconcile(True, [], [], {"BTC": {}}, []), "本地有仓交易所没有")
+        self.assertTrue(_reconcile(True, [{"coin": "ETH"}], [], {}, []), "交易所有仓本地没记")
+        self.assertIsNone(_reconcile(False, [], [], {}, []), "读不到 = 无法核对")
+        # 卡单只看本地 hl_orders：读不到交易所也照判不一致
+        self.assertTrue(_reconcile(False, [], [], {}, [{"id": 1}]))
+
+    def test_reachable_page_still_says_consistent(self):
+        self.insert_position()
+        html = self.client.get("/hl").text
+        self.assertIn("对账 <b>一致</b>", html)
+        self.assertNotIn("对账 <b>无法核对</b>", html)
+
+    def test_venue_address_free_hides_address_row(self):
+        self.info.venue_address_free = True
+        p = self.payload()
+        self.assertTrue(p["venue_address_free"])
+        html = render_dashboard(p)
+        self.assertNotIn("钱包地址", html)
+
+    def test_venue_address_free_empty_address_is_still_reachable(self):
+        """Kraken 没有地址概念：address 为空不是配置缺失，快照照常拉。"""
+        from app.hl.views import DashboardDeps, status_payload
+        self.info.venue_address_free = True
+        deps = DashboardDeps(db=self.db, config_fn=lambda: None, info=self.info,
+                             address_fn=lambda: "", mode_fn=lambda: "live")
+        p = status_payload(deps)
+        self.assertTrue(p["network"]["reachable"])
+        self.assertEqual(p["network"]["error"], "")
+        self.assertAlmostEqual(p["account"]["equity"], 1200.0)
+
+    def test_total_realized_and_fees_use_whole_table(self):
+        """累计已实现/净手续费走全表聚合：成交 >2000 条时不许只剩「最近 2000 条」。"""
+        rows = [(f"t{i}", "BTC_USDT", "BTC", 1, 0.05, 101_000.0, 0.01, "USDT", 0.01, "a",
+                 1000.0 if i < 5 else 0.0, None, 0, None, int(FIXED_NOW * 1000), FIXED_NOW)
+                for i in range(2005)]
+        self.db.conn.executemany(
+            "INSERT OR IGNORE INTO hl_fills(tid, symbol, coin, side, sz, px, fee, fee_token,"
+            " fee_quote, dir, closed_pnl, hash, reduce_only, oid, ts, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        self.db.conn.commit()
+        a = self.payload()["account"]
+        self.assertAlmostEqual(a["total_realized"], 5000.0, places=6,
+                               msg="最老那 5 笔（各 1000）不能被 2000 条窗口挤掉")
+        self.assertAlmostEqual(a["fees_total"], 2005 * 0.01, places=6)
+
+    def test_fills_totals_falls_back_to_fee_when_fee_quote_missing(self):
+        self.db.hl_upsert_fill(tid="old", symbol="BTC_USDT", coin="BTC", side=1, sz=1.0,
+                               px=100.0, fee=0.3, fee_token=None, fee_quote=None,
+                               dir="Close Long", closed_pnl=2.0, hash="old", ts=1)
+        pnl, fee = self.db.fills_totals()
+        self.assertAlmostEqual(pnl, 2.0, places=6)
+        self.assertAlmostEqual(fee, 0.3, places=6, msg="fee_quote 为 NULL 的老行按 fee 计")
+
+    def test_mr_leg_position_does_not_flag_manual_order(self):
+        """MR 腿（QQQ）在同一 Kraken 账户里，但不在 positions 表 → 不许判「人工单」。"""
+        self.insert_position()          # BTC open + hl_stop_oid=7（快照里有对应止损单）
+        self.info._snap = fake_snapshot(extra_positions=[
+            {"coin": "QQQ", "side": 1, "size": 2.0, "entry_px": 600.0, "mark_px": 606.0,
+             "position_value": 1212.0, "liq_px": None, "leverage": None, "isolated": False,
+             "margin_used": 121.2, "unrealized_pnl": 12.0, "roe": 0.099,
+             "funding_since_open": 0.0}])
+        p = self.payload()
+        self.assertFalse(p["system"]["mismatch"], "QQQ 是 MR 腿，不是人工单")
+        self.assertIn("对账 <b>一致</b>", render_dashboard(p))
+
+    def test_mr_leg_exclusion_keeps_main_symbol_strict(self):
+        """排除只针对非主策略标的：主策略标的（ETH）在交易所有仓、本地没记 → 仍判不一致。"""
+        self.insert_position()
+        self.info._snap = fake_snapshot(extra_positions=[
+            {"coin": "ETH", "side": -1, "size": 1.0, "entry_px": 3000.0, "mark_px": 3010.0,
+             "position_value": 3010.0, "liq_px": None, "leverage": None, "isolated": False,
+             "margin_used": 100.0, "unrealized_pnl": -10.0, "roe": -0.1,
+             "funding_since_open": 0.0}])
+        self.assertTrue(self.payload()["system"]["mismatch"])
+
+    def test_agent_no_expiry_when_info_missing(self):
+        """info=None 时不回读 HL 遗留的 hl_agent_state（那是 HL 时代的假到期日）。"""
+        from app.hl import agent as agent_mod
+        from app.hl.views import DashboardDeps, status_payload
+        agent_mod.write_state(self.db, {"valid_until_ms": int(time.time() * 1000) + 169 * 86400 * 1000,
+                                        "level": "ok", "days_left": 169})
+        deps = DashboardDeps(db=self.db, config_fn=lambda: None, info=None,
+                             address_fn=lambda: "0xA", mode_fn=lambda: "live")
+        ag = status_payload(deps)["agent"]
+        self.assertEqual(ag.get("level"), "no_expiry")
+        self.assertEqual(ag.get("source"), "kraken-key-no-expiry")
+        self.assertIsNone(ag.get("days_left"))
+

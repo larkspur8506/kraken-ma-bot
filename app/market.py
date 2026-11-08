@@ -1,15 +1,19 @@
-"""行情取数：**实盘信号用交易场所自己的 K 线**（HL），其他源只作诊断（纯 stdlib）。
+"""行情取数：**实盘信号用交易场所自己的 K 线**（Kraken charts v1），其他源只作诊断（纯 stdlib）。
 
-为什么主源是 HL：下单、止损、成交全在 HL 进行，信号却拿别家交易所的 K 线 = 拿 A 家行情做
-B 家交易。实测（2024-07~2026-10 同窗口、同一套线上规则）：HL 与 Binance 的 4h 收盘价中位差
-4 bps、最大 24 bps，97~98% 的信号一致、方向无翻转，但有 **2~3% 的边缘信号会因换源而出现/
-消失** —— 擦着均线边界的那些笔，由谁的数据决定。所以实盘必须与交易场所同源。
+为什么主源必须与交易场所同源：下单、止损、成交都在 Kraken Futures 进行，信号却拿别家
+交易所的 K 线 = 拿 A 家行情做 B 家交易。实测（2024-07~2026-10 同窗口、同一套线上规则，
+HL/Binance 对照）：两源 4h 收盘价中位差 4 bps、最大 24 bps，97~98% 的信号一致、方向无
+翻转，但有 **2~3% 的边缘信号会因换源而出现/消失** —— 擦着均线边界的那些笔，由谁的数据
+决定。所以实盘必须与交易场所同源。
 
-- 主源：`POST https://api.hyperliquid.xyz/info` {"type":"candleSnapshot"}（公开、无鉴权，
-  4h，返回最近 5000 根 = 约 833 天，**最后一根是未收盘的当前 bar**）。
+- 主源（`SOURCES`）：`GET {base}/api/charts/v1/trade/{sym}/4h`（公开、无鉴权，from/to
+  单位是**秒**，单页 2000 根；**最后一根是未收盘的当前 bar**）。
+- `_hyperliquid()` 保留为**死代码/历史对照**（迁移前的主源），已不在 `SOURCES` 里；
+  不删是为避免历史测试与文档大面积连带改动，改回主源前必须先做两源信号一致性验证。
 - **fail-closed**：主源失败就抛 FeedError → 引擎转成「数据源异常」提醒并跳过本轮，
   **绝不悄悄用别家交易所的数据去下单**。降级链只在 `allow_fallback=True`（诊断/展示）时启用。
-- 校验：根数 ≥ MIN_BARS_REQUIRED、时间单调、最后一根已收盘且新鲜。
+- 校验：根数 ≥ MIN_BARS_REQUIRED+1、时间单调且等距、价格合法、**最后一根必须是进行中
+  的 bar**，且上一根收盘距今不超过 STALE_TOLERANCE_MS。
 """
 from __future__ import annotations
 
@@ -241,6 +245,13 @@ def validate(symbol: str, bars: List[Bar], now_ms: Optional[int] = None) -> None
         raise FeedError(f"{symbol}: 数据陈旧，最后一根收盘距今 {age / 3600000:.1f} 小时")
     if age < -INTERVAL_MS:
         raise FeedError(f"{symbol}: 时间戳超前")
+    # 最后一根必须是**进行中**的 bar：Feed.closed 丢掉它、current_open 拿它的开盘价
+    # 当入场参考。若末根已经收盘（典型：数据源少给当前 bar），"current_open" 就成了
+    # 一根走完的 bar 的开盘价 —— 入场价整整错一根。（更久远的缺口先被上面的「陈旧」
+    # 拦下，这里专拦「只差当前那一根」这种最容易被忽略的形态。）
+    if now_ms >= bars[-1].open_ms + INTERVAL_MS:
+        raise FeedError(
+            f"{symbol}: 最后一根不是进行中的 bar（末根已收盘，缺当前 bar）")
 
 
 def fetch(symbol: str, now_ms: Optional[int] = None, allow_fallback: bool = False) -> Feed:

@@ -8,9 +8,10 @@ snapshot() 返回**冻结接口**（与 HlInfo.snapshot 同形状，另含统一
  unified, spot_usdc}
 
 已知数据缺口（2026-11-08，OpenAPI 逐字段核对）：
-- /fills 不带 fee / reduceOnly，但**带 realized_pnl 与 sequence_id**：平仓盈亏优先
-  用交易所真值，历史页（lastFillTime 路径）为 null 时才按净仓推演；fee 缺失按
-  taker 估并标 fee_estimated，`feeToken` 恒为 "USD"（fee 已折算成 USD 金额）。
+- /fills 不带 fee / reduceOnly，但**带 realized_pnl、fillType 与 sequence_id**：平仓盈亏
+  优先用交易所真值，历史页（lastFillTime 路径）为 null 时才按净仓推演；fee 按 fillType
+  取费率估（maker 0.75bp / 其余 taker 2.75bp）并标 fee_estimated，`feeToken` 恒为
+  "USD"（fee 已折算成 USD 金额）。
   dir/reduce_only 仍由成交序列推演，**dir 用 HL 原生大小写**（"Open Long" /
   "Close Long" / "Open Short" / "Close Short"）—— executor、pnl、面板的
   `"Long" in dir` / `"Close" in dir` / `_FILL_BS` 精确键全按这个契约写。
@@ -232,7 +233,10 @@ class KrInfo:
                     im = DEFAULT_INITIAL_MARGIN
                 out[coin] = {"sz_decimals": sz_dec, "szDecimals": sz_dec,
                              "price_tick": tick, "price_decimals": _decimals_of(tick),
-                             "contract_size": _num(i.get("contractSize"), 0.0) or 1.0,
+                             # 面值缺失就保留 0（**不兜 1.0**）：兜成 1 会让「本系统按
+                             # 币量下单」这个前提悄悄成立，真遇到非 1 面值合约 = 按面值
+                             # 倍数超量下单。留 0 → contract_size() 抛错 → place_order 拒单。
+                             "contract_size": _num(i.get("contractSize"), 0.0),
                              "initial_margin": im,
                              "max_leverage": lev, "maxLeverage": lev}
             if out:
@@ -380,13 +384,17 @@ class KrInfo:
             raise KrInfoError(f"openpositions 读取失败：{e}") from e
         for item in rows:
             sym = str(item.get("symbol") or "")
-            coin = registry.kr_coin(sym)
-            if not coin:
-                continue
-            side_txt = str(item.get("side") or "").strip().lower()
             size = abs(_num(item.get("size")))
             if size <= 0:
+                # 0 张 = 没有敞口（对账/平仓后残留行），与认不认识这个合约无关
                 continue
+            coin = registry.kr_coin(sym)
+            if not coin:
+                # 有量的未知合约持仓 = 账户里有本系统不认识的敞口：既不能读成 0
+                # （对账会判成「交易所无仓」后加倍开仓），也不能静默忽略
+                # → 整轮 fail-closed。
+                raise KrInfoError(f"未识别的 Kraken 合约持仓：{sym or '<空 symbol>'}（fail-closed）")
+            side_txt = str(item.get("side") or "").strip().lower()
             if side_txt not in ("long", "short"):
                 # 有仓却读不出方向 = 数据不可信，宁可整轮 fail-closed
                 raise KrInfoError(f"{sym} 持仓方向缺失（side={side_txt!r}）")
@@ -405,10 +413,17 @@ class KrInfo:
             # ROE 缩小 20 倍（对抗审查 P1-4）。
             im = self._initial_margin(coin)
             margin_est = value * im
+            # unrealizedFunding **显式判 None**：旧写法 `a or b` 在 a==0.0 时也会
+            # 落到 b，把一个真实「资金费恰好为 0」的仓位读成别的字段。
+            funding = item.get("unrealizedFunding")
+            if funding is None:
+                funding = item.get("realizedFundingPnl")
             out.append({
                 "coin": coin, "side": side, "size": size, "entry_px": entry,
                 "mark_px": mark, "position_value": value,
-                "liq_px": _num(item.get("liquidationThresholdPrice")),  # 全仓口径无逐仓强平价
+                # 官方 OpenPositionJson **没有**强平价字段（也没有 liquidationThresholdPrice），
+                # 全仓口径下不存在「逐仓强平价」这个概念，所以给 None，不编公式。
+                "liq_px": None,
                 # 全仓无「逐仓杠杆」这个量：给 None 让面板显示「全仓」，
                 # 而不是编一个 100x 冒充用户设置的杠杆（跨组契约，2026-11-08）。
                 "leverage": None, "isolated": False,          # flex 只有 cross
@@ -417,8 +432,7 @@ class KrInfo:
                 "margin_used_estimated": 1,
                 "unrealized_pnl": upnl,
                 "roe": (upnl / margin_est) if margin_est > 0 else 0.0,
-                "funding_since_open": _num(item.get("unrealizedFunding")
-                                           or item.get("realizedFundingPnl")),
+                "funding_since_open": _num(funding),
             })
         return out
 
@@ -445,6 +459,9 @@ class KrInfo:
             sym = str(o.get("symbol") or "")
             coin = registry.kr_coin(sym)
             if not coin:
+                # 挂单里出现未知合约：不影响本系统仓位/止损判定（挂单不是敞口），
+                # 但必须留痕——静默跳过会让「有单撤不掉」变成无感故障。
+                logger.warning("[kr-info] openorders 含未识别合约，已跳过：%s", sym or "<空 symbol>")
                 continue
             stop = _num(o.get("stopPrice"))
             otype = str(o.get("orderType") or "").strip().lower()
@@ -485,6 +502,8 @@ class KrInfo:
         side / symbol / order_id / sequence_id / realized_pnl。**没有** orderId/seq/
         fee（对抗审查 P0：旧代码把 ISO 时间 float() 成 0、orderId 读空、且只取最近
         100 条不分页 —— 面板成交记录空、按时段过滤全空、净仓推演起点错）。
+
+        fee 估算按 fillType 分档（maker/taker），不是一律 taker。
 
         分页语义（官方）：不传参 = 最近 100 条（带 realized_pnl）；传 lastFillTime =
         该时间**之前**的 100 条（历史页 realized_pnl 为 null，用推演补）。
@@ -571,7 +590,11 @@ class KrInfo:
                 closed_val, closed_src = closed, "derived"
             else:
                 closed_val, closed_src = _num(rp), "exchange"
-            fee_usd = sz * px * self._taker_fee
+            # 费率按 fillType 选：maker 单走 maker 费率（默认 0.75bp），其余按 taker
+            # （2.75bp）。全程用 taker 会把挂单成交的手续费高估 3.7 倍。
+            fill_type = str(f.get("fillType") or "").strip().lower()
+            fee_rate = self._maker_fee if fill_type == "maker" else self._taker_fee
+            fee_usd = sz * px * fee_rate
             out.append({
                 "coin": coin, "px": px, "sz": sz, "side": "buy" if is_buy else "sell",
                 "time": t, "hash": f"kr:{tid}", "dir": direction,

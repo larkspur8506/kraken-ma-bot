@@ -318,18 +318,20 @@ class TestRecordsTab(BaseCase):
 
     def test_records_200_with_key_blocks(self):
         html = self.body(tab="records")
-        for s in ("下单记录", "成交", "信号", "提醒日志", "执行器事件",
-                  "hl_orders", "hl_fills"):
+        for s in ("下单记录", "成交", "信号", "提醒日志", "执行器事件"):
             self.assertIn(s, html)
+        # 2026-11-08 审核 C3：记录页标题不再写内部表名（那属于排障细节，不是给用户看的）
+        for bad in ("hl_orders", "hl_fills", "alert_logs", "hl_events"):
+            self.assertNotIn(bad, html, f"记录页不该出现内部表名 {bad}")
 
     def test_records_signal_block_after_fills(self):
         """信号块必须在「成交」之后、提醒日志之前（与总览原顺序一致）。"""
         html = self.body(tab="records")
-        i_orders = html.index("下单记录（hl_orders")
-        i_fills = html.index("成交（hl_fills")
+        i_orders = html.index("下单记录（最近")
+        i_fills = html.index("成交（最近")
         i_signals = html.index("<h2>信号</h2>")
-        i_alerts = html.index("提醒日志（alert_logs")
-        i_events = html.index("执行器事件（hl_events")
+        i_alerts = html.index("提醒日志（最近")
+        i_events = html.index("执行器事件（最近")
         self.assertLess(i_orders, i_fills)
         self.assertLess(i_fills, i_signals, "信号块应紧跟「成交」之后")
         self.assertLess(i_signals, i_alerts)

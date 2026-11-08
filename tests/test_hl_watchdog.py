@@ -277,6 +277,63 @@ class TestKrakenAdaptation(Base):
         self.assertEqual(self.bad(notes), [])
 
 
+class TestVenueAddressFree(Base):
+    """2026-11-08 审核 C4：Kraken 没有钱包地址概念，不许拿「env 没填」当配置缺失。
+
+    以前 `not address` 就跳过整段交易所侧检查 —— 生产 compose 里 HL_ACCOUNT_ADDRESS
+    只是占位常量（可能为空），一旦为空，实盘的仓位/止损检查就整块静默消失。
+    """
+
+    def _kraken_info(self, positions=None, orders=None):
+        snap = _snap(positions=positions or [], orders=orders or [])
+
+        class _Kr:
+            venue_address_free = True
+
+            def snapshot(self, address):
+                return snap
+
+            def agent_status(self, address):
+                return {"kind": "kraken-api", "expires": None, "days_left": None}
+
+        return _Kr()
+
+    def test_no_env_address_still_checks_positions(self):
+        self._heartbeat()
+        naked = _pos(coin="BTC", size=0.01, entry=100_000.0)
+        with mock.patch.dict(os.environ, {"HL_ACCOUNT_ADDRESS": ""}, clear=False):
+            notes = self.checks()          # 先用普通 info 拿基线（会警告未配置）
+            self.assertIn("未配置 HL_ACCOUNT_ADDRESS", " ".join(notes))
+            notes = watchdog.run_checks(self.db, info=self._kraken_info(positions=[naked]),
+                                        mode=MODE_LIVE, force=True)
+        joined = " ".join(notes)
+        self.assertNotIn("未配置 HL_ACCOUNT_ADDRESS", joined, "venue 无地址概念，不许报未配置")
+        self.assertIn("没有止损挂单", joined, "仓位检查必须照常跑（否则实盘无看守）")
+        self.assertIn("仓位", joined)
+
+    def test_equity_text_is_kraken_derivatives_account(self):
+        self._heartbeat()
+        snap = _snap(positions=[], orders=[])
+        snap.update({"unified": True, "equity": 1234.5, "equity_total": 1234.5,
+                     "withdrawable": 1000.0, "margin_used": 0.0, "spot_usdc": 1000.0})
+        info = self._kraken_info()
+        info.snapshot = lambda address: snap
+        notes = watchdog.run_checks(self.db, info=info, mode=MODE_LIVE, force=True)
+        joined = " ".join(notes)
+        self.assertIn("Kraken 衍生品账户", joined)
+        self.assertNotIn("现货", joined, "Kraken 不拆现货/合约，别写不存在的结构")
+        self.assertNotIn("浮动盈亏", joined)
+
+    def test_clock_skew_text_no_nonce_claim(self):
+        self._heartbeat()
+        self.skew.stop()
+        self.skew = mock.patch.object(watchdog, "check_clock_skew", return_value=5.7)
+        self.skew.start()
+        joined = " ".join(self.bad(self.checks()))
+        self.assertIn("时间戳对齐", joined)
+        self.assertNotIn("nonce", joined, "Kraken 签名请求没有 HL 的 nonce 概念")
+
+
 class TestAgentExpiry(Base):
     """agent（API 钱包）授权到期必须提前告警 —— 到期后所有下单会被拒。"""
 

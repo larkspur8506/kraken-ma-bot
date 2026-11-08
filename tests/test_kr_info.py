@@ -112,6 +112,58 @@ class TestSnapshot(unittest.TestCase):
         with self.assertRaises(KrInfoError):
             _mk(ep).snapshot("kr")
 
+    def test_unknown_position_coin_fails_closed(self):
+        """未知合约**有量**的持仓 → 抛错（不能读成空仓，否则对账会加倍开仓）。"""
+        ep = _StubEp(account=ACC, positions=[{
+            "symbol": "PF_LTCUSD", "side": "long", "size": 5.0, "price": 90.0}])
+        with self.assertRaises(KrInfoError) as ctx:
+            _mk(ep).snapshot("kr")
+        self.assertIn("PF_LTCUSD", str(ctx.exception))
+
+    def test_zero_size_unknown_row_ignored(self):
+        """0 张的未知合约行 = 没有敞口，不该把整轮读挂掉。"""
+        ep = _StubEp(account=ACC, positions=[
+            {"symbol": "PF_LTCUSD", "side": "long", "size": 0.0},
+            {"symbol": "PF_XBTUSD", "side": "long", "size": 0.01, "price": 74000.0}],
+            tickers=[{"symbol": "PF_XBTUSD", "markPrice": 75000.0}])
+        snap = _mk(ep).snapshot("kr")
+        self.assertEqual([p["coin"] for p in snap["positions"]], ["BTC"])
+
+    def test_liq_px_is_none(self):
+        """官方 OpenPositionJson 无强平价字段 → 恒 None（不编公式）。"""
+        ep = _StubEp(account=ACC, positions=[{
+            "symbol": "PF_XBTUSD", "side": "long", "size": 0.01, "price": 74000.0,
+            "liquidationThresholdPrice": 60000.0}],
+            tickers=[{"symbol": "PF_XBTUSD", "markPrice": 75000.0}])
+        self.assertIsNone(_mk(ep).snapshot("kr")["positions"][0]["liq_px"])
+
+    def test_funding_zero_not_falling_back_to_other_field(self):
+        """unrealizedFunding=0.0 是真实值，不能被 `or` 跳到 realizedFundingPnl。"""
+        ep = _StubEp(account=ACC, positions=[{
+            "symbol": "PF_XBTUSD", "side": "long", "size": 0.01, "price": 74000.0,
+            "unrealizedFunding": 0.0, "realizedFundingPnl": -3.5}],
+            tickers=[{"symbol": "PF_XBTUSD", "markPrice": 75000.0}])
+        self.assertAlmostEqual(_mk(ep).snapshot("kr")["positions"][0]["funding_since_open"], 0.0)
+
+    def test_funding_falls_back_when_unrealized_missing(self):
+        ep = _StubEp(account=ACC, positions=[{
+            "symbol": "PF_XBTUSD", "side": "long", "size": 0.01, "price": 74000.0,
+            "realizedFundingPnl": -3.5}],
+            tickers=[{"symbol": "PF_XBTUSD", "markPrice": 75000.0}])
+        self.assertAlmostEqual(_mk(ep).snapshot("kr")["positions"][0]["funding_since_open"], -3.5)
+
+    def test_unknown_order_coin_skipped_with_warning(self):
+        """未知合约**挂单** → warning + 跳过（挂单不是敞口，不影响仓位判定）。"""
+        ep = _StubEp(account=ACC, orders=[
+            {"order_id": "x-1", "symbol": "PF_LTCUSD", "side": "buy",
+             "unfilledSize": 1.0, "limitPrice": 90.0, "orderType": "lmt"},
+            {"order_id": "x-2", "symbol": "PF_XBTUSD", "side": "sell",
+             "unfilledSize": 0.01, "limitPrice": 76000.0, "orderType": "lmt"}])
+        with self.assertLogs("app.kr.info", level="WARNING") as cap:
+            snap = _mk(ep).snapshot("kr")
+        self.assertEqual([o["oid"] for o in snap["open_orders"]], ["x-2"])
+        self.assertTrue(any("PF_LTCUSD" in line for line in cap.output))
+
     def test_openorders_trigger_mapping(self):
         ep = _StubEp(account=ACC, orders=[{
             "order_id": "abc-1", "symbol": "PF_ETHUSD", "side": "sell",
@@ -166,6 +218,21 @@ class TestFills(unittest.TestCase):
         self.assertEqual(out[1]["feeToken"], "USD")
         # ISO 时间必须解析（旧代码 0 → 按时段过滤永远为空）
         self.assertGreater(out[0]["time"], 1_700_000_000_000)
+
+    def test_maker_fill_uses_maker_fee(self):
+        """fillType=maker → 按 maker 费率（0.75bp）估，不再一律 taker。"""
+        fills = [{"fill_id": "m1", "symbol": "PF_XBTUSD", "side": "buy", "size": 0.01,
+                  "price": 74000.0, "fillTime": "2026-11-01T00:00:00Z", "fillType": "maker"}]
+        out = _mk(_StubEp(fills=fills)).user_fills("kr")
+        self.assertAlmostEqual(out[0]["fee"], 74000 * 0.01 * 0.000075)
+        self.assertEqual(out[0]["feeToken"], "USD")
+        self.assertEqual(out[0]["fee_estimated"], 1)
+
+    def test_taker_fill_uses_taker_fee(self):
+        fills = [{"fill_id": "t1", "symbol": "PF_XBTUSD", "side": "buy", "size": 0.01,
+                  "price": 74000.0, "fillTime": "2026-11-01T00:00:00Z", "fillType": "taker"}]
+        out = _mk(_StubEp(fills=fills)).user_fills("kr")
+        self.assertAlmostEqual(out[0]["fee"], 74000 * 0.01 * 0.000275)
 
     def test_open_short_then_close_short(self):
         fills = [
@@ -324,6 +391,25 @@ class TestSpecs(unittest.TestCase):
     def test_unknown_symbol_ignored(self):
         ep = _StubEp(instruments=[{"symbol": "PF_LTCUSD", "tickSize": 0.1}])
         self.assertEqual(_mk(ep).specs(), {})
+
+    def test_missing_contract_size_kept_zero_and_raises(self):
+        """跨组契约：contractSize 缺失 → 保留 0（**不再兜 1.0**），contract_size() 抛错。
+
+        兜成 1.0 会让「本系统按币量下单」这个前提在非 1 面值合约上悄悄成立
+        = 按面值倍数超量下单。
+        """
+        ep = _StubEp(instruments=[{"symbol": "PF_XBTUSD", "tickSize": 1,
+                                   "contractValueTradePrecision": 4}])
+        info = _mk(ep)
+        self.assertEqual(info.specs()["BTC"]["contract_size"], 0.0)
+        with self.assertRaises(KrInfoError):
+            info.contract_size("BTC")
+
+    def test_explicit_contract_size_preserved(self):
+        ep = _StubEp(instruments=[{"symbol": "PF_XBTUSD", "tickSize": 1,
+                                   "contractValueTradePrecision": 4,
+                                   "contractSize": 1.0}])
+        self.assertAlmostEqual(_mk(ep).contract_size("BTC"), 1.0)
 
     def test_round_price_to_tick(self):
         ep = _StubEp(instruments=[

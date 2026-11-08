@@ -13,7 +13,14 @@ from app.kr.exchange import (KrExchange, _coerce_cloid, make_cloid,
 
 
 class _StubInfo:
-    """生产 KrInfo 的价格取整钩子（BTC tick=1 / ETH tick=0.1）。"""
+    """生产 KrInfo 的价格取整/面值钩子（BTC tick=1 / ETH tick=0.1）。
+
+    `contract_size_value=None` 模拟 /instruments 缺 contractSize：KrInfo.contract_size()
+    会抛 KrInfoError（不再兜 1.0），place_order 必须据此拒单。
+    """
+
+    def __init__(self, contract_size_value=1.0):
+        self._cs = contract_size_value
 
     def all_mids(self, dex=""):
         return {"BTC": 75000.0}
@@ -22,10 +29,21 @@ class _StubInfo:
         tick = {"BTC": 1.0, "ETH": 0.1, "SOL": 0.01, "QQQ": 0.1}[coin]
         return round(round(float(px) / tick) * tick, 6)
 
+    def contract_size(self, coin):
+        if self._cs is None:
+            from app.kr.info import KrInfoError
+            raise KrInfoError(f"{coin} 取不到 contractSize（fail-closed）")
+        return self._cs
+
+    def open_orders_checked(self, address=""):
+        return [{"coin": "BTC", "oid": "o-1"}], True
+
 
 class _StubEndpoints:
-    def __init__(self, resp=None):
+    def __init__(self, resp=None, cancel_resp=None):
         self.resp = resp or {"result": "success"}
+        self.cancel_resp = cancel_resp if cancel_resp is not None else {
+            "result": "success", "cancelStatus": {"status": "cancelled", "order_id": "x"}}
         self.calls = []
         self.cancel_calls = []
         self.cancel_all_calls = []
@@ -39,16 +57,18 @@ class _StubEndpoints:
 
     def cancelorder(self, oid):
         self.cancel_calls.append(oid)
-        return {"result": "success"}
+        if isinstance(self.cancel_resp, Exception):
+            raise self.cancel_resp
+        return self.cancel_resp
 
     def cancelallorders(self, symbol=""):
         self.cancel_all_calls.append(symbol)
         return {"result": "success"}
 
 
-def _mk_ex(endpoints=None):
+def _mk_ex(endpoints=None, info=None):
     return KrExchange(api_key="k", secret_b64="aaaa", dry_run=False,
-                      info=_StubInfo(), endpoints=endpoints or _StubEndpoints())
+                      info=info or _StubInfo(), endpoints=endpoints or _StubEndpoints())
 
 
 def _exec_ok(oid="o-1", amount=0.001, price=74900.0, status="filled"):
@@ -75,7 +95,8 @@ class TestPlaceOrder(unittest.TestCase):
         self.assertEqual(p["symbol"], "PF_XBTUSD")
         self.assertEqual(p["side"], "buy")
         self.assertEqual(p["limitPrice"], "75200.0")
-        self.assertEqual(p["reduceOnly"], "false")
+        # 跨组契约：reduceOnly=false **不传键**（不是传字符串 "false"）
+        self.assertNotIn("reduceOnly", p)
         self.assertIn("cliOrdId", p)
 
     def test_price_rounded_to_tick(self):
@@ -98,6 +119,20 @@ class TestPlaceOrder(unittest.TestCase):
         self.assertEqual(p["triggerSignal"], "mark")
         self.assertEqual(p["stopPrice"], "73000.0")        # mark 触发价按 tick 取整
         self.assertEqual(p["reduceOnly"], "true")
+
+    def test_stop_without_reduce_only_omits_key(self):
+        """止损单不传 reduce_only → 同样不传该键（缺省即 false）。"""
+        ep = _StubEndpoints({"result": "success", "sendStatus": {
+            "status": "placed", "order_id": "o-2",
+            "orderEvents": [{"type": "PLACE", "order": {"orderId": "o-2"}}]}})
+        _mk_ex(ep).place_order("BTC", False, 0.001, 0.0, reduce_only=False,
+                               trigger_px=73000.0)
+        self.assertNotIn("reduceOnly", ep.calls[0])
+
+    def test_ioc_reduce_only_sends_string_true(self):
+        ep = _StubEndpoints(_exec_ok())
+        _mk_ex(ep).place_order("BTC", False, 0.001, 75000.0, reduce_only=True)
+        self.assertEqual(ep.calls[0]["reduceOnly"], "true")
 
     def test_reject_maps_to_error(self):
         ep = _StubEndpoints({"result": "error",
@@ -250,6 +285,177 @@ class TestOrderResponseOid(unittest.TestCase):
         ep = _StubEndpoints(_exec_ok())
         _mk_ex(ep).place_order("BTC", True, 0.001, 75200.0, cloid="entry:btc_4h.1")
         self.assertEqual(ep.calls[0]["cliOrdId"], "entry:btc_4h.1")
+
+
+class TestOrderStatusMachine(unittest.TestCase):
+    """跨组契约（2026-11-08）：只认交易所明说的状态，编造成交价一律 fail-closed。"""
+
+    def test_placed_resting_not_executed_false(self):
+        out = parse_order_response({"result": "success", "sendStatus": {
+            "status": "placed", "order_id": "o-1"}})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], STATUS_RESTING)
+        self.assertFalse(out["not_executed"])
+
+    def test_untouched_and_edited_are_resting(self):
+        for st in ("untouched", "edited"):
+            out = parse_order_response({"result": "success", "sendStatus": {
+                "status": st, "order_id": "o-1"}})
+            self.assertTrue(out["ok"], st)
+            self.assertEqual(out["status"], STATUS_RESTING, st)
+            self.assertFalse(out["not_executed"], st)
+
+    def test_cancelled_is_resting_not_executed(self):
+        out = parse_order_response({"result": "success", "sendStatus": {
+            "status": "cancelled", "order_id": "o-1"}})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], STATUS_RESTING)
+        self.assertTrue(out["not_executed"])
+
+    def test_filled_without_execution_detail_fails_closed(self):
+        """说 filled 却没 EXECUTION 明细 → ok=False（绝不编造成交价/量）。"""
+        out = parse_order_response({"result": "success", "sendStatus": {
+            "status": "filled", "order_id": "o-1"}})
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["status"], STATUS_ERROR)
+        self.assertIsNone(out["avg_px"])
+        self.assertIsNone(out["filled_sz"])
+        self.assertIn("EXECUTION", out["error"])
+
+    def test_partially_filled_without_detail_fails_closed(self):
+        out = parse_order_response({"result": "success", "sendStatus": {
+            "status": "partiallyFilled", "order_id": "o-1"}})
+        self.assertFalse(out["ok"])
+        self.assertIn("partiallyFilled", out["error"])
+
+    def test_partially_filled_with_execution_is_filled(self):
+        out = parse_order_response({"result": "success", "sendStatus": {
+            "status": "partiallyFilled", "order_id": "o-1",
+            "orderEvents": [{"type": "EXECUTION", "amount": 0.5, "price": 100.0}]}})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], STATUS_FILLED)
+        self.assertAlmostEqual(out["filled_sz"], 0.5)
+
+    def test_missing_status_fails_closed(self):
+        out = parse_order_response({"result": "success", "sendStatus": {
+            "order_id": "o-1", "orderEvents": []}})
+        self.assertFalse(out["ok"])
+        self.assertIn("status", out["error"])
+
+    def test_empty_status_fails_closed(self):
+        out = parse_order_response({"result": "success", "sendStatus": {
+            "status": "  ", "order_id": "o-1"}})
+        self.assertFalse(out["ok"])
+
+    def test_missing_send_status_fails_closed(self):
+        out = parse_order_response({"result": "success"})
+        self.assertFalse(out["ok"])
+
+    def test_contract_keys_unchanged(self):
+        """键集合是跨组契约，B 组按这些键取值 —— 不能增删。"""
+        out = parse_order_response(_exec_ok())
+        self.assertEqual(set(out), {"ok", "status", "oid", "avg_px", "filled_sz",
+                                    "raw", "error", "not_executed"})
+
+    def test_oid_is_string_not_int(self):
+        """oid 一律字符串（uuid/uid），禁止 int() 归一。"""
+        out = parse_order_response({"result": "success", "sendStatus": {
+            "status": "placed", "order_id": "6f1c2b9e-aaaa-bbbb-cccc-1234567890ab"}})
+        self.assertIsInstance(out["oid"], str)
+        numeric = parse_order_response({"result": "success", "sendStatus": {
+            "status": "placed", "order_id": 12345}})
+        self.assertEqual(numeric["oid"], "12345")
+        self.assertIsInstance(numeric["oid"], str)
+
+
+class TestPlaceOrderContractSize(unittest.TestCase):
+    """A4：contractSize 缺失 → contract_size() 抛错 → place_order 拒单（不兜 1.0）。"""
+
+    def test_missing_contract_size_rejects_order(self):
+        ep = _StubEndpoints(_exec_ok())
+        ex = _mk_ex(ep, info=_StubInfo(contract_size_value=None))
+        res = ex.place_order("BTC", True, 0.001, 75000.0)
+        self.assertFalse(res["ok"])
+        self.assertIn("contractSize", res["error"])
+        self.assertEqual(ep.calls, [], "拒单不能真的发出 sendorder")
+
+    def test_contract_size_not_one_rejects_order(self):
+        ep = _StubEndpoints(_exec_ok())
+        res = _mk_ex(ep, info=_StubInfo(contract_size_value=0.1)).place_order(
+            "BTC", True, 0.001, 75000.0)
+        self.assertFalse(res["ok"])
+        self.assertEqual(ep.calls, [])
+
+
+class TestCancelStatus(unittest.TestCase):
+    """A3：撤单只看 cancelStatus.status（官方三值），不再用错误文本猜 filled/notFound。"""
+
+    def _ex(self, cancel_resp):
+        ep = _StubEndpoints(cancel_resp=cancel_resp)
+        return _mk_ex(ep), ep
+
+    def test_cancelled_is_ok_resting(self):
+        ex, ep = self._ex({"result": "success", "cancelStatus": {"status": "cancelled",
+                                                                 "order_id": "abc"}})
+        out = ex.cancel("BTC", "abc")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], STATUS_RESTING)
+        self.assertEqual(ep.cancel_calls, ["abc"])
+
+    def test_not_found_is_ok_idempotent(self):
+        """notFound = 已撤/本就不存在 → 幂等成功（重试安全）。"""
+        ex, _ = self._ex({"result": "success", "cancelStatus": {"status": "notFound"}})
+        out = ex.cancel("BTC", "abc")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], STATUS_RESTING)
+
+    def test_filled_maps_to_filled(self):
+        ex, _ = self._ex({"result": "success", "cancelStatus": {"status": "filled"}})
+        out = ex.cancel("BTC", "abc")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], STATUS_FILLED)
+
+    def test_missing_cancel_status_fails(self):
+        ex, _ = self._ex({"result": "success"})
+        out = ex.cancel("BTC", "abc")
+        self.assertFalse(out["ok"])
+        self.assertIn("缺失", out["error"])
+
+    def test_unknown_cancel_status_fails(self):
+        ex, _ = self._ex({"result": "success", "cancelStatus": {"status": "weird"}})
+        out = ex.cancel("BTC", "abc")
+        self.assertFalse(out["ok"])
+        self.assertIn("weird", out["error"])
+
+    def test_api_error_no_longer_guessed_as_filled(self):
+        """HTTP/业务错误里带 'filled' 字样也不再猜成成交（旧实现的隐患）。"""
+        from app.kr.client import KrApiError
+        ex, _ = self._ex(KrApiError("order already filled", 200, {}))
+        out = ex.cancel("BTC", "abc")
+        self.assertFalse(out["ok"])
+        self.assertIn("撤单失败", out["error"])
+
+
+class TestOpenOrdersChecked(unittest.TestCase):
+    """A3：无 info → ([], False)；有 info → 复用归一形状。"""
+
+    def test_no_info_is_untrusted(self):
+        ex = KrExchange(api_key="k", secret_b64="a", dry_run=False,
+                        info=None, endpoints=_StubEndpoints())
+        self.assertEqual(ex._open_orders_checked(), ([], False))
+
+    def test_info_shape_used(self):
+        ex = _mk_ex()
+        orders, trusted = ex._open_orders_checked()
+        self.assertTrue(trusted)
+        self.assertEqual(orders[0]["oid"], "o-1")
+
+    def test_info_failure_is_untrusted(self):
+        class _Bad(_StubInfo):
+            def open_orders_checked(self, address=""):
+                raise RuntimeError("boom")
+        ex = _mk_ex(info=_Bad())
+        self.assertEqual(ex._open_orders_checked(), ([], False))
 
 
 if __name__ == "__main__":

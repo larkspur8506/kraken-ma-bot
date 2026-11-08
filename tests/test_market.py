@@ -1,7 +1,8 @@
-"""行情取数测试：**实盘信号必须来自交易场所自己的 K 线**（HL），失败即 fail-closed。
+"""行情取数测试：**实盘信号必须来自交易场所自己的 K 线**（Kraken charts），失败即 fail-closed。
 
-背景（用户拍板 2026-10-14）：下单/止损/成交都在 HL，信号却拿别家 K 线 = 拿 A 家行情做
+背景（用户拍板 2026-10-14）：下单/止损/成交都在交易场所，信号却拿别家 K 线 = 拿 A 家行情做
 B 家交易。实测两源信号一致率 97~98%、方向无翻转，但有 2~3% 边缘信号会因换源出现/消失。
+（`_hyperliquid` 现为死代码/历史对照，本文件保留它的单测。）
 """
 from __future__ import annotations
 
@@ -95,9 +96,16 @@ class TestFetchPolicy(unittest.TestCase):
         market.SOURCES = self.saved_src
         market.DIAGNOSTIC_SOURCES = self.saved_diag
 
-    def _bars(self, n=MIN_BARS_REQUIRED + 5):
-        return [Bar(open_ms=NOW - (n - i) * IV, open=83000.0, high=83100.0, low=82900.0,
-                    close=83050.0, volume=1.0) for i in range(n)]
+    def _bars(self, n=MIN_BARS_REQUIRED + 5, now_ms=None):
+        """造一段**以「进行中 bar」结尾**的 4h 序列（末根开盘 = 当前 4h 网格起点）。
+
+        validate() 要求最后一根未收盘（Feed.closed 丢掉它、current_open 用它），
+        所以测试数据必须落在 4h 网格上、且末根刚好是当前那根。
+        """
+        now = NOW if now_ms is None else now_ms
+        last_open = (now // IV) * IV
+        return [Bar(open_ms=last_open - (n - 1 - i) * IV, open=83000.0, high=83100.0,
+                    low=82900.0, close=83050.0, volume=1.0) for i in range(n)]
 
     def test_primary_source_is_kr(self):
         # PR-1：实盘信号源切 Kraken charts（交易场所自有数据，fail-closed）
@@ -139,6 +147,26 @@ class TestFetchPolicy(unittest.TestCase):
         market.SOURCES = [("hl-candle", lambda s: self._bars(10))]
         with self.assertRaises(FeedError):
             market.fetch("BTC_USDT", now_ms=NOW)
+
+    def test_last_bar_must_be_in_progress(self):
+        """末根校验（A6）：末根已收盘 = 数据源少给当前 bar → FeedError。"""
+        bars = self._bars()
+        stopped_one_early = [Bar(open_ms=b.open_ms - IV, open=b.open, high=b.high,
+                                 low=b.low, close=b.close, volume=b.volume) for b in bars]
+        with self.assertRaises(FeedError) as ctx:
+            market.validate("BTC_USDT", stopped_one_early, now_ms=NOW)
+        self.assertIn("进行中", str(ctx.exception))
+
+    def test_in_progress_last_bar_accepted(self):
+        """末根进行中（开盘 = 当前 4h 网格起点）→ 校验通过。"""
+        market.validate("BTC_USDT", self._bars(), now_ms=NOW)     # 不抛即通过
+
+    def test_feed_closed_drops_in_progress_bar(self):
+        bars = self._bars()
+        feed = market.Feed(symbol="BTC_USDT", source="t", bars=bars, fetched_at_ms=NOW)
+        self.assertEqual(len(feed.closed), len(bars) - 1)
+        self.assertEqual(feed.current_open, bars[-1].open)
+        self.assertEqual(feed.last_closed_ms, bars[-2].open_ms)
 
 
 class TestHlSourceLive(unittest.TestCase):

@@ -924,16 +924,28 @@ class TestV2StopRepairUnderDdKill(Base):
         self.assertTrue(reduce_only, "补挂的必须是减仓单")
         self.assertAlmostEqual(trigger_px, 80600.0, delta=1.0)
 
-    def test_manual_kill_still_skips_repair(self):
-        """保持原行为：人工/对账 kill 期间不动交易所（避免与人的操作打架）。"""
+    def test_machine_kill_repair_semantics(self):
+        """机器触发的 kill 仍允许「补挂止损」这类减风险动作；人工 kill 才完全不动。
+
+        B6（2026-11-08 审核）：reconcile/size/dd 三种机器 origin 与人工不同——
+        首轮对账发现裸仓会先置 origin=reconcile 的 kill，若此时早退，裸仓在
+        kill 永不自解的窗口里再无自动修复。人工 origin='manual' 保持早退。
+        """
         row = self._position()
         snap = _snap(1000.0, positions=[self._exchange_pos()], orders=[])
-        for origin in ("manual", "reconcile"):
+        # 人工 kill：人在核对，不动交易所
+        self.db.hl_set_kill(True, "停手", origin="manual")
+        self.ex.calls.clear()
+        self.executor()._repair_missing_stop(row, snap, kill_before=True)
+        self.assertEqual(self.ex.writes(), [], "manual kill 期间不许动交易所")
+        # 机器 kill：仍补挂止损（减风险动作不受「停新仓」限制）
+        for origin in ("reconcile", "size"):
             with self.subTest(origin=origin):
                 self.db.hl_set_kill(True, "停手", origin=origin)
                 self.ex.calls.clear()
                 self.executor()._repair_missing_stop(row, snap, kill_before=True)
-                self.assertEqual(self.ex.writes(), [], f"{origin} kill 期间不许动交易所")
+                self.assertEqual(len(self.ex.writes()), 1,
+                                 f"{origin} kill 期间仍须补挂止损（否则裸仓永无人修）")
 
 
 class TestV2SameRoundKill(Base):

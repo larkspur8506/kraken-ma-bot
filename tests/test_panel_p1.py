@@ -294,7 +294,7 @@ class TestRecordsNoise(BaseCase):
         self.assertNotIn("心跳（推送）", html)
         self.assertNotIn("每日心跳推送", html)
         # 标题行数 = 实际渲染行数（铁律 8）：3 条真实提醒
-        self.assertIn("提醒日志（alert_logs · 最近 3 条）", html)
+        self.assertIn("提醒日志（最近 3 条）", html)
         for msg in ("开多 BTC", "离场成交", "处理异常"):
             self.assertIn(msg, html, "真实提醒一条不能少")
         self.assertIn("主页已隐藏心跳类例行行", html, "滤了什么必须写出来")
@@ -302,8 +302,8 @@ class TestRecordsNoise(BaseCase):
     def test_main_page_hides_heartbeat_and_reconcile_ok_events(self):
         self._seed()
         html = self.admin(tab="records")
-        self.assertIn("执行器事件（hl_events · 最近 2 条）", html)
-        seg = html.split("执行器事件（hl_events", 1)[1].split("<thead>", 1)[1].split("</table>", 1)[0]
+        self.assertIn("执行器事件（最近 2 条）", html)
+        seg = html.split("执行器事件（最近", 1)[1].split("<thead>", 1)[1].split("</table>", 1)[0]
         self.assertNotIn("对账一致", seg)
         self.assertNotIn("心跳", seg, "心跳行整行隐藏")
         self.assertIn("对账异常", html, "对账异常不是例行行，必须照常显示")

@@ -43,7 +43,8 @@ def check_clock_skew(base_url: str = "https://futures.kraken.com",
 
     Kraken（PR-12 去 HL 残留）：原来 POST `api.hyperliquid.xyz/info`，Kraken 部署下
     这条等于在量 HL 的时间。改用 Kraken **公开** GET（instruments，无需签名）——
-    时钟偏差仍然有意义：Kraken 的 nonce 必须递增，本机跑快/跑慢都会被拒。
+    时钟偏差仍然有意义：Kraken 的签名请求带时间戳，本机跑快/跑慢会让请求时间戳对不齐，
+    偏差过大就可能被拒。
     """
     try:
         req = urllib.request.Request(
@@ -102,11 +103,15 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     #    后面的 24h 失败单、时钟偏差检查与交易所无关，必须照常执行。
     # 环境变量名沿用 HL_ACCOUNT_ADDRESS（部署侧已存在，改名=改 compose，收益为零）；
     # Kraken 下它只是 main 填的占位常量， KrInfo 的全部方法都忽略这个参数。
+    # Kraken（`venue_address_free`）：**没有地址这个概念**，所以这里不许拿「环境变量为空」
+    # 当「配置缺失」—— 那会在每次 cron 里刷一条假告警，并且把仓位/止损检查整块跳过
+    # （实盘无看守）。判据按 venue 能力，不按 env 有没有填。
     address = _env("HL_ACCOUNT_ADDRESS")
-    if info is None or not address:
+    address_free = bool(getattr(info, "venue_address_free", False))
+    if info is None or (not address and not address_free):
         add("未配置 HL_ACCOUNT_ADDRESS，跳过交易所侧检查")
     snap = None
-    if address and info is not None:
+    if info is not None and (address or address_free):
         try:
             snap = info.snapshot(address)
         except HlInfoError as e:
@@ -158,12 +163,19 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     if skew is None:
         add("时钟偏差检查失败（拿不到服务器时间）")
     elif abs(skew) > CLOCK_SKEW_MAX_S:
-        add(f"本机与 Kraken 服务器时间偏差 {skew:+.1f} 秒（>2s 会导致 nonce 被拒）")
+        add(f"本机与 Kraken 服务器时间偏差 {skew:+.1f} 秒（>2s 会影响请求时间戳对齐，"
+            f"签名请求可能被拒）")
     else:
         add(f"时钟偏差 {skew:+.2f} 秒", ok=True)
 
-    # 7) 权益（统一账户下余额在现货状态里）—— snap 可能因地址缺失/读取失败为 None
-    if snap is not None and snap.get("unified"):
+    # 7) 权益（Kraken 期货：只有一个衍生品钱包，不拆现货/合约）—— snap 可能因地址缺失/读取失败为 None
+    if snap is not None and snap.get("unified") and address_free:
+        # Kraken 的账本里没有「现货侧」这回事：equity 就是衍生品钱包总值，
+        # 写「现货 X + 浮动盈亏」是在描述一个不存在的结构（审核 C4）。
+        add(f"Kraken 衍生品账户权益 {snap.get('equity_total', 0) or snap.get('equity', 0):,.2f} USDC"
+            f"（可用 {snap.get('withdrawable', 0):,.2f} · 已用保证金 {snap.get('margin_used', 0):,.2f}）",
+            ok=True)
+    elif snap is not None and snap.get("unified"):
         # 文案与面板同口径：用人话写「现货 X + 浮动盈亏」，不用行业口径术语
         # （用户 2026-10-15 明确反馈那类词看不懂）
         add(f"账户总值 {snap.get('equity_total', 0):,.2f} USDC"
@@ -178,7 +190,8 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     #    max_valid_until）—— 按「有没有这个方法」判会漏，反而把「无 agent」当故障误报。
     #    判据按 venue 能力：kind 是 kraken-api，或既无 agents 也无到期字段 → 不适用，
     #    跳过（这是「不适用」，不是「读失败」，不许报成告警）。HL 形状照旧查到期。
-    if not address or info is None:
+    #    这里的门槛与第 4 步同一条（venue_address_free 时不需要地址）。
+    if info is None or (not address and not address_free):
         return notes
     ag_fn = getattr(info, "agent_status", None)
     if not callable(ag_fn):
