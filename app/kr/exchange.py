@@ -46,24 +46,31 @@ def make_cloid(symbol: str, bar_ms: int, purpose: str) -> str:
 
 
 def _coerce_cloid(cloid):
-    """Kraken 直接收字符串；这里只做格式守门（非法宁可拒单）。"""
+    """Kraken 直接收字符串；这里只做格式守门（非法宁可拒单）。
+
+    OpenAPI: cliOrdId maxLength=100，字符集不收空格/换行；下划线、点、冒号
+    （`0x…` / `entry_1` / `btc:4h` 这类常见构造）要放行。1.0 的 {1,64} +
+    仅字母数字/- 会把合法 cliOrdId 拒成 ValueError（PR-12 残留）。
+    """
     if cloid is None:
         return None
     import re
     txt = str(cloid).strip()
-    if not re.fullmatch(r"[a-zA-Z0-9\-]{1,64}", txt):
-        raise ValueError(f"cliOrdId 格式非法（≤64 位字母数字/-）：{txt[:14]}…")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", txt):
+        raise ValueError(f"cliOrdId 格式非法（≤100 位字母数字/_ . : -）：{txt[:14]}…")
     return txt
 
 
-def _ok(status: str, oid=None, avg_px=None, filled_sz=None, raw=None) -> dict:
+def _ok(status: str, oid=None, avg_px=None, filled_sz=None, raw=None,
+        not_executed: bool = False) -> dict:
     return {"ok": True, "status": status, "oid": oid, "avg_px": avg_px,
-            "filled_sz": filled_sz, "raw": raw, "error": ""}
+            "filled_sz": filled_sz, "raw": raw, "error": "",
+            "not_executed": bool(not_executed)}
 
 
 def _err(msg: str, raw: Any = None, status: str = STATUS_ERROR) -> dict:
     return {"ok": False, "status": status, "oid": None, "avg_px": None,
-            "filled_sz": None, "raw": raw, "error": msg}
+            "filled_sz": None, "raw": raw, "error": msg, "not_executed": False}
 
 
 def _f(v, default: float = 0.0) -> float:
@@ -82,7 +89,8 @@ def parse_order_response(resp: dict) -> dict:
         {"result":"success","sendStatus":{
             "status":"placed|filled|cancelled|iocWouldNotExecute|…",
             "order_id":"<uuid>","receivedTime":"2026-11-08T08:27:31.8Z",
-            "orderEvents":[{"type":"PLACE","order":{…}} |
+            "orderEvents":[{"type":"PLACE","order":{"orderId":"<uuid>"}} |
+                           {"type":"PLACE","orderTrigger":{"uid":"<uuid>"}} |
                            {"type":"EXECUTION","price":..,"amount":..} |
                            {"type":"REJECT","reason":"IOC_WOULD_NOT_EXECUTE"} |
                            {"type":"CANCEL",…}]}}
@@ -90,16 +98,33 @@ def parse_order_response(resp: dict) -> dict:
     对抗审查 P0：旧实现读 `sendStatus.orderId` 与 `orderEventStatus=="FILLED"` +
     `filledQty/filledPricePrice` —— 全都不是真实字段，于是**每一张单**（含止损）
     都返回「RESTING + oid=None」：成交不认、oid 丢失、止损无法撤/无法对账。
+
+    oid 兜底（P1-4）：止损单（orderType=stp）的 PLACE 事件是 PlaceTriggerEvent，
+    uuid 在 `orderTrigger.uid`，**不在** `order` 里；REJECT/CANCEL 事件则可能带
+    顶层 `uid`。sendStatus 顶层缺 order_id 时必须从事件里捞，否则止损单纯粹因为
+    「oid 为空」撤不掉 → 留在交易所裸奔。
     """
     if not isinstance(resp, dict):
         return _err(f"响应不是 dict：{str(resp)[:200]}", resp)
     send = resp.get("sendStatus")
     if not isinstance(send, dict):
         return _err(f"响应缺 sendStatus：{str(resp)[:200]}", resp)
-    oid = send.get("order_id") or send.get("orderId")
     status_raw = send.get("status")
     status = str(status_raw or "").strip().lower()
     events = send.get("orderEvents") or []
+    oid = send.get("order_id") or send.get("orderId")
+    if not oid and isinstance(events, list):
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            order = e.get("order") if isinstance(e.get("order"), dict) else {}
+            trig = e.get("orderTrigger") if isinstance(e.get("orderTrigger"), dict) else {}
+            cand = (order.get("orderId") or order.get("order_id")
+                    or trig.get("uid") or e.get("uid")
+                    or e.get("order_id") or e.get("orderId"))
+            if cand:
+                oid = cand
+                break
     fills = []
     rejects = []
     for e in events:
@@ -123,8 +148,10 @@ def parse_order_response(resp: dict) -> dict:
     if status in ("placed", "partiallyfilled", "edited", "untouched", ""):
         return _ok(STATUS_RESTING, oid=oid, raw=resp)
     if status == "cancelled" or "wouldnotexecute" in status:
-        # IOC 未成交/被撤销：对开仓调用方 = 撤单放弃；对止损单（stp）不会走到这里
-        return _ok(STATUS_RESTING, oid=oid, raw=resp)
+        # IOC 未成交/被撤销：**不是**「挂单在场」，而是「这张单没成交、已经不在了」。
+        # 保留 STATUS_RESTING 只为不破坏 executor（它据此撤单放弃，语义安全），
+        # 但显式标 not_executed=True 让调用方不必靠 status 猜。
+        return _ok(STATUS_RESTING, oid=oid, raw=resp, not_executed=True)
     reason = "; ".join(rejects) or str(status_raw or "") or "unknown"
     return _err(f"订单被拒：{reason}", resp)
 

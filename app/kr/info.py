@@ -10,7 +10,10 @@ snapshot() 返回**冻结接口**（与 HlInfo.snapshot 同形状，另含统一
 已知数据缺口（2026-11-08，OpenAPI 逐字段核对）：
 - /fills 不带 fee / reduceOnly，但**带 realized_pnl 与 sequence_id**：平仓盈亏优先
   用交易所真值，历史页（lastFillTime 路径）为 null 时才按净仓推演；fee 缺失按
-  taker 估并标 fee_estimated。dir/reduce_only 仍由成交序列推演。
+  taker 估并标 fee_estimated，`feeToken` 恒为 "USD"（fee 已折算成 USD 金额）。
+  dir/reduce_only 仍由成交序列推演，**dir 用 HL 原生大小写**（"Open Long" /
+  "Close Long" / "Open Short" / "Close Short"）—— executor、pnl、面板的
+  `"Long" in dir` / `"Close" in dir` / `_FILL_BS` 精确键全按这个契约写。
 - 无公开的逐账户资金费/出入金端点 → user_funding_history / ledger_updates 返回
   空列表（面板资金费汇总与净入金推演会缺数，属已知 PR-3 事项）。
 """
@@ -35,6 +38,31 @@ logger = logging.getLogger(__name__)
 # /fills 不带 fee 字段），要改就改 KR_TAKER_FEE / KR_MAKER_FEE，别在代码里硬编码第二次。
 DEFAULT_TAKER_FEE = 0.000275
 DEFAULT_MAKER_FEE = 0.000075
+
+#: 读不到 /instruments 的 marginLevels 时的初始保证金率兜底（10x）。
+#: **不放宽**到 100x：保证金宁可高估，ROE 宁可低估——编一个松的费率会让
+#: 面板看起来比真实账户健康。
+DEFAULT_INITIAL_MARGIN = 0.10
+
+
+def _inst_initial_margin(i: dict) -> float:
+    """合约的**散户**初始保证金率（min 档 = 最大杠杆那一档）。
+
+    Kraken 的 marginLevels 是按持仓档位阶梯的：第 0 档（numNonContractUnits=0）
+    initialMargin 最小 = 能开的最大杠杆。BTC/ETH/SOL=0.01（≈100x）、
+    QQQX=0.05（≈20x）。retailMarginLevels 是同一张表对散户的口径，优先它。
+    """
+    rows = i.get("retailMarginLevels") or i.get("marginLevels") or []
+    best = 0.0
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        v = _num(r.get("initialMargin"))
+        if v > 0 and (best <= 0 or v < best):
+            best = v
+    if best <= 0:
+        best = _num(i.get("initialMargin"))
+    return best
 
 
 class KrInfoError(KrAuthError, _HlInfoError):
@@ -166,12 +194,19 @@ class KrInfo:
 
     def specs(self, coins: Optional[List[str]] = None) -> Dict[str, dict]:
         """{coin: {"sz_decimals": int, "szDecimals": int, "price_tick": float,
-                  "price_decimals": int, "max_leverage": int, "maxLeverage": int}}
+                  "price_decimals": int, "initial_margin": float,
+                  "max_leverage": int, "maxLeverage": int}}
 
         数量精度取 `contractValueTradePrecision`（XBT=4 / ETH=3 / SOL=2 / QQQX=3）。
         **不能**用 `tickSize`：那是价格 tick（XBT=1），当数量步长会 floor 成整数张
         = 1 BTC ≈ $75k 一张，1.33% 风险仓位直接变成 0 或 1 张（对抗审查 P0）。
         兼容键：executor/agent 读 `sz_decimals`，MR 腿读 `szDecimals` —— 两个都给。
+
+        杠杆/保证金（对抗审查 P1-4）：`initial_margin` = /instruments 的
+        retailMarginLevels/marginLevels 最小档 initialMargin（散户口径），
+        `max_leverage` = round(1/initial_margin) 的**等效**值（BTC/ETH/SOL 100、
+        QQQX 20）。旧代码硬编码 5x + value/5 的 HL 逐仓公式，把面板保证金高估
+        20 倍、ROE 缩小 20 倍。构造参数 `max_leverage` 显式覆盖仍优先。
         """
         now = time.time()
         if self._specs_cache is None or now - self._specs_ts > 3600:
@@ -184,10 +219,21 @@ class KrInfo:
                 sz_dec = int(qty_dp) if isinstance(qty_dp, (int, float)) \
                     and int(qty_dp) >= 0 else _decimals_of(_num(i.get("minimumTradeSize"), 0.0))
                 tick = _num(i.get("tickSize"), 0.0)
-                lev = int(self._max_lev.get(coin, 5))
+                im = _inst_initial_margin(i)
+                override = int(self._max_lev.get(coin, 0) or 0)
+                if override > 0:
+                    lev = override
+                    if im <= 0:
+                        im = 1.0 / override
+                elif im > 0:
+                    lev = max(1, int(round(1.0 / im)))
+                else:
+                    lev = max(1, int(round(1.0 / DEFAULT_INITIAL_MARGIN)))
+                    im = DEFAULT_INITIAL_MARGIN
                 out[coin] = {"sz_decimals": sz_dec, "szDecimals": sz_dec,
                              "price_tick": tick, "price_decimals": _decimals_of(tick),
                              "contract_size": _num(i.get("contractSize"), 0.0) or 1.0,
+                             "initial_margin": im,
                              "max_leverage": lev, "maxLeverage": lev}
             if out:
                 self._specs_cache = out
@@ -196,6 +242,19 @@ class KrInfo:
         if coins is None:
             return dict(cache)
         return {c: cache[c] for c in coins if c in cache}
+
+    def _initial_margin(self, coin: str) -> float:
+        """该合约的初始保证金率（真实 IM；读不到 → DEFAULT_INITIAL_MARGIN）。
+
+        specs() 有 1h 缓存，这里只是取缓存；/instruments 抖动时不能把持仓
+        保证金算成 0（会把 ROE 除零 / 把占用算没），所以兜底而不是抛。
+        """
+        try:
+            sp = self.specs([coin]).get(coin) or {}
+        except Exception:                                        # noqa: BLE001
+            sp = {}
+        im = _num(sp.get("initial_margin"), 0.0)
+        return im if im > 0 else DEFAULT_INITIAL_MARGIN
 
     def price_tick(self, coin: str) -> float:
         """该合约的价格最小变动（Kraken tickSize）。读不到返回 0（调用方拒单）。"""
@@ -341,14 +400,20 @@ class KrInfo:
             if mark <= 0:
                 mark = entry
             value = mark * size
-            lev = int(self._max_lev.get(coin, 5))
-            margin_est = value / lev if lev > 0 else 0.0
+            # 真实初始保证金 = 名义 × 初始保证金率（/instruments 的 IM，散户口径）。
+            # 旧代码 value/5 是 HL 逐仓公式：BTC 真实 IM=1% → 保证金高估 20 倍、
+            # ROE 缩小 20 倍（对抗审查 P1-4）。
+            im = self._initial_margin(coin)
+            margin_est = value * im
             out.append({
                 "coin": coin, "side": side, "size": size, "entry_px": entry,
                 "mark_px": mark, "position_value": value,
                 "liq_px": _num(item.get("liquidationThresholdPrice")),  # 全仓口径无逐仓强平价
-                "leverage": lev, "isolated": False,          # flex 只有 cross
-                "margin_used": margin_est,                   # 估算（全仓无法逐仓拆分）
+                # 全仓无「逐仓杠杆」这个量：给 None 让面板显示「全仓」，
+                # 而不是编一个 100x 冒充用户设置的杠杆（跨组契约，2026-11-08）。
+                "leverage": None, "isolated": False,          # flex 只有 cross
+                "initial_margin": im,
+                "margin_used": margin_est,                    # 真实 IM（全仓无法逐仓拆分）
                 "margin_used_estimated": 1,
                 "unrealized_pnl": upnl,
                 "roe": (upnl / margin_est) if margin_est > 0 else 0.0,
@@ -423,6 +488,10 @@ class KrInfo:
 
         分页语义（官方）：不传参 = 最近 100 条（带 realized_pnl）；传 lastFillTime =
         该时间**之前**的 100 条（历史页 realized_pnl 为 null，用推演补）。
+
+        输出 dir 用 **HL 原生格式**（"Open Long"/"Close Long"/"Open Short"/
+        "Close Short"），反手成交按被平掉的旧仓方向给 Close Long/Close Short。
+        `feeToken` 恒 "USD"（fee 已是 USD 金额），`reduce_only` 1=平仓腿。
         """
         raw: List[dict] = []
         seen = set()
@@ -489,22 +558,28 @@ class KrInfo:
                 net.pop(coin, None)
                 avg.pop(coin, None)
             if old * new < 0:
-                direction = "long > short" if old > 0 else "short > long"
+                # 反手：这笔成交里有一部分在平旧仓 —— 对下游记账必须算「平仓腿」
+                # （reduce_only=1、closedPnl 归到旧仓），所以 dir 取被平掉的方向。
+                direction = "Close Long" if old > 0 else "Close Short"
             elif close_qty > 0:
-                direction = "close long" if old > 0 else "close short"
+                direction = "Close Long" if old > 0 else "Close Short"
             else:
-                direction = "open long" if is_buy else "open short"
+                direction = "Open Long" if is_buy else "Open Short"
             # realized_pnl 是交易所真值（历史页为 null），null 时才用推演值
             rp = f.get("realized_pnl")
             if rp is None:
                 closed_val, closed_src = closed, "derived"
             else:
                 closed_val, closed_src = _num(rp), "exchange"
+            fee_usd = sz * px * self._taker_fee
             out.append({
                 "coin": coin, "px": px, "sz": sz, "side": "buy" if is_buy else "sell",
                 "time": t, "hash": f"kr:{tid}", "dir": direction,
                 "closedPnl": closed_val, "closedPnl_src": closed_src,
-                "fee": sz * px * self._taker_fee,
+                # fee 已折算成 USD（Kraken flex 全额 USD 计价），feeToken 必须给
+                # "USD"：executor._fee_quote 只认 QUOTE_FEE_TOKENS，缺这个键就
+                # 每笔平仓刷「手续费以 未知币种 计价」并把 fee_quote 记成 NULL。
+                "fee": fee_usd, "feeToken": "USD",
                 "fee_estimated": 1, "tid": tid, "oid": oid,
                 "reduce_only": 1 if close_qty > 0 else 0,
             })

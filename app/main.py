@@ -162,7 +162,11 @@ def hl_params():
         max_fail_streak=int(f("HL_MAX_FAIL_STREAK", 3)),
         max_daily_loss_pct=f("HL_MAX_DAILY_LOSS_PCT", 0.05),
         deadman_minutes=int(f("HL_DEADMAN_MINUTES", 30)),
-        min_notional=f("HL_MIN_NOTIONAL", 10.0),
+        # Kraken 无最小名义金额（HL 的 10 USDC 下限在 Kraken 会真拒单）：
+        # 下单只看合约数量精度步长（contractValueTradePrecision），所以这里写死 0.0
+        # = 不设名义闸门。**不**新增 env/面板旋钮（参数面刻意最小化）。
+        # 不重用 HL_MIN_NOTIONAL：那是 HL 口径，留着只会让人以为还能调。
+        min_notional=0.0,
         code_rev=_env("HL_CODE_REV", os.environ.get("CODE_REV", "")),
     )
 

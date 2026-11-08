@@ -87,6 +87,17 @@ _GRACE_MIN_S, _GRACE_MAX_S = 300.0, 3600.0
 _FILL_BS = {"Open Long": "买", "Close Short": "买",
             "Close Long": "卖", "Open Short": "卖"}
 
+#: 大小写不敏感索引。Kraken 的 `KrInfo._fills()` 与历史行可能给 "open long"/
+#: "OPEN LONG" 等写法，精确键查找会让买卖列显示「—」。渲染层一律走 `_fill_bs()`，
+#: 别再直接 `_FILL_BS.get(...)`（admin_ui 也 import 这个 helper，不另抄一份）。
+_FILL_BS_LC = {k.lower(): v for k, v in _FILL_BS.items()}
+
+
+def _fill_bs(direction: Any) -> str:
+    """成交方向 → 买/卖。大小写/多余空白不敏感；未知值返回「—」。"""
+    key = " ".join(str(direction or "").split()).lower()
+    return _FILL_BS_LC.get(key, "—")
+
 
 # ---------------------------------------------------------------- 依赖注入
 @dataclass
@@ -140,6 +151,19 @@ def _opt_int(v: Any) -> Optional[int]:
     """安全转 int，保留 None（symbol_state.dense_cnt 这类可空整数）。"""
     f = _opt_num(v)
     return None if f is None else int(f)
+
+
+def _lev_text(pos: Dict[str, Any], long: bool = False) -> str:
+    """杠杆展示。
+
+    Kraken 期货只有全仓（flex），没有逐仓杠杆概念 —— KrInfo 的持仓行 `leverage`
+    给 None，**不能**兜成 1x/5x（那是编出来的数字）。`long=True` 用于窄屏小字行，
+    多带一句原因（「全仓」两个字在细字行里容易看不出是结论还是缺失）。
+    """
+    lev = _opt_num(pos.get("leverage"))
+    if not lev:
+        return "全仓（Kraken 不做逐仓杠杆设置）" if long else "全仓"
+    return f"杠杆 {lev:.0f}x" if long else f"{lev:.0f}x"
 
 
 def _fee_quoted(d: Dict[str, Any]) -> Optional[float]:
@@ -771,7 +795,9 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             "mark_px": mark,
             "position_value": _num(d.get("position_value")),
             "liq_px": _num(d.get("liq_px")),
-            "leverage": int(_num(d.get("leverage"), 1)),
+            # Kraken 全仓没有逐仓杠杆：KrInfo 给 None，**保留 None**（早先兜成 1
+            # 会让界面把「全仓」写成 1x，等于编了一个用户没设过的杠杆）。
+            "leverage": _opt_int(d.get("leverage")),
             "isolated": bool(d.get("isolated")),
             "margin_used": _num(d.get("margin_used")),
             "unrealized_pnl": upnl,
@@ -2304,7 +2330,7 @@ def _render_body(p: dict) -> str:
                  + _td(r_txt, f"num {r_cls}".strip())
                  + _td(stop_cell, "num")
                  + _td(f"{dist * 100:.2f}%" if dist is not None else "—", "num")
-                 + _td(f"{_num(pos.get('leverage'), 1):.0f}x"
+                 + _td(_lev_text(pos)
                        + (" <span class='muted'>逐</span>" if pos.get("isolated") else ""),
                        "num hidem")
                  + _td(_fmt(pos.get("margin_used")), "num hidem")
@@ -2317,7 +2343,7 @@ def _render_body(p: dict) -> str:
         subm_fund = f" · 本单资金费 {fund_txt}" if show_fund_col else ""
         o.append(f"<tr class='subm'><td colspan='{ncol}'>"
                  f"数量 {_fmt_sz(pos.get('size'))} · "
-                 f"{'全仓（Kraken 不做逐仓杠杆设置）' if not _opt_num(pos.get('leverage')) else '杠杆 %.0fx' % _num(pos.get('leverage'), 1)}"
+                 f"{_lev_text(pos, long=True)}"
                  f"{' 逐' if pos.get('isolated') else ''} · "
                  f"保证金 {_fmt(pos.get('margin_used'))} U · "
                  f"强平 {_fmt(pos.get('liq_px')) if _opt_num(pos.get('liq_px')) else '—'}"
@@ -2341,7 +2367,7 @@ def _render_body(p: dict) -> str:
                      + _td("—", "num")
                      + _td("<span class='muted'>—</span>", "num")
                      + _td("—", "num")
-                     + _td(f"{mr['leverage']:.0f}x" if mr.get("leverage") else "—",
+                     + _td(_lev_text({"leverage": mr.get("leverage")}),
                            "num hidem")
                      + _td(_fmt(mr.get("margin")), "num hidem")
                      + _td("—", "num hidem")

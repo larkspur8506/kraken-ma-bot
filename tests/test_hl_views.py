@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -898,3 +899,102 @@ class TestLatencyFromSnapshot(BaseCase):
         self.assertIn("Kraken 延迟 <b>—</b>", html)
         self.assertNotIn("Kraken 延迟 <b>0 ms</b>", html)
 
+
+
+# ---------------------------------------------------------------- PR-12 Kraken 对齐
+class TestFillDirectionCase(unittest.TestCase):
+    """成交方向 → 买/卖：大小写不敏感。
+
+    Kraken 的 `KrInfo._fills()` 与历史行可能给 "open long"/"OPEN LONG"，
+    旧的精确键查找会把买卖列渲染成「—」（等于丢了一列信息）。
+    """
+
+    def test_capitalized_still_works(self):
+        from app.hl.views import _fill_bs
+        self.assertEqual(_fill_bs("Open Long"), "买")
+        self.assertEqual(_fill_bs("Close Short"), "买")
+        self.assertEqual(_fill_bs("Close Long"), "卖")
+        self.assertEqual(_fill_bs("Open Short"), "卖")
+
+    def test_lowercase_and_uppercase_and_spaces(self):
+        from app.hl.views import _fill_bs
+        self.assertEqual(_fill_bs("open long"), "买")
+        self.assertEqual(_fill_bs("close short"), "买")
+        self.assertEqual(_fill_bs("close long"), "卖")
+        self.assertEqual(_fill_bs("open short"), "卖")
+        self.assertEqual(_fill_bs("  OPEN   LONG "), "买")
+
+    def test_unknown_or_empty_is_dash(self):
+        from app.hl.views import _fill_bs
+        for bad in ("", None, "buy", "Open  Long Extra", 42):
+            self.assertEqual(_fill_bs(bad), "—", f"{bad!r} 不该硬猜买卖")
+
+
+class TestLeverageDisplay(BaseCase):
+    """Kraken 全仓：持仓行 leverage=None，面板必须显示「全仓」而不是 1x/5x。
+
+    A 组契约：`KrInfo._positions()` 的 leverage=None，margin_used=真实初始保证金
+    ⇒ ROE% = 浮盈 ÷ margin_used 自然正确。
+    """
+
+    def _cross_pos(self, **kw):
+        pos = {"coin": "QQQ", "side": 1, "size": 2.0, "entry_px": 600.0,
+               "mark_px": 606.0, "position_value": 1212.0, "liq_px": 0.0,
+               "leverage": None, "isolated": False, "margin_used": 121.2,
+               "unrealized_pnl": 12.0, "roe": 0.099, "funding_since_open": 0.0}
+        pos.update(kw)
+        return pos
+
+    def test_payload_preserves_none_leverage(self):
+        self.info._snap = fake_snapshot(extra_positions=[self._cross_pos()])
+        p = self.payload()
+        qqq = [x for x in p["positions"] if x["coin"] == "QQQ"]
+        self.assertEqual(len(qqq), 1)
+        self.assertIsNone(qqq[0]["leverage"], "leverage=None 不许兜成 1")
+        self.assertFalse(qqq[0]["isolated"])
+        self.assertAlmostEqual(qqq[0]["margin_used"], 121.2)
+
+    def test_page_shows_full_margin_not_fake_1x(self):
+        self.info._snap = fake_snapshot(extra_positions=[self._cross_pos()])
+        html = render_dashboard(self.payload())
+        self.assertIn("全仓（Kraken 不做逐仓杠杆设置）", html)
+        self.assertNotIn(">1x<", html)
+        self.assertNotIn("杠杆 1x", html)
+        # ROE% 分母是真实保证金：12 / 121.2 = +9.90%
+        self.assertIn("+9.90%", html)
+
+    def test_numeric_leverage_still_renders(self):
+        """保留旧口径：真给了数字（历史行/HL 回放）就照实显示 5x。"""
+        self.info._snap = fake_snapshot()
+        html = render_dashboard(self.payload())
+        self.assertIn("5x", html)
+        self.assertIn("杠杆 5x", html)             # 小字行（窄屏替代列）照实写数字
+        self.assertNotIn("全仓", html)             # 有逐仓杠杆就不能说全仓
+
+
+class TestKrExecParams(unittest.TestCase):
+    """装配层：Kraken 无最小名义金额，HL 的 10 USDC 下限会真拒单。"""
+
+    def test_min_notional_is_zero(self):
+        import app.main as m
+        with tempfile.TemporaryDirectory(prefix="kr_params_") as tmp:
+            from app.db import DB
+            d = DB(os.path.join(tmp, "t.db"))
+            with mock.patch.object(m, "db", d), \
+                 mock.patch.dict(os.environ, {"DB_PATH": os.path.join(tmp, "t.db")}):
+                p = m.hl_params()
+        self.assertEqual(p.min_notional, 0.0,
+                         "Kraken 装配必须把 min_notional 置 0（不设名义闸门）")
+
+    def test_zero_min_notional_actually_opens_the_gate(self):
+        """0 必须真的放行：9.6U 名义在 HL 的 10U 下限下被拦，Kraken 下不该拦。"""
+        from app.hl.sizing import size_order_hl
+        kw = dict(coin="QQQ", sz_decimals=3, entry_price=600.0, stop_price=594.0,
+                  equity=10.0, risk_pct=0.01)
+        p10 = size_order_hl(min_notional=10.0, **kw)
+        p0 = size_order_hl(min_notional=0.0, **kw)
+        self.assertAlmostEqual(p10.notional, 9.6, places=6)
+        self.assertTrue(p10.below_min_notional, "10U 下限下应被拦（回归对照）")
+        self.assertFalse(p0.below_min_notional, "0 = 不设限，必须放行")
+        self.assertFalse([w for w in p0.warnings if "下限" in w],
+                         "0 下限不该再冒「小于交易所下限」的告警")

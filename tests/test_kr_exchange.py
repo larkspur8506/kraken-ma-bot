@@ -7,8 +7,9 @@
 """
 import unittest
 
-from app.kr.exchange import (KrExchange, make_cloid, parse_order_response,
-                             STATUS_DRY, STATUS_ERROR, STATUS_FILLED, STATUS_RESTING)
+from app.kr.exchange import (KrExchange, _coerce_cloid, make_cloid,
+                             parse_order_response, STATUS_DRY, STATUS_ERROR,
+                             STATUS_FILLED, STATUS_RESTING)
 
 
 class _StubInfo:
@@ -126,6 +127,7 @@ class TestPlaceOrder(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["status"], STATUS_RESTING)
         self.assertEqual(out["oid"], "o-10")
+        self.assertTrue(out["not_executed"])          # P1-4：显式「没成交」，不是「挂单在场」
 
     def test_dry_run_sends_nothing(self):
         ep = _StubEndpoints()
@@ -168,6 +170,86 @@ class TestPlaceOrder(unittest.TestCase):
         ep = _StubEndpoints()
         _mk_ex(ep).cancel_all("BTC")
         self.assertEqual(ep.cancel_all_calls, ["PF_XBTUSD"])
+
+
+class TestOrderResponseOid(unittest.TestCase):
+    """P1-4：oid 兜底 + 「未成交」语义 + cliOrdId 长度/字符集。"""
+
+    def test_stop_place_trigger_event_uid_is_oid(self):
+        """止损单 PLACE 事件是 PlaceTriggerEvent（orderTrigger.uid），无 order.orderId。"""
+        resp = {"result": "success", "sendStatus": {
+            "status": "placed", "receivedTime": "2026-11-08T08:27:31.814Z",
+            "orderEvents": [{"type": "PLACE",
+                             "orderTrigger": {"uid": "trig-uuid-1", "stopPrice": 73000.0}}]}}
+        out = parse_order_response(resp)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], STATUS_RESTING)
+        self.assertEqual(out["oid"], "trig-uuid-1")
+
+    def test_place_event_order_id_is_oid(self):
+        resp = {"result": "success", "sendStatus": {
+            "status": "placed",
+            "orderEvents": [{"type": "PLACE", "order": {"orderId": "evt-uuid-2"}}]}}
+        self.assertEqual(parse_order_response(resp)["oid"], "evt-uuid-2")
+
+    def test_event_top_level_uid_is_oid(self):
+        resp = {"result": "success", "sendStatus": {
+            "status": "placed",
+            "orderEvents": [{"type": "CANCEL", "uid": "evt-uuid-3"}]}}
+        self.assertEqual(parse_order_response(resp)["oid"], "evt-uuid-3")
+
+    def test_top_level_order_id_still_wins(self):
+        resp = {"result": "success", "sendStatus": {
+            "status": "placed", "order_id": "top-level",
+            "orderEvents": [{"type": "PLACE", "order": {"orderId": "from-event"}}]}}
+        self.assertEqual(parse_order_response(resp)["oid"], "top-level")
+
+    def test_stop_order_end_to_end_keeps_oid(self):
+        ep = _StubEndpoints({"result": "success", "sendStatus": {
+            "status": "placed",
+            "orderEvents": [{"type": "PLACE", "orderTrigger": {"uid": "stop-uuid-9"}}]}})
+        res = _mk_ex(ep).place_order("BTC", False, 0.001, 0.0, reduce_only=True,
+                                     trigger_px=73000.0)
+        self.assertEqual(res["oid"], "stop-uuid-9")
+        self.assertFalse(res["not_executed"])
+
+    def test_ioc_would_not_execute_flagged_not_executed(self):
+        """status=iocWouldNotExecute → RESTING（不破坏 executor 的撤单放弃），但标 not_executed。"""
+        resp = {"result": "success", "sendStatus": {
+            "status": "iocWouldNotExecute",
+            "orderEvents": [{"type": "REJECT", "reason": "IOC_WOULD_NOT_EXECUTE",
+                             "uid": "gone-uuid"}]}}
+        out = parse_order_response(resp)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], STATUS_RESTING)
+        self.assertTrue(out["not_executed"])
+        self.assertEqual(out["oid"], "gone-uuid")
+
+    def test_placed_is_not_flagged_not_executed(self):
+        resp = {"result": "success", "sendStatus": {
+            "status": "placed", "order_id": "o-1",
+            "orderEvents": [{"type": "PLACE", "order": {"orderId": "o-1"}}]}}
+        self.assertFalse(parse_order_response(resp)["not_executed"])
+
+    def test_filled_is_not_flagged_not_executed(self):
+        self.assertFalse(parse_order_response(_exec_ok())["not_executed"])
+
+    def test_cloid_accepts_underscore_dot_colon_and_100_chars(self):
+        self.assertEqual(_coerce_cloid("entry_1.btc:4h"), "entry_1.btc:4h")
+        self.assertEqual(_coerce_cloid("a" * 100), "a" * 100)
+
+    def test_cloid_rejects_too_long_and_whitespace(self):
+        with self.assertRaises(ValueError):
+            _coerce_cloid("a" * 101)
+        with self.assertRaises(ValueError):
+            _coerce_cloid("bad cloid")
+        with self.assertRaises(ValueError):
+            _coerce_cloid("bad\ncloid")
+
+    def test_cloid_passes_through_place_order(self):
+        ep = _StubEndpoints(_exec_ok())
+        _mk_ex(ep).place_order("BTC", True, 0.001, 75200.0, cloid="entry:btc_4h.1")
+        self.assertEqual(ep.calls[0]["cliOrdId"], "entry:btc_4h.1")
 
 
 if __name__ == "__main__":

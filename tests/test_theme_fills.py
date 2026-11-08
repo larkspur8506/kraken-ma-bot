@@ -185,6 +185,25 @@ if FastAPI is not None:
             for d, want in cases.items():
                 self.assertEqual(got[d], want, f"{d} 应显示 {want}")
 
+        def test_buy_sell_case_insensitive_on_records(self):
+            """PR-12：KrInfo._fills 的 dir 可能是小写（open long），不能显示「—」。
+
+            A 组把 dir 对齐成 HL 原生大写，但历史行/中途版本可能是小写 ——
+            面板两侧（总览成交、记录页成交）都走 views._fill_bs，大小写不敏感。
+            """
+            cases = {"open long": "买", "close short": "买",
+                     "close long": "卖", "open short": "卖"}
+            for i, d in enumerate(cases):
+                self.ins_fill(f"lc{i}", d, 0.001, 90_000.0 + i,
+                              reduce=("close" in d))
+            html = self.client.get("/admin", params={"k": TOKEN, "tab": "records"}).text
+            rows = self._rows(html)
+            by_px = {f"{90_000.0 + i:,.2f}": d for i, d in enumerate(cases)}
+            got = {by_px[r[4]]: r[2] for r in rows}
+            self.assertEqual(len(got), 4)
+            for d, want in cases.items():
+                self.assertEqual(got[d], want, f"{d} 应显示 {want}")
+
         def test_records_tab_buy_sell_and_alignment(self):
             self.ins_fill("r1", "Close Long", 0.005, 100_000.0, pnl=5.0, reduce=True)
             self.ins_fill("r2", "Open Short", 0.005, 100_000.0)

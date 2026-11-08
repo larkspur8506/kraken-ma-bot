@@ -154,7 +154,7 @@ class TestProblems(Base):
 
     def test_exchange_unreadable(self):
         self.info = FakeInfo(raise_on_snapshot="network down")
-        self.assertIn("读不到 HL 账户", " ".join(self.bad(self.checks())))
+        self.assertIn("读不到 Kraken 账户", " ".join(self.bad(self.checks())))
 
     def test_missing_address_skips_exchange_checks(self):
         with mock.patch.dict(os.environ, {"HL_ACCOUNT_ADDRESS": ""}, clear=False):
@@ -180,7 +180,7 @@ class TestMain(Base):
     def _run(self, argv=None):
         buf = io.StringIO()
         with mock.patch("app.db.DB", return_value=self.db), \
-             mock.patch("app.hl.info.HlInfo", return_value=self.info), \
+             mock.patch("app.kr.info.KrInfo", return_value=self.info), \
              mock.patch.object(watchdog, "check_clock_skew", return_value=0.4), \
              contextlib.redirect_stdout(buf):
             rc = watchdog.main(argv or ["--mode", MODE_LIVE])
@@ -195,7 +195,7 @@ class TestMain(Base):
     def test_prints_when_problem(self):
         rc, out = self._run()                     # 没有心跳 → 有问题
         self.assertEqual(rc, 0)
-        self.assertIn("HL 执行器看守告警", out)
+        self.assertIn("Kraken 执行器看守告警", out)
         self.assertIn("从未写过心跳", out)
 
     def test_dry_run_lists_everything(self):
@@ -203,6 +203,78 @@ class TestMain(Base):
         self.assertEqual(rc, 0)
         self.assertIn("[dry-run]", out)
         self.assertIn("kill switch", out)
+
+
+class TestKrakenAdaptation(Base):
+    """PR-12 去 HL 残留：时钟检查打 Kraken 公开端点；Kraken key 无到期 → 跳过 agent 检查。"""
+
+    def test_clock_skew_hits_kraken_public_endpoint(self):
+        seen = {}
+
+        class _Resp:
+            headers = {"Date": "Wed, 08 Nov 2026 00:00:00 GMT"}
+
+            def read(self):
+                return b"{}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["method"] = req.get_method()
+            return _Resp()
+
+        self.skew.stop()                      # Base 把 check_clock_skew 打了桩，这里要真跑
+        try:
+            with mock.patch("urllib.request.urlopen", fake_urlopen):
+                skew = watchdog.check_clock_skew(timeout=1.0)
+        finally:
+            self.skew = mock.patch.object(watchdog, "check_clock_skew", return_value=0.4)
+            self.skew.start()
+        self.assertIsNotNone(skew)
+        self.assertTrue(seen["url"].startswith(
+            "https://futures.kraken.com/derivatives/api/v3/instruments"), seen["url"])
+        self.assertEqual(seen["method"], "GET", "公开读不该再用 HL 的 POST /info")
+
+    def test_agent_check_skipped_for_kraken_key_shape(self):
+        """Kraken 下 KrInfo **实现了** agent_status，但返回
+        {"kind":"kraken-api","expires":None,"days_left":None}（无 agents / max_valid_until）。
+        这是「不适用」，不是读失败、更不是「没有任何 agent」故障，不许报成告警。
+        用真实 KrInfo 的形状做 fixture（不用自造「没有该方法」的假件——那会掩盖真实契约）。
+        """
+        from app.kr.info import KrInfo
+        self._heartbeat()
+
+        class _KrakenShape:
+            """复用真实 KrInfo.agent_status 的返回，避免 fixture 复制错假设。"""
+            def snapshot(self, address):
+                return _snap(positions=[], orders=[])
+
+            def agent_status(self, address):
+                return KrInfo.agent_status(self, address)   # 真实实现：kind=kraken-api，无 agents
+
+        notes = watchdog.run_checks(self.db, info=_KrakenShape(), mode=MODE_LIVE, force=True)
+        joined = " ".join(notes)
+        self.assertIn("无到期概念", joined)
+        self.assertNotIn("没有任何 agent", joined)
+        self.assertEqual(self.bad(notes), [])
+
+    def test_agent_check_skipped_without_agent_status_method(self):
+        """没有 agent_status 方法的桩（老 HL 迁移期假件）：同样按「不适用」跳过。"""
+        self._heartbeat()
+
+        class _NoAgent:
+            def snapshot(self, address):
+                return _snap(positions=[], orders=[])
+
+        notes = watchdog.run_checks(self.db, info=_NoAgent(), mode=MODE_LIVE, force=True)
+        joined = " ".join(notes)
+        self.assertIn("无到期概念", joined)
+        self.assertEqual(self.bad(notes), [])
 
 
 class TestAgentExpiry(Base):

@@ -599,7 +599,14 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
             except Exception:                                     # noqa: BLE001
                 sz_dec = 5
             try:
-                px = hl_sizing.round_price(ex.slippage_limit(coin, is_buy, ex.mid(coin)), sz_dec)
+                raw_px = ex.slippage_limit(coin, is_buy, ex.mid(coin))
+                # 取整必须用 venue 自己的规则：Kraken 的 PF_XBTUSD tick=1，套 HL 的
+                # 「≤5 位有效数字」会得到 75798.3 这种非 tick 整数倍价 → invalidPrice 拒单。
+                rp = getattr(info, "round_price", None)
+                if callable(rp):
+                    px = float(rp(coin, raw_px))
+                else:
+                    px = hl_sizing.round_price(raw_px, sz_dec)
             except Exception as e:                                # noqa: BLE001
                 px = _f(pos.get("mark_px"))
                 if px <= 0:
