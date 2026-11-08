@@ -82,18 +82,27 @@ def _f(v, default: float = 0.0) -> float:
 
 
 def parse_order_response(resp: dict) -> dict:
-    """把 sendorder 响应归一化成 _ok/_err dict。
+    """把 sendorder 响应归一化成 _ok/_err dict（状态机见下，跨组契约 2026-11-08）。
 
     真实形状（Kraken Derivatives v3 OpenAPI，2026-11-08 核对）::
 
         {"result":"success","sendStatus":{
-            "status":"placed|filled|cancelled|iocWouldNotExecute|…",
+            "status":"placed|partiallyFilled|filled|cancelled|iocWouldNotExecute|…",
             "order_id":"<uuid>","receivedTime":"2026-11-08T08:27:31.8Z",
             "orderEvents":[{"type":"PLACE","order":{"orderId":"<uuid>"}} |
                            {"type":"PLACE","orderTrigger":{"uid":"<uuid>"}} |
                            {"type":"EXECUTION","price":..,"amount":..} |
                            {"type":"REJECT","reason":"IOC_WOULD_NOT_EXECUTE"} |
                            {"type":"CANCEL",…}]}}
+
+    状态机（**只认交易所明说的，不猜**）：
+    - 有 EXECUTION 明细 → FILLED（量价按明细加权，partiallyFilled 同理）。
+    - placed / untouched / edited → RESTING，可在场，not_executed=False。
+    - cancelled / iocWouldNotExecute → RESTING 且 not_executed=True：这张单
+      **没成交、也已不在场**（B 组消费该标记，不能当成挂单去撤）。
+    - status 缺失/空串、filled 但无明细、partiallyFilled 无明细 → ok=False：
+      成交价/量不可信时**绝不编造**（fail-closed）。
+    - 其余（invalidSize / insufficientAvailableFunds / selfFill…）→ ok=False。
 
     对抗审查 P0：旧实现读 `sendStatus.orderId` 与 `orderEventStatus=="FILLED"` +
     `filledQty/filledPricePrice` —— 全都不是真实字段，于是**每一张单**（含止损）
@@ -111,6 +120,10 @@ def parse_order_response(resp: dict) -> dict:
         return _err(f"响应缺 sendStatus：{str(resp)[:200]}", resp)
     status_raw = send.get("status")
     status = str(status_raw or "").strip().lower()
+    if not status:
+        # 没状态就无从判定「成交 / 在场 / 没成交」——宁可当失败让调用方停手，
+        # 也不能回一个 RESTING 让执行器去撤一张不存在的单。
+        return _err(f"响应缺 sendStatus.status（无法判定订单状态）：{str(resp)[:200]}", resp)
     events = send.get("orderEvents") or []
     oid = send.get("order_id") or send.get("orderId")
     if not oid and isinstance(events, list):
@@ -125,6 +138,9 @@ def parse_order_response(resp: dict) -> dict:
             if cand:
                 oid = cand
                 break
+    if oid is not None:
+        # 跨组契约：oid 一律字符串（Kraken 是 uuid；即便上游真给了数字也不 int()）
+        oid = str(oid)
     fills = []
     rejects = []
     for e in events:
@@ -142,16 +158,16 @@ def parse_order_response(resp: dict) -> dict:
         qty = sum(q for q, _ in fills)
         avg = (sum(q * p for q, p in fills) / qty) if qty > 0 else None
         return _ok(STATUS_FILLED, oid=oid, avg_px=avg, filled_sz=qty or None, raw=resp)
-    if status == "filled":
-        # 无 EXECUTION 明细（少数实现只回 status）→ 认成交，价格由调用方兜底
-        return _ok(STATUS_FILLED, oid=oid, raw=resp)
-    if status in ("placed", "partiallyfilled", "edited", "untouched", ""):
+    if status in ("placed", "untouched", "edited"):
         return _ok(STATUS_RESTING, oid=oid, raw=resp)
     if status == "cancelled" or "wouldnotexecute" in status:
         # IOC 未成交/被撤销：**不是**「挂单在场」，而是「这张单没成交、已经不在了」。
         # 保留 STATUS_RESTING 只为不破坏 executor（它据此撤单放弃，语义安全），
         # 但显式标 not_executed=True 让调用方不必靠 status 猜。
         return _ok(STATUS_RESTING, oid=oid, raw=resp, not_executed=True)
+    if status in ("filled", "partiallyfilled"):
+        # 说成交却没有任何 EXECUTION 明细 —— 成交价/量不可信，绝不编造成交价。
+        return _err(f"订单状态 {status_raw} 但无 EXECUTION 明细（成交价/量不可信）", resp)
     reason = "; ".join(rejects) or str(status_raw or "") or "unknown"
     return _err(f"订单被拒：{reason}", resp)
 
@@ -285,12 +301,16 @@ class KrExchange:
                 return _err(f"{coin} contractSize={v:g} ≠ 1，本版本不支持（拒单）")
         params: dict[str, Any] = {"symbol": symbol, "side": "buy" if is_buy else "sell",
                                   "size": _fmt_num(_sz)}
+        # 跨组契约：reduceOnly=false **不传这个键**（缺省即非只减仓）；true 传字符串
+        # "true"（form-urlencode）。传 "false" 字符串在 Kraken 侧是字符串真值，
+        # 语义有歧义，干脆不传。
+        if reduce_only:
+            params["reduceOnly"] = "true"
         if trigger_px is not None:
             params.update({"orderType": _STOP_ORDER, "stopPrice": _fmt_num(trigger_px),
-                           "triggerSignal": "mark", "reduceOnly": "true" if reduce_only else "false"})
+                           "triggerSignal": "mark"})
         else:
-            params.update({"orderType": _IOC_ORDER, "limitPrice": _fmt_num(_px),
-                           "reduceOnly": "true" if reduce_only else "false"})
+            params.update({"orderType": _IOC_ORDER, "limitPrice": _fmt_num(_px)})
         if cli:
             params["cliOrdId"] = cli
         if self.dry_run:
@@ -312,6 +332,13 @@ class KrExchange:
         return out
 
     def cancel(self, coin: str, oid) -> dict:
+        """撤单。判定**只看 cancelStatus.status**（官方三值枚举），不猜错误文本。
+
+        - filled      → 已全部成交，撤不到，但也算「单已不在场」
+        - cancelled   → 撤成功
+        - notFound    → 已撤/本就不存在（幂等，调用方重试安全）
+        - 其它/缺失   → 失败（不猜，交给调用方下一轮对账）
+        """
         if self.dry_run:
             return _ok(STATUS_DRY, oid=oid)
         if not self._ensure() or self.endpoints is None:
@@ -319,16 +346,21 @@ class KrExchange:
         if not oid:
             return _err("cancel 缺 orderId")
         try:
-            self.endpoints.cancelorder(oid)
-            return _ok(STATUS_RESTING, oid=oid)
+            resp = self.endpoints.cancelorder(oid)
         except KrApiError as e:
-            # 已成交/已不存在的单继续撤会报错——对调用方这就是「撤了，无所谓」
-            if "notfound" in str(e).lower() or "not found" in str(e).lower() \
-                    or "filled" in str(e).lower():
-                return _ok(STATUS_FILLED, oid=oid, raw=e.raw)
             return _err(f"撤单失败：{_exc_text(e)}", e.raw)
         except Exception as e:                               # noqa: BLE001
             return _err(f"撤单异常：{_exc_text(e)}")
+        st = ""
+        if isinstance(resp, dict):
+            cs = resp.get("cancelStatus")
+            if isinstance(cs, dict):
+                st = str(cs.get("status") or "").strip().lower()
+        if st == "filled":
+            return _ok(STATUS_FILLED, oid=oid, raw=resp)
+        if st in ("cancelled", "notfound"):
+            return _ok(STATUS_RESTING, oid=oid, raw=resp)
+        return _err(f"撤单状态不可识别（status={st or '缺失'}）：{str(resp)[:200]}", resp)
 
     def cancel_all(self, coin: str) -> dict:
         """撤该合约全部挂单：用 Kraken 的 per-symbol cancelallorders（原子，少一轮竞态）。"""
@@ -364,21 +396,18 @@ class KrExchange:
         return _ok(STATUS_RESTING, raw={"noop": "schedule-cancel-disabled"})
 
     def _open_orders_checked(self) -> Tuple[list, bool]:
-        """(orders, trusted)：/openorders 成功即可信；异常时 ([], False)。
+        """(orders, trusted)：([], False) 表示「读不到/不可信」，调用方必须停手。
 
-        有 info（KrInfo）时复用它的 HL 形状映射（coin/oid/is_trigger…），
-        保证消费方字段口径一致。
+        有 info（KrInfo）时复用它的 HL 形状映射（coin/oid/is_trigger…），保证消费方
+        字段口径一致；**没有 info 时直接判不可信**——原始 /openorders 字段
+        （order_id/unfilledSize…）与消费方约定的归一形状不同，拿它当归一结果
+        会被对账读成「挂单为空」，那是 fail-open 的另一种写法。
         """
-        if self.info is not None:
-            try:
-                return self.info.open_orders_checked("")
-            except Exception as e:                           # noqa: BLE001
-                logger.warning("[kr-exchange] openorders 读取失败：%s", _exc_text(e))
-                return [], False
-        if not self._ensure() or self.endpoints is None:
+        if self.info is None:
+            logger.warning("[kr-exchange] 未注入 KrInfo：挂单列表不可信（返回 untrusted）")
             return [], False
         try:
-            return self.endpoints.openorders(), True
+            return self.info.open_orders_checked("")
         except Exception as e:                               # noqa: BLE001
             logger.warning("[kr-exchange] openorders 读取失败：%s", _exc_text(e))
             return [], False

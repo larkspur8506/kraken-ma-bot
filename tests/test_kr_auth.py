@@ -47,6 +47,77 @@ class TestHeaders(unittest.TestCase):
         self.assertEqual(KrClient._method_of("/derivatives/api/v3/sendorder"), "sendorder")
 
 
+class TestRetryPolicy(unittest.TestCase):
+    """A1/A2 回归：**写端点不重试**（POST 只发一次），GET 仍 3 次。
+
+    Kraken 的 sendorder 重发 = 第二张真单；网络抖动时「宁可失败让人工/下一轮对账兜」
+    也比「多下一张」便宜。
+    """
+
+    def _client(self):
+        import base64
+        return KrClient(api_key="k", secret_b64=base64.b64encode(b"x" * 32).decode())
+
+    def test_post_defaults_to_single_attempt(self):
+        c = self._client()
+        seen = {}
+
+        def fake(url, *, method="GET", data=b"", headers, retries=3):
+            seen["retries"] = retries
+            return {"result": "success"}, 200
+
+        c._request = fake
+        c.post("/derivatives/api/v3/sendorder", {"symbol": "PF_XBTUSD"})
+        self.assertEqual(seen["retries"], 1)
+
+    def test_post_retries_kwarg_passthrough(self):
+        c = self._client()
+        seen = {}
+
+        def fake(url, *, method="GET", data=b"", headers, retries=3):
+            seen["retries"] = retries
+            return {"result": "success"}, 200
+
+        c._request = fake
+        c.post("/derivatives/api/v3/sendorder", {}, retries=3)
+        self.assertEqual(seen["retries"], 3)
+
+    def test_get_private_keeps_three_attempts(self):
+        c = self._client()
+        seen = {}
+
+        def fake(url, *, method="GET", data=b"", headers, retries=3):
+            seen["retries"] = retries
+            return {"accounts": {}}, 200
+
+        c._request = fake
+        c.get_private("/derivatives/api/v3/accounts")
+        self.assertEqual(seen["retries"], 3)
+
+    def test_write_failure_is_not_resent(self):
+        """真实调用一次（urlopen 抛网络错）：POST 只能有一次尝试。"""
+        import urllib.error
+        import urllib.request as urlreq
+
+        c = self._client()
+        calls = []
+
+        class _Boom:
+            def __call__(self, req, timeout=None):
+                calls.append(req.full_url)
+                raise urllib.error.URLError("network down")
+
+        orig = urlreq.urlopen
+        urlreq.urlopen = _Boom()
+        try:
+            resp, st = c.post("/derivatives/api/v3/sendorder", {"a": "b"})
+        finally:
+            urlreq.urlopen = orig
+        self.assertEqual(len(calls), 1, "写端点重发会变成第二张真单")
+        self.assertEqual(st, 0)
+        self.assertIn("httpError", resp)
+
+
 class TestEndpointPaths(unittest.TestCase):
     def test_account_uses_plural_accounts(self):
         calls = []

@@ -226,7 +226,8 @@ class TestExecutorCard(BaseCase):
             self.assertIn("<h2>执行器</h2>", html)
             seg = self.executor_seg(html)
             self.assertIn("执行器最后事件", seg)
-            self.assertIn("交易所 api.hyperliquid.xyz · 主网", seg)
+            # 2026-11-08 审核 C1：默认基址 = 线上 venue（Kraken 期货），不再是 HL
+            self.assertIn("交易所 futures.kraken.com · 主网", seg)
             # 对账/熔断/卡单三行删除 —— 状态条徽章是唯一出处（卡内 0 处）
             for gone in ("对账", "熔断", "卡在 intent/sent"):
                 self.assertNotIn(gone, seg, f"「{gone}」不该再出现在执行器卡内")

@@ -807,6 +807,28 @@ class DB:
         return list(self.conn.execute("SELECT * FROM hl_fills ORDER BY id DESC LIMIT ?", (limit,)))
 
     @_locked
+    def fills_totals(self) -> tuple:
+        """**全表**成交聚合 → `(Σ closed_pnl, Σ 手续费U)`，给面板「累计已实现 / 净手续费」。
+
+        为什么另起一个方法而不是在 views 里对 `hl_recent_fills(2000)` 求和：那个是
+        「最近 2000 条」的窗口口径，成交一多就静默少算（面板上的「累计」其实只是
+        「最近一段」）。聚合必须落到 SQL 全表，与条数无关。
+
+        手续费口径与读侧 `views._fee_quoted` 严格一致：`fee_quote`（已折算成 U）优先，
+        为 NULL 的老行回退 `fee` —— 只 `COALESCE(fee_quote, 0)` 会让 PR-1 之前的老成交
+        手续费凭空消失，与「逐笔手续费加起来等于合计」的口径打架。
+
+        空表 → `(0.0, 0.0)`；`closed_pnl` 为 NULL 的行按 0 计入（它代表「这笔没有平仓盈亏」，
+        不是「本金未知」）。
+        """
+        r = self.conn.execute(
+            "SELECT COALESCE(sum(closed_pnl), 0.0) AS pnl,"
+            " COALESCE(sum(COALESCE(fee_quote, fee, 0.0)), 0.0) AS fee FROM hl_fills").fetchone()
+        if r is None:
+            return 0.0, 0.0
+        return float(r["pnl"] or 0.0), float(r["fee"] or 0.0)
+
+    @_locked
     def hl_fills_since(self, since_ts: float) -> List[sqlite3.Row]:
         return list(self.conn.execute(
             "SELECT * FROM hl_fills WHERE created_at >= ? ORDER BY id", (since_ts,)))

@@ -692,6 +692,22 @@ class TestFifthRoundResiduals(unittest.TestCase):
             self.assertAlmostEqual(acct["mr_margin_used"], 250.0, places=6)
             self.assertAlmostEqual(acct["mr_margin_reserved"], 50.0, places=6)
 
+    def test_flat_mr_occupies_zero(self):
+        """【B9】MR 空仓时占用必须是 0：全账户 marginUsed 不得被当成 MR 占用去扣定仓基数。
+
+        旧代码 `occupied = mr_margin_used`：MR 空仓但 crypto 腿有仓（marginUsed>0）时，
+        crypto 腿的定仓基数被按「MR 也在用」扣一截，MR 停用期间照样扣。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)                    # mr_szi="0" → MR 空仓
+            info.user_state_dex = lambda a, d: {
+                "marginSummary": {"marginUsed": "50"},        # 全是 crypto 腿的保证金
+                "assetPositions": []}
+            acct = leg._read_account(ADDR)
+            self.assertIsNone(acct["mr_pos"])
+            self.assertEqual(acct["mr_margin_used"], 0.0)     # 不扣
+            self.assertAlmostEqual(acct["mr_margin_reserved"], 50.0)  # 展示口径保留全账户
+
     def test_bare_coin_name_is_recognised(self):
         """持仓行为裸名 `XYZ100` 时也要认出来（无仓无法实测，两种都认）。"""
         with tempfile.TemporaryDirectory() as tmp:

@@ -50,6 +50,36 @@ class TestChartsHistory(unittest.TestCase):
         self.assertEqual(registry.kr_coin("PF_SOLUSD"), "SOL")
         self.assertIsNone(registry.kr_symbol("DOGE"))
 
+    def test_qqq_symbol_registered_without_mexc(self):
+        """A5：QQQ_USDT 必须登记（防 SYMBOLS 误配静默坏），且没有 MEXC 段。"""
+        from app import symbol_registry as registry
+        entry = registry.get("QQQ_USDT")
+        self.assertEqual(entry.hl_coin, "QQQ")
+        self.assertIsNone(entry.mexc)
+        self.assertIsNone(registry.mexc_spec("QQQ_USDT"))
+        self.assertEqual(registry.kr_symbol(registry.hl_coin("QQQ_USDT")), "PF_QQQXUSD")
+
+
+class TestChartsUrl(unittest.TestCase):
+    """A2：K 线 URL 必须跟随客户端 base_url（demo/自建地址不被常量覆盖）。"""
+
+    def test_charts_url_follows_base_url(self):
+        class _C:
+            base_url = "https://demo-futures.kraken.com"
+
+            def __init__(self):
+                self.url = None
+
+            def get_public(self, url, retries=4):
+                self.url = url
+                return {"candles": [], "more_candles": False}, 200
+
+        c = _C()
+        KrEndpoints(c).charts("PF_XBTUSD", "4h", 100, 200)
+        self.assertEqual(
+            c.url,
+            "https://demo-futures.kraken.com/api/charts/v1/trade/PF_XBTUSD/4h?from=100&to=200")
+
 
 if __name__ == "__main__":
     unittest.main()

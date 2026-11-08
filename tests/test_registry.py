@@ -28,7 +28,8 @@ from app.sizing import SPECS, size_order                               # noqa: E
 from app.symbol_registry import (MexcSpec, SymbolEntry,                # noqa: E402
                                  SymbolNotConfigured)
 
-THREE = ["BTC_USDT", "ETH_USDT", "SOL_USDT"]
+# 已登记的标的（QQQ_USDT 是 MR 腿标的：无 MEXC 段，登记目的见 symbol_registry 注释）
+THREE = ["BTC_USDT", "ETH_USDT", "SOL_USDT", "QQQ_USDT"]
 
 
 class FakeFeed:
@@ -71,7 +72,7 @@ def _cfg(**kw):
 
 # ================================================================ a. registry
 class TestRegistryBasics(unittest.TestCase):
-    def test_known_symbols_has_three(self):
+    def test_known_symbols_complete(self):
         self.assertEqual(registry.known_symbols(), THREE)
 
     def test_get_and_hl_coin_correct(self):

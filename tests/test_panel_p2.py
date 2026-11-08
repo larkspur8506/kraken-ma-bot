@@ -300,7 +300,7 @@ class TestEventPoolWidened(BaseCase):
         html = self.admin(tab="records")
         self.assertIn("人工切换执行器模式 → dry", html,
                       "执行器事件池扩容后，池外真实事件回到主页")
-        self.assertIn("执行器事件（hl_events · 最近 1 条）", html, "标题行数仍如实")
+        self.assertIn("执行器事件（最近 1 条）", html, "标题行数仍如实")
 
     def test_alert_pool_widened_same_way(self):
         self.db.log_alert("BTC_USDT", 1_700_000_000_000, "entry", "开多 BTC（真实提醒）", True)
@@ -308,7 +308,7 @@ class TestEventPoolWidened(BaseCase):
             self.db.log_alert(None, None, "heartbeat", f"每日心跳推送 {i}", True)
         html = self.admin(tab="records")
         self.assertIn("开多 BTC（真实提醒）", html, "提醒日志池同一修法")
-        self.assertIn("提醒日志（alert_logs · 最近 1 条）", html)
+        self.assertIn("提醒日志（最近 1 条）", html)
 
     def test_empty_state_logic_kept(self):
         # 池里全是例行行：仍显示「被滤光」而非「没有数据」（真没有 vs 被滤光两种文案）

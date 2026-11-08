@@ -132,7 +132,7 @@ if FastAPI is not None:
         """表头 9 列 + 数据 9 格 + 列序对齐（回归本 bug）。"""
 
         def _rows(self, html):
-            m = re.search(r"成交（hl_fills · 最近 \d+ 条）.*?<tbody>(.*?)</tbody>", html, re.S)
+            m = re.search(r"成交（最近 \d+ 条）.*?<tbody>(.*?)</tbody>", html, re.S)
             self.assertIsNotNone(m, "找不到记录页成交表")
             out = []
             for tr in re.findall(r"<tr>(.*?)</tr>", m.group(1), re.S):
@@ -144,7 +144,7 @@ if FastAPI is not None:
 
         def test_records_header_has_8_columns_in_order(self):
             html = self.client.get("/admin", params={"k": TOKEN, "tab": "records"}).text
-            m = re.search(r"成交（hl_fills · 最近 \d+ 条）.*?<thead><tr>(.*?)</tr></thead>",
+            m = re.search(r"成交（最近 \d+ 条）.*?<thead><tr>(.*?)</tr></thead>",
                           html, re.S)
             self.assertIsNotNone(m)
             heads = [re.sub(r"<[^>]+>", "", h).strip()
@@ -165,7 +165,7 @@ if FastAPI is not None:
             self.assertEqual(r[7], "—")                        # 减仓列 = 非平仓
             # 总览不再有这张表（迁走了，不是删了）
             ov = self.client.get("/admin", params={"k": TOKEN, "tab": "overview"}).text
-            self.assertNotIn("成交（hl_fills", ov)
+            self.assertNotIn("成交（最近", ov)
             self.assertNotIn("最近成交（最近", ov)
 
         def test_buy_sell_four_directions_on_records(self):
@@ -208,7 +208,7 @@ if FastAPI is not None:
             self.ins_fill("r1", "Close Long", 0.005, 100_000.0, pnl=5.0, reduce=True)
             self.ins_fill("r2", "Open Short", 0.005, 100_000.0)
             html = self.client.get("/admin", params={"k": TOKEN, "tab": "records"}).text
-            m = re.search(r"成交（hl_fills · 最近 \d+ 条）.*?<table>(.*?)</table>", html, re.S)
+            m = re.search(r"成交（最近 \d+ 条）.*?<table>(.*?)</table>", html, re.S)
             self.assertIsNotNone(m)
             trs = re.findall(r"<tr>(.*?)</tr>", m.group(1), re.S)
             body = [t for t in trs if "<td" in t]

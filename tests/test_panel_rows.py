@@ -121,16 +121,16 @@ class TestRecordsTableRows(BaseCase):
         for i in range(30):
             _fill(self.db, i)
         html = self.body(tab="records")
-        self.assertEqual(self._count_rows(html, "成交（hl_fills · 最近 20 条）"), 20)
+        self.assertEqual(self._count_rows(html, "成交（最近 20 条）"), 20)
         html = self.body(tab="records", n=50)
-        self.assertEqual(self._count_rows(html, "成交（hl_fills · 最近 50 条）"), 30)
+        self.assertEqual(self._count_rows(html, "成交（最近 50 条）"), 30)
         html = self.body(tab="records", n=10)
-        self.assertEqual(self._count_rows(html, "成交（hl_fills · 最近 10 条）"), 10)
+        self.assertEqual(self._count_rows(html, "成交（最近 10 条）"), 10)
 
     def test_orders_title_shows_count(self):
         self.db.hl_record_intent("BTC_USDT", "BTC", BAR, "entry", 1, 0.005, px=100_000.0)
         html = self.body(tab="records")
-        self.assertIn("下单记录（hl_orders · 最近 20 条）", html)
+        self.assertIn("下单记录（最近 20 条）", html)
 
     def test_signals_follow_setting(self):
         """信号块也用同一 n 切片（迁入记录页时就按这个口径做）。"""
@@ -164,7 +164,7 @@ class TestEventsNotOnOverview(BaseCase):
         self.assertNotIn("人工切换执行器模式", ov)
         rec = self.body(tab="records")
         # P1 降噪后标题行数 = 实际渲染行数（铁律 8）：只有 1 条非常规事件就写 1。
-        self.assertIn("执行器事件（hl_events · 最近 1 条）", rec)
+        self.assertIn("执行器事件（最近 1 条）", rec)
         self.assertIn("人工切换执行器模式", rec)
 
 

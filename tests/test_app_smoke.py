@@ -126,6 +126,98 @@ class TestAppAssembly(unittest.TestCase):
         self.assertIsNone(mod._hl_info, "保存凭据后只读客户端缓存必须失效")
         self.assertEqual(mod.db.get_config_str("kr_api_key"), "kr-key-1")
 
+    def test_hl_keyform_not_mounted_on_kraken(self):
+        """B10：Kraken 构建**不挂** /admin/hl/key。
+
+        那个页面写的是 HL 代理钱包私钥，而 `kr_secret()` 的兜底链最后一环是
+        `hl_private_key()` —— 从这里录进去的值会变成 Kraken 的 API secret，签名全错，
+        页面却显示「✅ 已写入」。Kraken key 的唯一入口是面板「更新 API」（`_kr_renew`）。
+        """
+        try:
+            import fastapi                                            # noqa: F401
+        except ImportError:
+            self.skipTest("fastapi 未安装")
+        mod = importlib.import_module("app.main")
+        importlib.reload(mod)
+        paths = self._route_paths(mod.app)
+        self.assertNotIn("/admin/hl/key", paths,
+                         "Kraken 构建不该挂 HL 私钥录入页（会污染 kr_secret 回落链）")
+        # 反向断言：Kraken 凭据的正规入口必须在（免得「两边都没了」也算通过）
+        self.assertIn("/api/hl/status", paths)
+
+    def test_mr_identity_tracks_kraken_credentials(self):
+        """B7：MR 腿指纹 = (mode, base_url, sha256(kr_api_key:kr_secret))。
+
+        旧实现把 `hl_params().private_key`（执行器的 HL 私钥）算进指纹：换 Kraken key
+        不会重建腿（旧凭据继续用），而改一个与 MR 无关的 HL 私钥却会重建。
+        """
+        try:
+            import fastapi                                            # noqa: F401
+        except ImportError:
+            self.skipTest("fastapi 未安装")
+        mod = importlib.import_module("app.main")
+        importlib.reload(mod)
+        old_env = {k: os.environ.get(k) for k in ("KRAKEN_API_KEY", "KRAKEN_API_SECRET",
+                                                  "HL_PRIVATE_KEY")}
+        os.environ["KRAKEN_API_KEY"] = ""
+        os.environ["KRAKEN_API_SECRET"] = ""          # 强制走 DB，避免开发机 env 干扰
+        try:
+            mod.db.set_config("kr_api_key", "kr-key-a")
+            mod.db.set_config("kr_api_secret", "c2VjcmV0LWE=")
+            ident = mod._mr_identity()
+            self.assertEqual(len(ident), 3)           # (mode, base_url, fp)
+            self.assertEqual(ident, mod._mr_identity())          # 稳定
+            self.assertNotIn("kr-key-a", repr(ident))            # 不含明文
+            # HL 私钥与 MR 腿无关：改它不重建腿
+            mod.db.set_config("hl_private_key", "0x" + "ab" * 32)
+            self.assertEqual(ident, mod._mr_identity())
+            # 换 Kraken key → 指纹变化（下一轮 tick 重建腿）
+            mod.db.set_config("kr_api_key", "kr-key-b")
+            self.assertNotEqual(ident, mod._mr_identity())
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_mr_leg_uses_configured_taker_fee(self):
+        """B8：HlMrConfig.taker_fee_rate 必须来自配置，不能吃模块默认常量。"""
+        try:
+            import fastapi                                            # noqa: F401
+        except ImportError:
+            self.skipTest("fastapi 未安装")
+        mod = importlib.import_module("app.main")
+        importlib.reload(mod)
+        # kr_taker_fee 由 Config 字段提供（env KR_TAKER_FEE 只在进程启动时读一次，
+        # 这里直接改 Config 实例，等价于「运维改了费率档」）。
+        old_fee = mod.config.kr_taker_fee
+        mod.config.kr_taker_fee = 0.0009                         # 故意不等于任何默认值
+        try:
+            self.assertAlmostEqual(mod.current_config().kr_taker_fee, 0.0009)
+            mod.db.set_config("hl_exec_mode", "dry")
+            import app.hl.mr as mr_mod
+            seen = {}
+            orig = mr_mod.HlMrConfig
+
+            class _Rec(orig):                          # 记录装配时传了哪些关键字参数
+                def __init__(self, *a, **kw):
+                    seen.update(kw)
+                    super().__init__(*a, **kw)
+
+            mr_mod.HlMrConfig = _Rec
+            try:
+                leg = mod._build_mr_leg()
+            finally:
+                mr_mod.HlMrConfig = orig
+            self.assertIsNotNone(leg, "dry 模式应能离线装配 MR 腿")
+            self.assertEqual(seen.get("taker_fee_rate"), 0.0009,
+                             "taker_fee_rate 必须按关键字参数显式传入")
+            self.assertAlmostEqual(leg.config.taker_fee_rate, 0.0009)
+            self.assertEqual((leg.config.coin, leg.config.dex), ("QQQ", "kr"))
+        finally:
+            mod.config.kr_taker_fee = old_fee
+
     @staticmethod
     def _route_paths(app) -> set:
         return set(app.openapi().get("paths", {}).keys())

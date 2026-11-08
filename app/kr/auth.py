@@ -65,7 +65,11 @@ def sign(secret_b64: str, payload: bytes, method: str) -> str:
 
 
 class KrClient:
-    """REST 客户端：私有端点走签名，公开端点免鉴权。网络错误重试 3 次（1/3/9s 退避）。
+    """REST 客户端：私有端点走签名，公开端点免鉴权。
+
+    重试策略按「读写分离」：GET（幂等）网络错误重试 3 次（1/3/9s 退避）；
+    POST 是写端点（下单/撤单），**默认只发一次**（`retries=1`）——请求可能已经
+    到达交易所并生效，重发会变成两张单 / 重复撤单，重试的代价远大于失败。
 
     返回 ``(payload_dict, http_status)``；HTTP 4xx/5xx 也返回（body 尽力解析），
     让上层按业务错误处理，而不是把「交易所明确拒绝」和网络抖动混为一谈。
@@ -127,17 +131,20 @@ class KrClient:
         """`/derivatives/api/v3/sendorder` → `sendorder`（签名只用端点名）。"""
         return path.rstrip("/").rsplit("/", 1)[-1]
 
-    def post(self, path: str, params: dict | None = None) -> tuple:
+    def post(self, path: str, params: dict | None = None, retries: int = 1) -> tuple:
+        """写端点：**默认不重试**（写操作重发的代价是重复下单，不是丢一次请求）。"""
         url = f"{self.base_url}{path}"
         body = urllib.parse.urlencode(params or {})
         headers = self._auth_headers(self._method_of(path), body.encode())
-        return self._request(url, method="POST", data=body.encode(), headers=headers)
+        return self._request(url, method="POST", data=body.encode(), headers=headers,
+                             retries=retries)
 
     def get_private(self, path: str, params: dict | None = None) -> tuple:
         qs = urllib.parse.urlencode(params or {})
         url = f"{self.base_url}{path}" + (f"?{qs}" if qs else "")
         headers = self._auth_headers(self._method_of(path), qs.encode())
-        return self._request(url, headers=headers)
+        # GET 幂等 → 保持 3 次重试（与改造前一致）
+        return self._request(url, headers=headers, retries=3)
 
     # ------------------------------------------------------------- public API
     def get_public(self, url: str, retries: int = 4) -> tuple:

@@ -456,9 +456,9 @@ class MainRecordsRegression(BaseCase):
         r = self.client.get("/admin", params={"k": TOKEN, "tab": "records"}).text
         # 块顺序：资金流水 → 记录 → 下单 → 成交 → 信号 → 提醒 → 事件
         order = [r.index("<h2>资金流水"), r.index("<h2>记录</h2>"),
-                 r.index("下单记录（hl_orders"), r.index("成交（hl_fills"),
-                 r.index("<h2>信号</h2>"), r.index("提醒日志（alert_logs"),
-                 r.index("执行器事件（hl_events")]
+                 r.index("下单记录（最近"), r.index("成交（最近"),
+                 r.index("<h2>信号</h2>"), r.index("提醒日志（最近"),
+                 r.index("执行器事件（最近")]
         self.assertEqual(order, sorted(order), "记录页块顺序被改变了")
         # 「全部 ›」六条，指向各自的子页
         for slug in SLUGS:

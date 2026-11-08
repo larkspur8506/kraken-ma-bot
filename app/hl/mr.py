@@ -7,7 +7,8 @@
   szDecimals 从 `meta?dex=xyz` 现查，绝不硬编码。
 - **权益口径**：统一账户下现货 USDC 余额**已含**全部持仓浮盈亏（见
   `app/hl/equity_fix.py` 的结论），所以 sizing 基数 = `info.account_equity()`
-  （现货 USDC 总额）− MR 仓占用（`marginUsed + uPnL`，与 Lighter 侧同口径）。
+  （现货 USDC 总额）− MR 仓占用（MR 仓自身价格敞口 = 数量 × 标记价，与 Lighter 侧
+  同口径；**不用** marginSummary.marginUsed —— 那是全账户口径，见 `_read_account`）。
   注意 `spotClearinghouseState` **没有 marginSummary**，必须读 `balances`。
 - **市价单**：交易所没有真市价，用激进 IOC 限价（mid ± slippage_bps 带宽）。
   价格取整走 venue 自己的精度：Kraken 用 `info.round_price()`（tickSize 整数倍），
@@ -293,6 +294,10 @@ class HlMrLeg:
         equity_total = float(self.info.account_equity(address) or 0.0)
         dex_state = self.info.user_state_dex(address, cfg.dex) or {}
         dms = dex_state.get("marginSummary") or {}
+        # 【B9】`marginUsed` 是**全账户**口径（这个 venue 没有按 dex/按腿拆分的保证金读数），
+        # 不能直接当「MR 腿占用」去扣：MR 空仓时它包含 crypto 腿的保证金，扣一次等于
+        # 按「MR 也在用」把 crypto 腿的定仓基数压低。所以它只做展示（mr_margin_reserved），
+        # 真正的占用由下面按 MR 仓自己的敞口算；MR 空仓 = 占用 0。
         mr_margin_used = float(dms.get("marginUsed") or 0.0)
         mr_pos = None
         bare = cfg.coin.split(":")[-1]
@@ -318,13 +323,17 @@ class HlMrLeg:
         # 按保证金扣时，同一个 MR 敞口在 5x 下只扣 1/5 —— 扣多少取决于杠杆设置，
         # 而 Lighter 侧是 1x（扣满额）⇒ 同样 exposure，HL 的 crypto 腿会被放大 1.8 倍。
         # 保证金值单独保留在 `mr_margin_reserved` 里做展示，不参与定仓。
-        occupied = mr_margin_used
+        # 【B9】MR **空仓**时占用必须是 0：旧代码 `occupied = mr_margin_used` 把全账户
+        # marginUsed（含 crypto 腿自己占的保证金）当成 MR 占用 → crypto 腿定仓基数被
+        # 无端扣掉一截，MR 停用期间也一样扣（而且随 crypto 仓位变大而变大，形成负反馈）。
+        occupied = 0.0
         if mr_pos is not None:
             value = mr_pos["position_value"]
             if not value:
                 value = abs(mr_pos["szi"]) * mr_pos["entry_px"]
             occupied = max(abs(value), 0.0)
         return {"equity_total": equity_total, "mr_margin_used": occupied,
+                # 展示用：**全账户**保证金（无 dex 拆分），不要拿它定仓/扣减。
                 "mr_margin_reserved": mr_margin_used,
                 "mr_margin_raw": mr_margin_used, "mr_pos": mr_pos}
 

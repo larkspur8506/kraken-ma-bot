@@ -25,12 +25,12 @@ import unittest
 from pathlib import Path
 
 from app.db import DB
-from app.hl import EV_ORDER, MODE_LIVE, PURPOSE_STOP
+from app.hl import EV_ORDER, MODE_LIVE, PURPOSE_ENTRY, PURPOSE_STOP
 from app.hl import agent as A
 from app.hl import sizing as hl_sizing
 from app.hl.exchange import STATUS_FILLED, STATUS_RESTING
 from app.hl.executor import Executor, ExecParams
-from tests.test_hl_executor import FakeExchange, FakeInfo, FakeNotifier, _pos, _snap
+from tests.test_hl_executor import FakeExchange, FakeInfo, FakeNotifier, _pos, _snap, _stop_order
 
 # Kraken 真实形态的订单号：带连字符的 UUID 字符串，int() 必炸。
 UUID_OID = "06b9d509-965c-4788-b317-0e5ca11d56fb"
@@ -244,6 +244,241 @@ class TestDirCaseInsensitive(Base):
         self.info._fills = [{"coin": "BTC", "px": "84420.5", "dir": "Close Long"}]
         px, _fills = self.executor()._last_fill_px("BTC")
         self.assertAlmostEqual(px, 84420.5)
+
+
+# --------------------------------------------- 成交顺序 / not_executed（B1/B2/B3）
+BASE_MS = 1_760_000_000_000        # 固定基准时刻（毫秒），避免依赖「现在」
+
+
+def _mk_fill(i, coin="BTC", direction="Open Long", ts_offset_ms=60_000, **kw):
+    """第 i 笔成交：时间 = BASE_MS + i*60s。"""
+    f = {"tid": f"kr-{i}", "coin": coin, "dir": direction, "sz": 0.001, "px": 84000.0,
+         "fee": 0.42, "feeToken": "USD", "closedPnl": 0.0, "hash": f"kr-{i}",
+         "oid": UUID_OID, "time": BASE_MS + i * ts_offset_ms}
+    f.update(kw)
+    return f
+
+
+class TestFillChronology(Base):
+    """venue 契约：**成交列表的顺序不可信**（Kraken 升序 / HL 降序）。
+
+    `_sync_fills` 以前取 `fills[:limit]` —— 在 Kraken 上永远是「最旧的一批」，
+    窗口内成交一多，最新成交（含止损平仓）永远进不了库：手续费/净利/对账证据全缺。
+    """
+
+    def test_helper_sorts_ascending_keeps_untimed_slots(self):
+        from app.hl.executor import _fills_time_ascending
+        t1, t2, t3 = (_mk_fill(i) for i in (1, 2, 3))
+        u1, u2 = {"tid": "u1", "coin": "BTC"}, {"tid": "u2", "coin": "BTC"}
+        out = _fills_time_ascending([u1, t2, t3, u2, t1])
+        # 有 time 的行按时间升序回填到「有 time 的槽位」，无 time 的行留在原位
+        self.assertEqual([f["tid"] for f in out], ["u1", "kr-1", "kr-2", "u2", "kr-3"])
+
+    def test_sync_fills_takes_latest_from_ascending_feed(self):
+        """Kraken `/fills` 升序：必须取最后 limit 条（最新），不是前 limit 条。"""
+        added = self.executor()._sync_fills(fills=[_mk_fill(i) for i in range(150)])
+        self.assertEqual(added, 100)
+        tids = {str(r["tid"]) for r in self.db.hl_recent_fills(500)}
+        self.assertIn("kr-149", tids)
+        self.assertIn("kr-50", tids)               # 最后 100 条 = 50..149
+        self.assertNotIn("kr-49", tids)
+        self.assertNotIn("kr-0", tids)
+
+    def test_sync_fills_takes_latest_from_descending_feed(self):
+        """HL 桩降序：同一窗口取到的集合必须与升序一致（顺序无关）。"""
+        fills = list(reversed([_mk_fill(i) for i in range(150)]))
+        self.assertEqual(self.executor()._sync_fills(fills=fills), 100)
+        tids = {str(r["tid"]) for r in self.db.hl_recent_fills(500)}
+        self.assertIn("kr-149", tids)
+        self.assertNotIn("kr-0", tids)
+        self.assertEqual(len(tids), 100)
+
+    def test_sync_fills_untimed_rows_still_participate(self):
+        """无 time 的行不能因为排序丢键：照原序参与（这里 limit 足够大，全部入库）。"""
+        fills = [{"tid": "u1", "coin": "BTC", "dir": "Open Long", "sz": 0.001, "px": 84000.0,
+                  "fee": 0.1, "feeToken": "USD", "closedPnl": 0.0},
+                 _mk_fill(1)]
+        self.assertEqual(self.executor()._sync_fills(fills=fills), 2)
+
+    def test_last_fill_px_picks_latest_close(self):
+        """两笔平仓成交（升序）→ 必须取**最新**那笔的价格（旧代码取第一条=最旧）。"""
+        self.info._fills = [
+            _mk_fill(1, direction="Open Long", px=83000.0),
+            _mk_fill(2, direction="Close Long", px=80100.0),
+            _mk_fill(3, direction="Open Long", px=82000.0),
+            _mk_fill(4, direction="Close Long", px=84500.0),      # 最新平仓
+        ]
+        px, _raw = self.executor()._last_fill_px("BTC")
+        self.assertAlmostEqual(px, 84500.0)
+
+    def test_last_fill_px_picks_latest_close_descending(self):
+        """降序（HL 原生）同样取最新，不依赖列表顺序。"""
+        self.info._fills = [
+            _mk_fill(4, direction="Close Long", px=84500.0),
+            _mk_fill(2, direction="Close Long", px=80100.0),
+        ]
+        px, _raw = self.executor()._last_fill_px("BTC")
+        self.assertAlmostEqual(px, 84500.0)
+
+    def test_last_fill_px_respects_opened_at_lower_bound(self):
+        """上上轮仓位的平仓成交（早于 opened_at−120s）不得拿来给本仓关账。"""
+        opened_at = BASE_MS / 1000.0
+        self.info._fills = [
+            # 上一轮：早于本仓开仓 1 小时 —— 时间边界外的旧价
+            _mk_fill(0, direction="Close Long", px=70000.0,
+                     time=BASE_MS - 3600_000),
+            _mk_fill(1, direction="Close Long", px=84500.0,
+                     time=BASE_MS + 60_000),
+        ]
+        px, _raw = self.executor()._last_fill_px("BTC", since_ts=opened_at)
+        self.assertAlmostEqual(px, 84500.0)
+
+    def test_last_fill_px_no_evidence_inside_bound(self):
+        """只有边界外的旧平仓成交 → 不给价（返回 None），而不是拿旧价关账。"""
+        self.info._fills = [_mk_fill(0, direction="Close Long", px=70000.0,
+                                     time=BASE_MS - 3600_000)]
+        px, raw = self.executor()._last_fill_px("BTC", since_ts=BASE_MS / 1000.0)
+        self.assertIsNone(px)
+        self.assertTrue(raw)                       # 诊断用原文仍返回
+
+
+class TestNotExecuted(Base):
+    """Kraken：cancelled / iocWouldNotExecute → `ok=True, RESTING, not_executed=True`。
+
+    消费侧必须把「单从未进入委托簿」与「挂单在场」区分开，否则：
+      * 入场：去撤一张不存在的单（还把 churn 计数当撤单记一次）；
+      * 止损：台账记成 resting（以为有保护），实际仓位裸奔。
+    """
+
+    def _entry_not_executed(self):
+        return {"ok": True, "status": STATUS_RESTING, "oid": UUID_OID, "avg_px": None,
+                "filled_sz": None, "error": "", "raw": {}, "not_executed": True}
+
+    def test_entry_not_executed_skips_cancel(self):
+        pid = self.add_signal()
+        self.ex.entry = self._entry_not_executed()
+        self.assertTrue(self.executor().on_entry(pid))
+        self.assertEqual([c for c in self.ex.calls if c[0] == "cancel"], [],
+                         "not_executed 的单不在委托簿里，撤单是无效调用")
+        # 只发了那一张入场 IOC：没有止损单、没有平仓单（整条链在入场失败处收束）
+        orders = [c for c in self.ex.calls if c[0] == "order"]
+        self.assertEqual(len(orders), 1)
+        self.assertIsNone(orders[0][6])            # 不是触发单（没有止损）
+        self.assertFalse(orders[0][5])             # 不是 reduce_only 平仓单
+        bar_ms = int(self.db.position_by_id(pid)["signal_bar_ms"])
+        self.assertEqual(self.db.hl_order("BTC_USDT", bar_ms, PURPOSE_ENTRY)["status"], "failed")
+
+    def test_stop_not_executed_triggers_immediate_flatten(self):
+        """止损 not_executed = 挂单失败 → 仓位无保护 → 必须走「立即平仓」闭环。"""
+        pid = self.add_signal()
+        self.ex.stop = {"ok": True, "status": STATUS_RESTING, "oid": UUID_OID_STOP,
+                        "avg_px": None, "filled_sz": None, "error": "", "raw": {},
+                        "not_executed": True}
+        self.assertTrue(self.executor().on_entry(pid))
+        bar_ms = int(self.db.position_by_id(pid)["signal_bar_ms"])
+        # 台账：止损行必须 failed（绝不能记 resting 让面板以为有保护）
+        self.assertEqual(self.db.hl_order("BTC_USDT", bar_ms, PURPOSE_STOP)["status"], "failed")
+        self.assertEqual(self.db.position_by_id(pid)["hl_status"], "aborted")
+        # 交易所侧只有一张平仓单（reduce_only、非触发单）
+        closes = [c for c in self.ex.calls
+                  if c[0] == "order" and c[5] is True and c[6] is None]
+        self.assertEqual(len(closes), 1)
+        self.assertTrue(any("止损" in str(m) for m in self.notifier.messages))
+
+    def test_real_resting_stop_is_still_accepted(self):
+        """反证：真挂上的止损（not_executed=False/缺键）不能被误判成失败。"""
+        pid = self.add_signal()
+        self.ex.stop = {"ok": True, "status": STATUS_RESTING, "oid": UUID_OID_STOP,
+                        "avg_px": None, "filled_sz": None, "error": None, "raw": {}}
+        self.assertTrue(self.executor().on_entry(pid))
+        bar_ms = int(self.db.position_by_id(pid)["signal_bar_ms"])
+        self.assertEqual(self.db.hl_order("BTC_USDT", bar_ms, PURPOSE_STOP)["status"], "resting")
+        self.assertEqual(self.db.position_by_id(pid)["hl_status"], "open")
+
+
+class TestReconcileOtherLegs(Base):
+    """B4：同一账户里的 MR 腿仓（QQQ）不是「人工单」。"""
+
+    def _snap_with(self, *coins):
+        return _snap(positions=[_pos(c, size=1.0, entry=93.0) for c in coins],
+                     orders=[_stop_order("BTC")])
+
+    def test_mr_leg_position_is_not_manual(self):
+        pid, _bar = self.open_position()                      # BTC 有本地台账
+        self.info._snap = self._snap_with("BTC", "QQQ")
+        res = self.executor().reconcile()
+        self.assertEqual([p for p in res["problems"] if "QQQ" in p], [])
+        self.assertTrue(res["ok"], res["problems"])           # 不再因此置 mismatch/kill
+        self.assertFalse(self.db.hl_kill())
+
+    def test_unknown_coin_still_reported(self):
+        """反证：注册表里也没有的 coin 仍要报出来（fail-closed，不认识就得被人看见）。"""
+        pid, _bar = self.open_position()
+        self.info._snap = self._snap_with("BTC", "DOGE")
+        res = self.executor().reconcile()
+        self.assertTrue(any("DOGE" in p for p in res["problems"]), res["problems"])
+        self.assertFalse(res["ok"])
+
+
+class TestRepairUnderMachineKill(Base):
+    """B6：机器触发的 kill（reconcile/size）不该挡住「补挂止损」这个减风险动作。"""
+
+    def _row_and_snap(self):
+        pid, _bar = self.open_position()
+        row = dict(self.db.position_by_id(pid))
+        snap = _snap(positions=[_pos("BTC")], orders=[])       # 交易所侧确实没有止损
+        return pid, row, snap
+
+    def test_size_kill_allows_stop_repair(self):
+        pid, row, snap = self._row_and_snap()
+        self.db.hl_set_kill(True, "数量对账不一致", origin="size")
+        self.ex.calls.clear()
+        self.executor()._repair_missing_stop(row, snap, kill_before=True)
+        triggers = [c for c in self.ex.calls if c[0] == "order" and c[6] is not None]
+        self.assertEqual(len(triggers), 1, "size kill 下仍必须补挂止损（减风险动作）")
+
+    def test_manual_kill_still_blocks(self):
+        pid, row, snap = self._row_and_snap()
+        self.db.hl_set_kill(True, "人工", origin="manual")
+        self.ex.calls.clear()
+        self.executor()._repair_missing_stop(row, snap, kill_before=True)
+        self.assertEqual(self.ex.calls, [], "人工 kill 期间自动化不许动交易所")
+
+
+class TestExitPriceFallback(Base):
+    """B5：平仓 IOC 限价算不出来时用**该 coin** 的标记价，不用旧 ref_price。"""
+
+    def test_exit_uses_mark_px_when_limit_fails(self):
+        pid, _bar = self.open_position()
+        self.ex.calls.clear()
+
+        def boom(coin, is_buy, mid=None):
+            raise RuntimeError("tickSize 读不到")
+        self.ex.slippage_limit = boom
+        self.ex.exit = {"ok": True, "status": STATUS_FILLED, "oid": UUID_OID_EXIT,
+                        "avg_px": 83000.0, "filled_sz": None, "error": None, "raw": {}}
+        self.info._snap = _snap(positions=[_pos("BTC", size=0.01, entry=83000.0)])
+
+        self.assertTrue(self.executor().on_exit(pid, "ma20", ref_price=70000.0))
+
+        orders = [c for c in self.ex.calls if c[0] == "order"]
+        self.assertEqual(len(orders), 1)
+        # _pos() 的 mark_px = entry+50 = 83050（ref_price 70000 绝不许出现在限价里）
+        self.assertEqual(orders[0][4], 83050.0)
+        self.assertNotEqual(orders[0][4], 70000.0)
+
+    def test_exit_refuses_to_send_without_mark_px(self):
+        """连标记价都没有 → 这轮不发单（止损已撤，宁可喊人也不拿旧价乱发）。"""
+        pid, _bar = self.open_position()
+        self.ex.calls.clear()
+
+        def boom(coin, is_buy, mid=None):
+            raise RuntimeError("tickSize 读不到")
+        self.ex.slippage_limit = boom
+        self.info._snap = _snap(positions=[])        # 快照里也没有该 coin
+        self.assertTrue(self.executor().on_exit(pid, "ma20", ref_price=70000.0))
+        self.assertEqual([c for c in self.ex.calls if c[0] == "order"], [])
+        self.assertTrue(any("未下平仓单" in str(m) for m in self.notifier.messages))
 
 
 # ------------------------------------------------------------------- agent 清仓取整

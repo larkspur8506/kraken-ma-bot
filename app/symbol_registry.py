@@ -60,6 +60,11 @@ _REGISTRY: Dict[str, SymbolEntry] = {
     "BTC_USDT": SymbolEntry("BTC_USDT", "BTC", MexcSpec(0.0001, 1, 1, 1)),
     "ETH_USDT": SymbolEntry("ETH_USDT", "ETH", MexcSpec(0.01, 1, 1, 2)),
     "SOL_USDT": SymbolEntry("SOL_USDT", "SOL", MexcSpec(0.1, 1, 1, 2)),
+    # QQQ 是 MR 腿（QQQX 永续）的标的，**没有** MEXC 合约段（mexc=None）。
+    # 登记它的目的：env SYMBOLS 里误配成 QQQ_USDT 时，信号层能查到 hl_coin/规格
+    # （而不是静默抛 KeyError 被 per-symbol try/except 吞掉 → 该标的永远没信号）；
+    # 同时 coin_map 的取值集合（executor 判定「主策略标的」）仍是显式配置的。
+    "QQQ_USDT": SymbolEntry("QQQ_USDT", "QQQ", None),
 }
 
 

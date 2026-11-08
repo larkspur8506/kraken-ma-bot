@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+# CHARTS_BASE 仅为向后兼容再导出（URL 现由 `self._base` 跟随客户端 base_url 拼装，
+# 不再用常量拼接，否则 demo/自定义地址会打生产端点）。
 from .auth import CHARTS_BASE, DEFAULT_BASE, KrClient, KrAuthError  # noqa: F401
 
 API = "/derivatives/api/v3"
@@ -45,6 +47,19 @@ class KrEndpoints:
     def __init__(self, client: KrClient | None = None) -> None:
         self.c = client or KrClient()
 
+    @property
+    def _base(self) -> str:
+        """服务基址：**跟随客户端的 base_url**（demo / 自定义地址必须生效）。
+
+        旧实现把 `DEFAULT_BASE` / `CHARTS_BASE` 常量拼死在 URL 里，配了
+        demo-futures 也照样打生产公网端点 —— 影子盘会读到真账户数据。
+        """
+        return (getattr(self.c, "base_url", "") or DEFAULT_BASE).rstrip("/")
+
+    @property
+    def _charts_base(self) -> str:
+        return f"{self._base}/api/charts/v1"
+
     # ------------------------------------------------------------ private
     def account(self) -> dict:
         """账户快照：端点名是 **/accounts（复数）**。
@@ -72,7 +87,8 @@ class KrEndpoints:
         return _raise_if_error(resp, st, "fills").get("fills") or []
 
     def sendorder(self, params: dict) -> dict:
-        resp, st = self.c.post(f"{API}/sendorder", params)
+        """下单：**写端点不重试**（retries=1）——重发可能就是第二张真实订单。"""
+        resp, st = self.c.post(f"{API}/sendorder", params, retries=1)
         return _raise_if_error(resp, st, "sendorder")
 
     def cancelorder(self, order_id: str) -> dict:
@@ -88,11 +104,11 @@ class KrEndpoints:
 
     # ------------------------------------------------------------ public
     def instruments(self) -> list:
-        resp, st = self.c.get_public(f"{DEFAULT_BASE}{API}/instruments")
+        resp, st = self.c.get_public(f"{self._base}{API}/instruments")
         return _raise_if_error(resp, st, "instruments").get("instruments") or []
 
     def tickers(self) -> list:
-        resp, st = self.c.get_public(f"{DEFAULT_BASE}{API}/tickers")
+        resp, st = self.c.get_public(f"{self._base}{API}/tickers")
         return _raise_if_error(resp, st, "tickers").get("tickers") or []
 
     def charts(self, trade_symbol: str, res: str, from_s: int, to_s: int,
@@ -102,7 +118,7 @@ class KrEndpoints:
         返回 (candles, more_candles)；candle 的 time 是毫秒、OHLCV 是字符串。
         单页上限 2000 根——翻页逻辑在 info.candles/charts_history 里做。
         """
-        url = f"{CHARTS_BASE}/{tick}/{trade_symbol}/{res}?from={int(from_s)}&to={int(to_s)}"
+        url = f"{self._charts_base}/{tick}/{trade_symbol}/{res}?from={int(from_s)}&to={int(to_s)}"
         resp, st = self.c.get_public(url)
         data = _raise_if_error(resp, st, "charts")
         return data.get("candles") or [], bool(data.get("more_candles"))

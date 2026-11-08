@@ -684,7 +684,9 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
              f"（页脚「每页行数」可切 10/20/50）。</div>")
 
     # ---- 下单记录 ----
-    o.append(f"<div class='card'><div class='sec'>下单记录（hl_orders · 最近 {n} 条）"
+    # 标题不写内部表名（hl_orders）：这是给人看的记录页，表名属于排障细节，
+    # 出现在标题里只会让用户以为要去看数据库（审核 C3）。
+    o.append(f"<div class='card'><div class='sec'>下单记录（最近 {n} 条）"
              f"{_all_link('orders', _token_of(deps))}</div>")
     rows = ""
     _orders_rows = _rows(deps, "hl_recent_orders", n)
@@ -708,7 +710,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     o.append("</div>")
 
     # ---- 成交 ----
-    o.append(f"<div class='card'><div class='sec'>成交（hl_fills · 最近 {n} 条）"
+    o.append(f"<div class='card'><div class='sec'>成交（最近 {n} 条）"
              f"{_all_link('fills', _token_of(deps))}</div>")
     rows = ""
     for r in _rows(deps, "hl_recent_fills", n):
@@ -751,8 +753,8 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     _alert_rows = [r for r in _alert_pool
                    if str(r.get("kind") or "") not in _ALERT_NOISE_KINDS][:n]
     _shown_n = len(_alert_rows)
-    _alert_title = (f"提醒日志（alert_logs · 最近 {_shown_n} 条）" if _shown_n
-                    else "提醒日志（alert_logs）")
+    _alert_title = (f"提醒日志（最近 {_shown_n} 条）" if _shown_n
+                    else "提醒日志")
     o.append(f"<div class='card'><div class='sec'>{_alert_title}"
              f"{_all_link('alerts', _token_of(deps))}</div>")
     # 口径落可见文字：主页滤掉了什么、去哪看全部，必须写出来而不是让人猜少了行。
@@ -763,7 +765,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
                       if str(r.get("message") or "").startswith(BACKFILL_PREFIX))
     if _backfilled:
         o.append(f"<div class='hint'>2026-10-15 之前执行器推送不落库（当时版本限制），"
-                 f"下表含 {_backfilled} 条按执行器事件（hl_events）回填的历史记录，"
+                 f"下表含 {_backfilled} 条按执行器事件回填的历史记录，"
                  f"标记为「[回填]」。</div>")
     rows = ""
     for r in _alert_rows:
@@ -797,8 +799,8 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
                            or (str(r.get("kind") or "") == "reconcile"
                                and str(r.get("message") or "").strip() == _RECONCILE_OK_MSG))][:n]
     _shown_n = len(_event_rows)
-    _event_title = (f"执行器事件（hl_events · 最近 {_shown_n} 条）" if _shown_n
-                    else "执行器事件（hl_events）")
+    _event_title = (f"执行器事件（最近 {_shown_n} 条）" if _shown_n
+                    else "执行器事件")
     o.append(f"<div class='card'><div class='sec'>{_event_title}"
              f"{_all_link('events', _token_of(deps))}</div>")
     o.append("<div class='hint'>主页已隐藏「心跳」与「对账一致」例行行；"

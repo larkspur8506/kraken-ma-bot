@@ -189,6 +189,79 @@ KILL_CLEAN_MIN_GAP_S = 60.0
 REFETCH_ATTEMPTS = 2
 REFETCH_GAP_S = 1.0
 REFETCH_MARGIN_MS = 120_000
+# 平仓成交的时间下界余量（秒）：与上面 REFETCH_MARGIN_MS 同一口径 —— 交易所与本地
+# 时钟、成交回报顺序都会差几十秒，opened_at 前 2 分钟内落地的平仓腿仍算本仓的。
+LAST_FILL_SLACK_S = 120.0
+
+# ------------------------------------------------------- 成交列表的时间序（venue 契约）
+# 【venue 契约】成交列表**不能假设顺序**：Kraken `/fills` 按时间**升序**返回（最旧在前），
+# HL `userFills` 是降序（最新在前），测试桩两种都有。消费侧一律按 `time`（毫秒）自己排，
+# 否则「取最近 N 条」「取最新一笔平仓」在 Kraken 上会静默取到最旧的那批 —— 手续费/净利/
+# 关账价全错，而且不报错。
+
+
+def _fill_ts_ms(f: Any) -> Optional[int]:
+    """成交的时间戳（毫秒）；缺失/脏值返回 None（调用方必须按「无时间」处理，不许猜）。"""
+    try:
+        v = f.get("time")
+    except AttributeError:
+        return None
+    if v is None or v == "":
+        return None
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _fills_time_ascending(fills: List[dict]) -> List[dict]:
+    """按 `time` 升序重排成交；**无 time 的行保持原位置**（不丢、不猜时间）。
+
+    做法：只对有 time 的行排序，再按原列表的「有时间槽位」顺序回填 —— 这样
+    「升序(Kraken) / 降序(HL桩) / 混入无 time 行」三种输入都得到同一条时间线，
+    且无 time 的行仍在原来的相对位置参与（不会被挤到末尾抢走 limit 窗口，
+    也不会因为排序键缺失被丢掉）。
+    """
+    timed = sorted((f for f in fills if _fill_ts_ms(f) is not None), key=_fill_ts_ms)
+    if not timed:
+        return list(fills)
+    it = iter(timed)
+    return [next(it) if _fill_ts_ms(f) is not None else f for f in fills]
+
+
+def _order_live(res: Any) -> bool:
+    """下单结果是否「交易所侧真有一张在场/成交的单」。
+
+    `not_executed=True`（Kraken cancelled / iocWouldNotExecute）虽然 status 是 RESTING，
+    但那张单**从来不在委托簿里**：把它当成功去记「止损已挂」= 裸仓还以为有保护。
+    """
+    if not isinstance(res, dict) or not res.get("ok"):
+        return False
+    if res.get("not_executed"):
+        return False
+    return res.get("status") in (STATUS_RESTING, STATUS_FILLED)
+
+
+# MR 腿标的（app.main._build_mr_leg 装配 HlMrConfig(coin="QQQ") → PF_QQQXUSD）。
+# 它们的仓位出现在同一账户里是**另一条腿**的，不是「本地无记录的人工单」。
+# XYZ100 是 HL 侧的 xStock 名，保留以兼容旧库/旧配置。
+MR_LEG_COINS = frozenset({"QQQ", "XYZ100"})
+
+
+def _registered_coins() -> frozenset:
+    """symbol_registry 里**已登记**的全部 display coin（BTC/ETH/SOL/QQQ…）。
+
+    对账用它区分「账户里另一条腿的仓」与「真的不知道哪来的仓」：登记过但不在本执行器
+    coin_map 里的标的（MR 腿）可以静默跳过；连注册表都没有的 coin 仍然报出来
+    （fail-closed：不认识的仓必须被人看见）。读注册表失败 -> 空集（回到旧行为）。
+    """
+    out = set()
+    for s in registry.known_symbols():
+        try:
+            out.add(registry.hl_coin(s))
+        except Exception:                                            # noqa: BLE001
+            continue
+    return frozenset(out)
 
 
 # ---------------------------------------------------------------- 推送文案（人类可读）
@@ -756,9 +829,25 @@ class Executor:
                 else:
                     unconfirmed.append(f"{r['symbol']} 有仓但无法确认止损"
                                        f"（挂单接口回落，读不到触发单）")
+        # 【B4】主策略标的 = coin_map 里的 coin，**减去 MR 腿标的**。同一账户还跑着
+        # MR 腿（QQQ → PF_QQQXUSD），它的仓位不该被当成「人工单」：旧逻辑对**每一个**
+        # 未在本地台账里的交易所仓都报一条 problem（ok=False）→ 对账 mismatch → kill。
+        # 等于 MR 一开仓就把主策略停了。这里按「是不是主策略标的」收窄判据
+        # （venue 层仍返回全账户）。
+        # 为什么必须减 MR_LEG_COINS：`DEFAULT_COIN_MAP` 是从 symbol_registry 派生的，
+        # 而 QQQ_USDT 已登记（防 SYMBOLS 误配），于是 coin_map 里也有 QQQ —— 不减掉
+        # 就永远走不到「另一条腿」分支，本修复等于没做。
+        own = set((self.p.coin_map or {}).values()) - MR_LEG_COINS
+        others = MR_LEG_COINS | _registered_coins()
         for coin in ex_pos:
-            if coin not in seen:
-                problems.append(f"交易所有 {coin} 仓位但本地无记录（人工单？）")
+            if coin in seen:
+                continue
+            if coin not in own and coin in others:
+                # 另一条腿（或别的已登记、本执行器不管的标的）：静默跳过，只留 debug。
+                logger.debug("[hl-exec] %s 是其它腿的仓位（非主策略标的），对账跳过", coin)
+                continue
+            problems.append(f"交易所有 {coin} 仓位但本地无记录（人工单？）")
+
         # 数量对账的「要不要动作」在 _size_check 里已经判过 kill_before：
         # kill 分支并入 problems（走既有告警口径），真正置 kill 放在这里一次完成 ——
         # 于是直接调 reconcile() 的路径（agent 到期保护等）也同样是 fail-closed，
@@ -1838,11 +1927,17 @@ class Executor:
                 origin = str(self.db.hl_kill_origin() or "")
             except Exception:                                       # noqa: BLE001
                 origin = ""
-            if origin != "dd":
+            # 【B6】豁免面从 `dd` 扩到「机器触发的减风险类 kill」：
+            #   reconcile = 对账发现问题（账户/挂单读不准），size = 数量对账不一致。
+            # 这两种 kill 的共同点与 dd 一样 —— 它们**不会自解**（尤其 size），若这里
+            # 也早退，就变成「有裸仓不修」，而且没人会去修：停手是为了不加新仓，
+            # 不是为了让已有的仓裸奔。人工 origin='manual' 仍然早退（人在核对，
+            # 自动化不许跟他抢交易所）。
+            if origin not in ("dd", "reconcile", "size"):
                 self._event(EV_DECISION, f"kill 已触发：{symbol} 暂不自动补挂止损", symbol=symbol)
                 return
             self._event(EV_DECISION,
-                        f"回撤熔断期间仍补挂止损：{symbol}（减风险动作不受停手限制）",
+                        f"{origin} 熔断期间仍补挂止损：{symbol}（减风险动作不受停手限制）",
                         symbol=symbol)
         # 映射缺失 → 不知道交易所上的标的，**绝不动交易所**（补挂/平仓都不做），只提示
         coin = self._coin_or_none(symbol)
@@ -1902,7 +1997,9 @@ class Executor:
                                                                    PURPOSE_STOP + ":fix"))
             except Exception as ex:                                 # noqa: BLE001
                 res = {"ok": False, "error": f"{type(ex).__name__}: {ex}"}
-        if res.get("ok") and res.get("status") in (STATUS_RESTING, STATUS_FILLED):
+        # 补挂结果必须「交易所侧真有一张在场/成交的单」才算成功（not_executed 的
+        # RESTING 不算：委托簿里没有它 → 仍是裸仓）。
+        if _order_live(res):
             self.db.hl_update_order(symbol, bar_ms, PURPOSE_STOP, status=res["status"],
                                     oid=res.get("oid"), error=None)
             self.db.set_pos_hl(int(row["id"]),
@@ -1913,13 +2010,23 @@ class Executor:
                         f"核对后可恢复。")
             return
         # 补挂失败 → 无保护持仓不允许存在 → 市价平掉
-        self._event(EV_ERROR, f"{symbol} 止损补挂失败（{res.get('error')}）→ 立即平仓",
+        res_err = (str(res.get("error") or "")
+                   if not res.get("not_executed")
+                   else "止损单未成交/未进入委托簿（交易所侧无该单）")
+        self._event(EV_ERROR, f"{symbol} 止损补挂失败（{res_err}）→ 立即平仓",
                     symbol=symbol, data={"place": res})
         try:
             limit_px = self._round_px(coin, self.ex.slippage_limit(coin, side != 1), sz_dec)
         except Exception as ex:                                     # noqa: BLE001
-            limit_px = float((snap.get("positions") or [{}])[0].get("mark_px") or px)
-            logger.warning("[hl-exec] 平仓限价计算失败（用标价）：%s", ex)
+            # 回退价必须取**该 coin** 的标记价（旧代码写死 positions[0]，多标的时
+            # 可能拿到另一个币的价格）；取不到才退回上面算好的止损触发价。
+            mark = self._mark_px(snap, coin)
+            fallback = mark if mark is not None else px
+            try:
+                limit_px = self._round_px(coin, fallback, sz_dec)
+            except Exception:                                       # noqa: BLE001
+                limit_px = fallback
+            logger.warning("[hl-exec] 平仓限价计算失败（用标记价）：%s", ex)
         try:
             close = self.ex.place_order(coin, side != 1, sz, limit_px, reduce_only=True)
         except Exception as ex:                                     # noqa: BLE001
@@ -1931,6 +2038,24 @@ class Executor:
         self._alert(f"【Kraken】🛑 {coin} 止损单丢失且补挂失败（{res.get('error')}），"
                     f"已{'市价平仓' if ok_close else '尝试平仓但结果异常'}（{close.get('status')}）。"
                     f"**请立刻人工核对交易所**！")
+
+    @staticmethod
+    def _mark_px(snap: Optional[dict], coin: str) -> Optional[float]:
+        """快照里**该 coin** 的标记价；没有这个仓 / 脏值返回 None。
+
+        存在的理由：平仓限价算不出来时的兜底价必须来自「正在平的这一仓」。
+        旧代码写 `(snap["positions"] or [{}])[0]["mark_px"]` —— 多标的时那是
+        **列表第一项**的价，可能完全不是这个币，等于拿另一个标的的价格发单。
+        """
+        for p in (snap or {}).get("positions") or []:
+            if p.get("coin") != coin:
+                continue
+            try:
+                px = float(p.get("mark_px") or 0.0)
+            except (TypeError, ValueError):
+                return None
+            return px if px > 0 else None
+        return None
 
     @staticmethod
     def _has_stop(snap: dict, coin: str) -> bool:
@@ -2206,6 +2331,13 @@ class Executor:
                                   cloid=self.ex._cloid(symbol, bar_ms, PURPOSE_ENTRY))
         if not res["ok"] or res["status"] not in (STATUS_FILLED, STATUS_RESTING):
             return self._entry_failed(symbol, bar_ms, f"入场失败：{res['error']}")
+        if res.get("not_executed"):
+            # 【venue 契约 B3】Kraken 把「IOC 未成交」（status=cancelled /
+            # iocWouldNotExecute）也归一成 RESTING，但**那张单从来不在委托簿里**，
+            # 交易所侧没有可撤的东西。旧路径在这里会拿 oid 去撤一张不存在的单
+            # （cancel 返回 notFound）并记一次 churn —— 把「市场没给价」当成「我们撤了
+            # 一张挂单」，churn 计数的语义被污染，还会因为撤单失败刷告警。
+            return self._entry_failed(symbol, bar_ms, "IOC 未成交（单未进入委托簿），已放弃")
         if res["status"] == STATUS_RESTING:
             # IOC 不该挂着；挂上了说明限价不够激进 → 撤掉并放弃（不追价）
             self.ex.cancel(coin, res["oid"])
@@ -2232,9 +2364,16 @@ class Executor:
         self.db.hl_record_intent(symbol, coin, bar_ms, PURPOSE_STOP, side, filled_sz,
                                  px=stop, reduce_only=True, status=ST_SENT,
                                  cloid=make_cloid(symbol, bar_ms, PURPOSE_STOP))
-        if not stop_res["ok"] or stop_res["status"] not in (STATUS_RESTING, STATUS_FILLED):
+        # 【venue 契约 B3】`not_executed` 的 RESTING **不算挂上了止损**：Kraken 对
+        # 「触发单未成交/被撤」也回 RESTING，但委托簿里没有这张单 → 仓位是裸的。
+        # 必须当成挂单失败走下面的「立即平仓」闭环（旧代码会把它记成 resting，
+        # 台账以为有保护、真实裸奔）。
+        if not _order_live(stop_res):
+            stop_err = (f"{stop_res.get('error')}"
+                        if not stop_res.get("not_executed")
+                        else "止损单未成交/未进入委托簿（交易所侧无该单）")
             self.db.hl_update_order(symbol, bar_ms, PURPOSE_STOP, status=ST_FAILED,
-                                    error=str(stop_res.get("error"))[:300])
+                                    error=str(stop_err)[:300])
             # 没有保护的仓位不允许存在 → 立刻平掉。
             # 平仓限价必须按**平仓方向**算滑点（side != 1），不能用上面开仓方向的 limit_px
             try:
@@ -2243,11 +2382,11 @@ class Executor:
                 close_px = limit_px
             close = self.ex.place_order(coin, side != 1, filled_sz, close_px, reduce_only=True)
             closed_ok = bool(close.get("ok")) and close.get("status") == STATUS_FILLED
-            msg = (f"【Kraken】⚠️ {coin} 止损单挂失败（{stop_res['error']}），"
+            msg = (f"【Kraken】⚠️ {coin} 止损单挂失败（{stop_err}），"
                    + ("已立即平仓" if closed_ok else f"平仓未确认（{close.get('status')}）——仓位可能仍在交易所")
                    + "。本次未持仓，请人工核对。")
-            self._event(EV_ERROR, f"止损挂单失败 → 立即平仓：{stop_res['error']}",
-                        symbol=symbol, data={"close": close})
+            self._event(EV_ERROR, f"止损挂单失败 → 立即平仓：{stop_err}",
+                        symbol=symbol, data={"close": close, "stop_res": stop_res})
             self.db.set_pos_hl(position_id, hl_status="aborted")
             self._alert(msg)
             return True
@@ -2398,7 +2537,7 @@ class Executor:
         ex_pos = {p["coin"]: p for p in (snap or {}).get("positions") or []}
         # 止损已由交易所触发（stop 事件）→ 用真实成交价关账，不发平仓单
         if reason == "stop" and snap is not None and coin not in ex_pos:
-            px, fills = self._last_fill_px(coin)
+            px, fills = self._last_fill_px(coin, since_ts=row["opened_at"])
             if px is None and hl_status == "mismatch":
                 # mismatch 行 + 读不到成交价：账本本来就不一致，再按参考价关一次等于
                 # 「猜一个价把仓抹掉」。让出接管权（引擎会喊人去交易所核对），不关账。
@@ -2497,8 +2636,24 @@ class Executor:
         try:
             limit_px = self._round_px(coin, self.ex.slippage_limit(coin, side != 1), sz_dec)
         except Exception as e:                                       # noqa: BLE001
-            limit_px = ref_price
-            self._event(EV_ERROR, f"平仓限价计算失败（用参考价）：{e}", symbol=symbol)
+            # 【B5】平仓限价算不出来时**不得**用 ref_price 直接发单：ref_price 是信号
+            # 触发时的参考价（可能几分钟前、也可能来自 bar 收盘），拿它当 IOC 限价
+            # 要么成交在明显不利的价位，要么挂在盘口外来回被拒（而止损单已在第 1 步
+            # 撤掉了 —— 那等于裸仓）。退路是当前快照里**这一个 coin** 的标记价；
+            # 连标记价都读不到就这轮不发单，留给下一轮/人工（并且喊出来）。
+            mark = self._mark_px(snap, coin)
+            if mark is None:
+                self._event(EV_ERROR,
+                            f"{symbol} 平仓限价计算失败且拿不到标记价，本轮不发单：{e}",
+                            symbol=symbol)
+                self._alert(f"【Kraken】🛑 {coin} 平仓限价计算失败，且快照里读不到该仓标记价"
+                            f"——本轮**未下平仓单**（止损单已撤）。请立即人工平仓或挂回止损！")
+                return True
+            try:
+                limit_px = self._round_px(coin, mark, sz_dec)
+            except Exception:                                        # noqa: BLE001
+                limit_px = mark
+            self._event(EV_ERROR, f"平仓限价计算失败（改用标记价 {mark:,.2f}）：{e}", symbol=symbol)
         # cloid 按「尝试时刻」区分：同一 4h 内第二次离场尝试不能再复用同一个值
         # （HL 拒重复 cloid，而重试第一步已撤掉止损 → 撞号就是裸仓，见 _attempt_cloid）
         exit_cloid = self._attempt_cloid(symbol, exit_bar_ms, PURPOSE_EXIT)
@@ -2541,7 +2696,8 @@ class Executor:
             else:
                 re_stop = {"ok": False, "status": "gated",
                            "error": "churn 熔断：停止重挂止损，改为市价平仓"}
-            re_ok = bool(re_stop.get("ok")) and re_stop.get("status") in (STATUS_RESTING, STATUS_FILLED)
+            # 重挂成功的判据同样排除 not_executed（委托簿里没有这张单 = 仍然裸仓）。
+            re_ok = _order_live(re_stop)
             self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side, sz,
                                      px=re_stop_px, reduce_only=True,
                                      status=(re_stop.get("status") if re_ok else ST_FAILED),
@@ -2616,7 +2772,8 @@ class Executor:
             else:
                 re_stop = {"ok": False, "status": "gated",
                            "error": "churn 熔断：停止重挂剩余量止损，改为市价平仓"}
-            re_ok = bool(re_stop.get("ok")) and re_stop.get("status") in (STATUS_RESTING, STATUS_FILLED)
+            # 重挂成功的判据同样排除 not_executed（委托簿里没有这张单 = 仍然裸仓）。
+            re_ok = _order_live(re_stop)
             try:
                 self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side,
                                          remain, px=re_px, reduce_only=True,
@@ -2900,7 +3057,16 @@ class Executor:
         known = {str(r["tid"]) for r in self.db.hl_recent_fills(500)}
         added = 0
         reverse = {v: k for k, v in (self.p.coin_map or {}).items()}
-        for f in fills[:limit]:
+        # 【venue 契约】成交顺序不做假设：按 time 升序后取**最后 limit 条**（最新的一批）。
+        # 旧代码 `fills[:limit]` 在 Kraken（升序）上永远是「最旧的 100 笔」，一旦窗口内
+        # 成交超过 limit，新成交永远进不了库 —— 止损平仓的手续费/净利/对账证据全缺。
+        ordered = _fills_time_ascending(list(fills))
+        try:
+            lim = int(limit)
+        except (TypeError, ValueError):
+            lim = 100
+        # limit<=0 时「取最后 0 条」必须是空，而不是 Python 切片 `[-0:]` 的全量。
+        for f in (ordered[-lim:] if lim > 0 else []):
             tid = str(f.get("tid") or f.get("hash") or "")
             if not tid or tid in known:
                 continue
@@ -3433,10 +3599,19 @@ class Executor:
         except Exception as e:                                       # noqa: BLE001
             logger.warning("[hl-exec] 关账后计算流水口径净利失败（忽略）：%s", e)
 
-    def _last_fill_px(self, coin: str) -> Tuple[Optional[float], List[dict]]:
+    def _last_fill_px(self, coin: str, since_ts: Any = None
+                      ) -> Tuple[Optional[float], List[dict]]:
         """从交易所成交里取最近一笔该 coin 的**平仓**成交价（用于止损已触发的关账）。
 
         必须过滤 dir 含 "Close" —— 否则同标的重开后会取到开仓价当平仓价，R 值全错。
+
+        **顺序不可信**（venue 契约）：Kraken `/fills` 升序（最旧在前）、HL `userFills`
+        降序。旧实现取 `closing[0]` = 在 Kraken 上取到**最早**那笔平仓，同标的多次
+        进出后 R 值/关账价全错。这里按 `time` 取**最新**一条，不依赖列表顺序。
+
+        ``since_ts``：本仓 opened_at（秒）。给了就按 `ts >= since_ts − 120s` 过滤，
+        避免把**上一轮**仓位的平仓成交（它们也在窗口里，且在时间线上更旧或更接近）
+        拿来给这一仓关账。不传 = 不过滤（旧行为，诊断/回放用）。
 
         没有平仓腿时返回 ``None`` + 该币成交原文（**证据不足，不给价**；对抗审查 M2）。
         以前这里 ``source = closing or mine``：一旦窗口里只有开仓腿，就把**开仓价**
@@ -3455,14 +3630,35 @@ class Executor:
         closing = [f for f in mine if "close" in str(f.get("dir") or "").lower()]
         if not closing:                  # 没有平仓腿 → 不给价（见 docstring）
             return None, mine[:8]
-        px = None
-        for f in closing[:8]:
+        lo_s = None
+        if since_ts is not None:
             try:
-                px = float(f.get("px"))
+                lo_s = float(since_ts) - LAST_FILL_SLACK_S
             except (TypeError, ValueError):
+                lo_s = None
+        best = None
+        best_ms: Optional[int] = None
+        for f in closing:
+            ts_ms = _fill_ts_ms(f)
+            if ts_ms is None:
                 continue
-            break
-        return px, mine[:8]
+            if lo_s is not None and ts_ms / 1000.0 < lo_s:
+                continue
+            if best_ms is None or ts_ms >= best_ms:
+                best, best_ms = f, ts_ms
+        if best is None:
+            # 一条带时间戳的平仓腿都没有（测试桩/降级适配层）：退回旧行为按原序取第一条。
+            # 不能因此返回 None —— 调用方在「无价」分支会退回 ref_price（信号价），
+            # 那比一条真实成交价更不可信。有 time 的行仍严格按下界过滤。
+            untimed = [f for f in closing if _fill_ts_ms(f) is None]
+            if untimed:
+                best = untimed[0]
+        if best is None:
+            return None, mine[:8]
+        try:
+            return float(best.get("px")), mine[:8]
+        except (TypeError, ValueError):
+            return None, mine[:8]
 
     # ------------------------------------------------------------ 到期保护清仓
     def flatten_for_expiry(self, reason: str = "agent 到期保护") -> dict:

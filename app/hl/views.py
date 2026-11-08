@@ -14,12 +14,14 @@
 
 本页只读、不持私钥、不发起任何写请求；鉴权交给外层网关或可选的 ?k=（见 HL_DASH_REQUIRE_ADMIN）。
 
-对账口径（system.mismatch = True 表示需人工处理）：
+对账口径（system.mismatch 三态：True 需人工处理 / False 一致 / None 无法核对）：
     1) 有停在 intent/sent 超过 3 分钟的 hl_orders（进程崩溃/超时，结果未知）
     2) DB 里 status='open' 的仓位，快照里查不到对应 coin
     3) DB 里 hl_stop_oid 非空，但快照里没有该 coin 的 reduce_only 触发单
     4) 快照里有仓位，但 DB 没有任何对应 open 记录（手工/外部仓位）
-    快照读不到时不判 2/3/4（避免误报），只报第 1 条，并在 network.error 说明。
+    快照读不到（reachable=False）时**不判一致也不判不一致**，返回 None（面板显示
+    「对账 无法核对」）—— 以前返回 False 等于把「没读到」说成「账实相符」。
+    第 1 条只看本地 hl_orders，与快照无关，所以照常判。
 """
 from __future__ import annotations
 
@@ -63,7 +65,7 @@ ROWS_COOKIE = "cma_rows"
 
 SCHEMA_VERSION = 1
 _DAY = 86400.0
-MAINNET_DEFAULT = "https://api.hyperliquid.xyz"
+MAINNET_DEFAULT = "https://futures.kraken.com"   # 线上 venue（Kraken 期货）；HL 只在历史分支里
 
 _MODE_TXT = {"off": "只提醒", "dry": "影子", "live": "实盘"}
 _MODE_CLS = {"off": "muted", "dry": "warn", "live": "neg"}
@@ -575,17 +577,29 @@ def _dd_meta(deps: DashboardDeps, cfg: Any, flows_ok: bool) -> Dict[str, Any]:
 
 def _reconcile(reachable: bool, snap_positions: List[dict], snap_orders: List[dict],
                open_by_coin: Dict[str, dict], stuck_orders: List[Any],
-               orders_trusted: bool = True) -> bool:
-    """对账（口径见模块 docstring）。
+               orders_trusted: bool = True,
+               own_coins: Optional[set] = None) -> Optional[bool]:
+    """对账（口径见模块 docstring），三态返回：True 不一致 / False 一致 / None 无法核对。
 
     `orders_trusted=False`（挂单接口回落/非 list）时**跳过止损判断**——
     与执行器同一口径：读不到 isTrigger 时把「有止损」读成「没止损」，
     据此判 mismatch 会吓用户去手动平仓。
+
+    `reachable=False` → None（不是 False）：快照没读到就既证明不了不一致、也证明不了
+    一致，写成 False 会让面板顶部的徽章显示「对账 一致」——那是把「不知道」说成
+    「没问题」，正是这类静默 fail-open 最危险的地方。卡单（只看本地 hl_orders）
+    与快照无关，仍然照判。
+
+    `own_coins`（主策略标的集合，cfg.symbols 的合约名）：给了就只对**这些标的**判
+    「交易所有仓、本地无记录 = 人工单」。Kraken 的账户是**全账户**快照，MR 腿（QQQ）
+    也挂在同一个账户上，而 positions 表里本来就不该有它的行 —— 不排除的话，MR 持仓
+    期间状态条会永久显示「对账 不一致」，把一个正常状态说成异常（与执行器 B4 同口径）。
+    传 None（默认）= 保持旧行为（任何未记录仓位都算不一致）。
     """
     if stuck_orders:
         return True
     if not reachable:
-        return False
+        return None
     snap_coins = {str(p.get("coin") or "") for p in snap_positions if str(p.get("coin") or "")}
     for coin, row in open_by_coin.items():
         if coin not in snap_coins:
@@ -597,8 +611,13 @@ def _reconcile(reachable: bool, snap_positions: List[dict], snap_orders: List[di
             if not has_stop:
                 return True
     for coin in snap_coins:
-        if coin not in open_by_coin:
-            return True
+        if coin in open_by_coin:
+            continue
+        if own_coins is not None and coin not in own_coins:
+            # 非主策略标的（MR 腿 QQQ 之类）：DB 的 positions 表不会有它的行，不算人工单
+            logger.debug("[hl-views] 对账跳过非主策略标的 %s（MR 腿/外部标的）", coin)
+            continue
+        return True
     return False
 
 
@@ -679,6 +698,12 @@ def _perf_stats(rows: List[Any]) -> Dict[str, Any]:
             "total_r": round(r_sum, 4)}
 
 
+#: `account` 里所有「金额」键。交易所读不到时统一置 None（不是 0），渲染层显示「—」。
+_ACCT_NUM_KEYS = ("equity", "perp_equity", "withdrawable", "margin_used", "notional",
+                  "spot_usdc", "spot_hold", "today_realized", "total_realized",
+                  "fees_total", "funding_total")
+
+
 def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) -> dict:
     """组装监控 JSON（schema_version=1）。任何字段缺失/接口失败都不抛异常。
 
@@ -698,6 +723,8 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     cfg = _call(deps.config_fn)
     # venue 是否提供出入金流水（Kraken 期货：否）。渲染层用它决定整块不画。
     flows_supported = _flows_supported(deps)
+    # venue 有没有「钱包地址」这个概念（Kraken 期货：没有）。面板据此不渲染「钱包地址」行。
+    address_free = bool(getattr(getattr(deps, "info", None), "venue_address_free", False))
 
     # ---------------- 交易所快照 ----------------
     snap: Optional[dict] = None
@@ -705,7 +732,7 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     t0 = time.time()
     if deps.info is None:
         net_err = "未配置只读客户端"
-    elif not address and not getattr(deps.info, "venue_address_free", False):
+    elif not address and not address_free:
         # HL：address 空 → 拦住（公开主网数据会误导成自己的账户）。
         # Kraken（venue_address_free）：没有地址概念，空 address 照常拉快照。
         net_err = "未配置钱包地址"
@@ -854,16 +881,16 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     fills_rows = _db_call(deps.db, "hl_recent_fills", 2000) or []
     fills_out: List[dict] = []
     today_realized = 0.0
-    total_realized = 0.0
-    fees_total = 0.0
+    window_realized = 0.0          # 窗口口径兜底（fills_totals 缺失时才用）
+    window_fees = 0.0
     day_start = _utc_day_start(now)
     for r in (fills_rows or []):
         d = _rowd(r)
         cp = _num(d.get("closed_pnl"))
-        total_realized += cp
+        window_realized += cp
         # 费用口径统一走 fee_quote（NULL 回退 fee）：非计价币行的 fee 是「币的数量」，
         # 直接当 U 累加会把 0.2 ARB 记成 0.2U（#34 修的就是这个，读侧漏了这里）。
-        fees_total += _fee_quoted(d) or 0.0
+        window_fees += _fee_quoted(d) or 0.0
         t_s = _to_seconds(d.get("ts"))
         if t_s is not None and day_start <= t_s < day_start + _DAY:
             today_realized += cp
@@ -880,6 +907,16 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             "closed_pnl": _opt_num(d.get("closed_pnl")),
             "reduce_only": bool(d.get("reduce_only")),
         })
+    # 累计已实现 / 净手续费走**全表**聚合（db.fills_totals）：以前是拿上面这批
+    # 「最近 2000 条成交」求和当累计 —— 成交一多，面板上的「累计」就静默缩水成
+    # 「最近一段」。方法缺失（老库/测试桩）时退回窗口和：宁可与以前一样少算，
+    # 也不能把真实数字变成 0。
+    _totals = _db_call(deps.db, "fills_totals")
+    if isinstance(_totals, (tuple, list)) and len(_totals) >= 2:
+        total_realized = _num(_totals[0])
+        fees_total = _num(_totals[1])
+    else:
+        total_realized, fees_total = window_realized, window_fees
 
     # 资金费取「收付视角」：HL 的 cumFunding.sinceOpen 是**仓位成本视角**（付出为正，
     # 空头收钱时该值为负），与 userFunding.delta.usdc 的**入账视角**（正=收入）符号相反。
@@ -1036,6 +1073,10 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         symbols = [str(s) for s in (list(getattr(cfg, "symbols", []) or []))]
     except Exception:                                            # noqa: BLE001
         symbols = []
+    # 主策略标的的合约名（BTC/ETH/…）：面板对账判「交易所有仓、本地无记录 = 人工单」
+    # 时只认这些标的 —— Kraken 账户是全账户，MR 腿（QQQ）也在里面而 positions 表
+    # 本来就没有它的行（与执行器 reconcile 的 B4 同口径）。
+    own_coins = {_coin_of(s) for s in symbols if _coin_of(s)} or None
     last_bar: Dict[str, Optional[int]] = {}
     for s in symbols:
         v = _db_call(deps.db, "get_last_bar", s)
@@ -1052,9 +1093,13 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     # API 有效期（P3 R3）：状态条徽章的数据源。只读 hl_agent_state DB 缓存
     #（执行器每个整点刷新），面板渲染零网络调用；缺失/损坏一律空 dict → 徽章显「—」。
     agent_out: dict = {}
-    if callable(getattr(getattr(deps, "info", None), "price_tick", None)):
+    info_obj = getattr(deps, "info", None)
+    if info_obj is None or callable(getattr(info_obj, "price_tick", None)):
         # Kraken Derivatives API key 无到期概念，也没有代理钱包授权体系：
         # 不读 HL 遗留的 hl_agent_state（那里的到期日会让徽章显示「169 天」）。
+        # info 为 None（只读客户端没装配成功）时同样走这条：那时候读 hl_agent_state
+        # 只能读到 HL 时代的陈旧到期日，而那套体系在 Kraken 部署里根本不存在 ——
+        # 显示「不限期」比显示一个假的到期日诚实（审核 C1）。
         agent_out = {"days_left": None, "level": "no_expiry", "cleanup": "none",
                      "source": "kraken-key-no-expiry"}
     else:
@@ -1081,6 +1126,30 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             raw_mr = {"state": "error", "error": "mr status read failed"}
         mr_out = dict(raw_mr) if raw_mr else None
 
+    account_out: Dict[str, Any] = {
+        "address": address,
+        "equity": _num(snap.get("equity_total", snap.get("equity"))),   # 总值（统一账户友好）
+        "perp_equity": _num(snap.get("equity")),                        # 永续口径（原字段语义）
+        "spot_usdc": _num(snap.get("spot_usdc")),
+        "spot_hold": _num(snap.get("spot_hold")),
+        "spot_ok": bool(snap.get("spot_ok", True)),
+        "unified": bool(snap.get("unified", False)),
+        "withdrawable": _num(snap.get("withdrawable")),
+        "margin_used": _num(snap.get("margin_used")),
+        "notional": _num(snap.get("notional")),
+        "unrealized_pnl": unrealized_pnl,
+        "today_realized": today_realized,
+        "total_realized": total_realized,
+        "fees_total": fees_total,
+        "funding_total": funding_total,
+    }
+    # 读不到交易所（reachable=False）时金额一律 None —— 不是 0：渲染层 _fmt(None) 给
+    # 「—」，而 0 会渲染成「账户权益 0.00 U」，那是把「没读到」说成「钱没了」。
+    # 键集合不随可达性变化（消费方按键读，schema 稳定）。
+    if not reachable:
+        for _k in _ACCT_NUM_KEYS:
+            account_out[_k] = None
+
     return {
         "schema_version": SCHEMA_VERSION,
         "ts": now,
@@ -1097,23 +1166,7 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             "latency_age_s": latency_age_s,
             "error": net_err,
         },
-        "account": {
-            "address": address,
-            "equity": _num(snap.get("equity_total", snap.get("equity"))),   # 总值（统一账户友好）
-            "perp_equity": _num(snap.get("equity")),                        # 永续口径（原字段语义）
-            "spot_usdc": _num(snap.get("spot_usdc")),
-            "spot_hold": _num(snap.get("spot_hold")),
-            "spot_ok": bool(snap.get("spot_ok", True)),
-            "unified": bool(snap.get("unified", False)),
-            "withdrawable": _num(snap.get("withdrawable")),
-            "margin_used": _num(snap.get("margin_used")),
-            "notional": _num(snap.get("notional")),
-            "unrealized_pnl": unrealized_pnl,
-            "today_realized": today_realized,
-            "total_realized": total_realized,
-            "fees_total": fees_total,
-            "funding_total": funding_total,
-        },
+        "account": account_out,
         "positions": positions_out,
         "orders_open": orders_open,
         "orders_recent": orders_recent,
@@ -1128,7 +1181,8 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             "mismatch": _reconcile(reachable, snap_positions, snap_orders,
                                    open_by_coin, stuck,
                                    orders_trusted=bool(snap.get("orders_trusted", False))
-                                   if snap else False),
+                                   if snap else False,
+                                   own_coins=own_coins),
         },
         # 盈亏曲线（已剔除出入金）+ TWR 指数。旧键 equity_curve（原始权益曲线）已按
         # 用户要求**整个删掉**，不是开关 —— 全仓只有这一个图表源。
@@ -1138,6 +1192,9 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         # venue 是否提供出入金流水端点（False = Kraken 期货；面板据此隐藏
         # 盈亏曲线 / 策略回撤 / 资金费 / 资金流水，见 _render_body）。
         "flows_supported": flows_supported,
+        # venue 有没有「钱包地址」概念（True = Kraken 期货）。渲染层据此整行不画
+        # 「钱包地址」—— 那里只有一个 main 填的占位常量，展示出来等于编了个地址。
+        "venue_address_free": address_free,
         # 策略绩效（上线以来）：总览卡片数据源（只读聚合，见 _perf_stats）。
         "perf": perf,
         # API 有效期（P3 R3）：状态条徽章唯一常驻出处；/admin 的 get_payload 会用
@@ -2237,7 +2294,10 @@ def _render_body(p: dict) -> str:
     reachable = bool(net.get("reachable"))
     latency = _opt_num(net.get("latency_ms"))
     error = str(net.get("error") or "")
-    mismatch = bool(system.get("mismatch"))
+    # 对账三态（审核 C1）：True 不一致 / False 一致 / None 无法核对（快照没读到）。
+    # 以前 None 被 bool() 折成 False，顶部状态条会打「对账 一致」——把「不知道」
+    # 说成「没问题」。现在如实说「无法核对」（琥珀点，不是红色：没有证据说明出事）。
+    mismatch = system.get("mismatch")
     pnl_all = _curve_points(curve.get("pnl"))
     twr_all = _curve_points(curve.get("twr"))
     # 时间窗（P1）：GET span ∈ 7/30/all，缺参/非法值回落 7（normalize_span 白名单）。
@@ -2255,10 +2315,13 @@ def _render_body(p: dict) -> str:
         o.append(f"<span class='badge'><span class='neg'>&#9679;</span> 熔断 <b>已触发</b>{extra}</span>")
     else:
         o.append(_badge("pos", "熔断", "未触发"))
-    o.append("<span class='badge'>" + (
-        f"<span class='pos'>&#9679;</span> 对账 <b>一致</b>" if not mismatch
-        else f"<span class='neg'>&#9679;</span> 对账 <b>不一致</b>"
-    ) + "</span>")
+    if mismatch is None:
+        o.append("<span class='badge' title='交易所数据没读到，账实是否一致无从判断'>"
+                 "<span class='warn'>&#9679;</span> 对账 <b>无法核对</b></span>")
+    elif mismatch:
+        o.append("<span class='badge'><span class='neg'>&#9679;</span> 对账 <b>不一致</b></span>")
+    else:
+        o.append("<span class='badge'><span class='pos'>&#9679;</span> 对账 <b>一致</b></span>")
     # 卡单徽章（P3 R2）：只在 >0 时出现，正常态状态条不出现「卡单」字样。
     o.append(_stuck_badge_html(system))
     lat_txt = f"{latency:.0f} ms" if latency is not None else "—"
@@ -2397,11 +2460,15 @@ def _render_body(p: dict) -> str:
     # 可看的，无信息损失。次级项只是搬位置，一项不少、数值口径不变。
     o.append("<div class='card'><div class='sec'>账户</div>")
     today_txt, today_cls = _sign(acc.get("today_realized"))
-    fees = _num(acc.get("fees_total"))
+    fees = _opt_num(acc.get("fees_total"))
     # 可提口径与旧版一致：统一账户且交易所 withdrawable<=0 时按 现货−占用 现算
     # （手续费说明已按用户要求删除，2026-10-29；口径细节保留在 title 悬停）。
-    wd = _num(acc.get("withdrawable"))
-    if acc.get("unified") and wd <= 0:
+    wd = _opt_num(acc.get("withdrawable"))
+    if wd is None:
+        # 交易所读不到（reachable=False → account 金额是 None）：可提余额**未知**，
+        # 不是 0。以前 _num 兜成 0 会显示「可用保证金 0.00 U」，用户会以为钱没了。
+        wd_html, wd_title = "—", ""
+    elif acc.get("unified") and wd <= 0:
         avail = max(_num(acc.get("spot_usdc")) - _num(acc.get("spot_hold")), 0.0)
         wd_html = f"{_fmt(avail)} U"
         wd_title = "可用保证金：扣掉持仓与挂单占用后还能用来开新仓的金额"
@@ -2414,7 +2481,10 @@ def _render_body(p: dict) -> str:
              f"<span{wd_t}>可用保证金 <b>{wd_html}</b></span></div>")
     o.append("<details class='acct-details'><summary>资金明细</summary>")
     o.append("<div class='acct-sub'>")
-    o.append(_asub("钱包地址", _addr_text(acc.get("address"))))
+    # Kraken 期货没有钱包地址（venue_address_free）：这一行整行不画 —— 那里的
+    # address 只是 main 填的占位常量，展示出来等于凭空造了个地址。
+    if not p.get("venue_address_free"):
+        o.append(_asub("钱包地址", _addr_text(acc.get("address"))))
     if acc.get("unified") and not acc.get("spot_ok", True):
         # 现货状态读取失败 → equity_total 只剩浮盈，数字完全不可信，必须喊出来
         o.append("<span class='neg'>⚠️ 现货余额读取失败：总值/可提不可信（只剩浮盈），不是没钱</span>")
@@ -2430,7 +2500,10 @@ def _render_body(p: dict) -> str:
     o.append(_asub("持仓名义", f"{_fmt(acc.get('notional'))} U"))
     o.append(_asub("今日已实现", today_txt, today_cls,
                    title="交易所 closedPnl 口径，未扣手续费与资金费"))
-    o.append(_asub("净手续费（付出）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
+    if fees is None:
+        o.append(_asub("净手续费（付出）", "—"))
+    else:
+        o.append(_asub("净手续费（付出）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
     o.append("</div>")
     o.append("</details>")
     # 注脚（可见文字，iOS Safari 无 title 悬停）：账户相关数字的口径收口。
