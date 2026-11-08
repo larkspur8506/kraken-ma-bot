@@ -127,6 +127,12 @@ class Config:
     # 只有参数、**没有面板开关**（用户明确要求）：正常情况不需要人管它。
     # ⚠️ Kraken 下不生效：期货没有出入金流水端点，`KrInfo.flows_supported=False`，
     #    executor 在读到间隔之前就已整段跳过 —— 这个值只对 HL 有意义。
+    # Kraken 手续费（计费口径）——Kraken 的 /fills 不带 fee 字段，拿不到真实值，
+    # 只能按账号费率档配置。用户当前 6 级：taker 2.75bp / maker 0.75bp；
+    # 长期成交量不足掉回 Tier 1 时 taker 是 5bp，改这里即可（别再硬编码到代码里）。
+    kr_taker_fee: float = _env_f("KR_TAKER_FEE", 0.000275)
+    kr_maker_fee: float = _env_f("KR_MAKER_FEE", 0.000075)
+
     hl_flow_sync_s: int = _env_i("HL_FLOW_SYNC_S", 1800)
 
     # 回撤熔断（DD Guard，规格见分支 feat/dd-guard）：判据是**策略口径**峰谷回撤

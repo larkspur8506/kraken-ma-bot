@@ -149,7 +149,7 @@ class TestFills(unittest.TestCase):
         self.assertAlmostEqual(out[1]["closedPnl"], 10.0)     # 交易所真值
         self.assertEqual(out[1]["closedPnl_src"], "exchange")
         self.assertEqual(out[0]["oid"], "o1")
-        self.assertAlmostEqual(out[0]["fee"], 74000 * 0.01 * 0.0005)  # 估算口径
+        self.assertAlmostEqual(out[0]["fee"], 74000 * 0.01 * 0.000275)  # 估算口径（Kraken 6 级 taker 2.75bp）
         # ISO 时间必须解析（旧代码 0 → 按时段过滤永远为空）
         self.assertGreater(out[0]["time"], 1_700_000_000_000)
 

@@ -234,7 +234,7 @@ class TestMrExit(unittest.TestCase):
             # 不是 mid —— 台账必须记实际成交口径。
             exit_px = order["limit_px"]
             self.assertAlmostEqual(row["exit_price"], exit_px, places=6)
-            fee = 0.0009 * (249.24 + 2.68 * exit_px)
+            fee = 0.000275 * (249.24 + 2.68 * exit_px)  # Kraken 6 级单边 taker
             self.assertAlmostEqual(row["net_pnl"],
                                    (exit_px - 93.0) * 2.68 - 0.03 - fee, places=3)
             self.assertEqual(status["state"], "exited")
