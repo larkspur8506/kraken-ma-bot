@@ -36,7 +36,7 @@ from app.hl import dd as hl_dd
 from app.kr.exchange import (STATUS_DRY, STATUS_FILLED, STATUS_RESTING, _clean_alert_text,
                              make_cloid)
 from app.engine import DISPLAY_TZ, TZ_LABEL
-from app.kr.info import KrInfoError as HlInfoError
+from app.hl.info import HlInfoError  # venue 无关基类：KrInfoError 是其子类（迁移桥接）
 from app.sizing import effective_risk_pct
 from app import symbol_registry as registry
 

@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 from app import symbol_registry as registry
 from .auth import KrAuthError
 from .client import KrEndpoints
+from app.hl.info import HlInfoError as _HlInfoError
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +33,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_TAKER_FEE = 0.0005
 
 
-class KrInfoError(KrAuthError):
-    """对齐 HlInfoError 的语义：读失败 = 数据不可信，调用方 fail-closed。"""
+class KrInfoError(KrAuthError, _HlInfoError):
+    """对齐 HlInfoError 的语义：读失败 = 数据不可信，调用方 fail-closed。
+
+    同时继承 HL 的 `HlInfoError` 作为 venue 无关基类——executor/面板里的
+    `except HlInfoError` 旧消费方在 PR-1 切 KrInfo 后必须继续接得住（迁移桥接）。
+    """
 
 
 def _num(v: Any, default: float = 0.0) -> float:
