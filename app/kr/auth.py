@@ -1,14 +1,16 @@
 """Kraken Futures REST 认证与 HTTP 客户端（stdlib only，与 app/hl/info.py 同风格）。
 
-认证（Kraken Futures 官方文档口径）：
-- 头：``APIKey`` / ``Nonce``（毫秒，进程内单调递增）/ ``Authent``。
-- POST：Authent = HMAC-SHA512(key=base64.b64decode(secret),
-  msg=str(nonce) + urlencode(body)) 的 hex。
-- GET：msg = str(nonce) + request_path + ('?' + query 如果带参)。
+认证（**按官方 CLI 样例实测通过**，2026-11-08 用真实 key 验过）：
+- 头：``APIKey`` / ``Authent``（**没有 Nonce**）。
+- 计算：``sha256(payload + "/api/v3/" + method)`` → ``HMAC-SHA512(key=base64decode(secret),
+  msg=上面的 digest)`` → **base64** 编码，放进 ``Authent`` 头。
+  - POST 的 payload = form-urlencoded body
+  - GET 的 payload = query string（不含 "?"；无参数时为空串）
+  - method = 端点名（``accounts`` / ``sendorder`` …），不含路径。
+- 服务端地址：``https://futures.kraken.com/derivatives/api/v3/<method>``。
 
-TODO(sandbox)：拿到沙盒 key 后第一件事就是用真实响应核对 GET 的 msg 拼法
-（官方文档对 GET 的描述有歧义：path+query 还是仅 query）——这是 PR-1 里
-唯一「文档读不准、必须实测」的点，签错会 401，不会错单。
+⚠️ 不要按「nonce + path」的旧文档实现：那样算出来的是 hex，且服务端一律回
+``authenticationError``（2026-11-08 实测四种变体全灭，换成上面的算法立刻 200）。
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE = "https://futures.kraken.com"
 CHARTS_BASE = "https://futures.kraken.com/api/charts/v1"
+API_SIGN_PREFIX = b"/api/v3/"
 TIMEOUT_S = 15.0
 
 
@@ -34,9 +37,7 @@ class KrAuthError(RuntimeError):
     pass
 
 
-class Nonce:
-    """毫秒 nonce，进程内单调递增（同毫秒重号会被交易所拒）。"""
-
+class Nonce:  # 保留名字仅为向后兼容；Kraken v3 签名不用 nonce
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._last = 0
@@ -48,14 +49,19 @@ class Nonce:
             return self._last
 
 
-def sign(secret_b64: str, nonce: int, msg: str) -> str:
-    """Authent = HMAC-SHA512(base64decode(secret), str(nonce) + msg) 的 hex。"""
+def sign(secret_b64: str, payload: bytes, method: str) -> str:
+    """Authent = base64(HMAC-SHA512(base64decode(secret),
+    sha256(payload + "/api/v3/" + method)))。
+
+    payload：POST 是 urlencoded body，GET 是 query string（空则 b""）。
+    method：端点名（"accounts" / "sendorder" …），不带路径。
+    """
     try:
         key = base64.b64decode(secret_b64, validate=True)
     except Exception as e:                                       # noqa: BLE001
         raise KrAuthError(f"secret 不是合法 base64：{type(e).__name__}") from e
-    mac = hmac.new(key, f"{nonce}{msg}".encode(), hashlib.sha512)
-    return mac.hexdigest()
+    digest = hashlib.sha256(payload + API_SIGN_PREFIX + method.encode()).digest()
+    return base64.b64encode(hmac.new(key, digest, hashlib.sha512).digest()).decode()
 
 
 class KrClient:
@@ -107,29 +113,30 @@ class KrClient:
                 time.sleep(self._retry_delays()[min(attempt, 2)])
         return {"httpError": err_txt or "unknown"}, status
 
-    def _auth_headers(self, nonce: int, msg: str) -> dict:
+    def _auth_headers(self, method: str, payload: bytes) -> dict:
         if not self.api_key or not self.secret_b64:
             raise KrAuthError("Kraken API key/secret 未配置")
         return {"APIKey": self.api_key,
-                "Nonce": str(nonce),
-                "Authent": sign(self.secret_b64, nonce, msg),
+                "Authent": sign(self.secret_b64, payload, method),
                 "Content-Type": "application/x-www-form-urlencoded",
                 "User-Agent": "kraken-ma-bot/0.1"}
 
     # ------------------------------------------------------------- private API
+    @staticmethod
+    def _method_of(path: str) -> str:
+        """`/derivatives/api/v3/sendorder` → `sendorder`（签名只用端点名）。"""
+        return path.rstrip("/").rsplit("/", 1)[-1]
+
     def post(self, path: str, params: dict | None = None) -> tuple:
         url = f"{self.base_url}{path}"
         body = urllib.parse.urlencode(params or {})
-        nonce = self._nonce.next()
-        headers = self._auth_headers(nonce, body)
+        headers = self._auth_headers(self._method_of(path), body.encode())
         return self._request(url, method="POST", data=body.encode(), headers=headers)
 
     def get_private(self, path: str, params: dict | None = None) -> tuple:
         qs = urllib.parse.urlencode(params or {})
         url = f"{self.base_url}{path}" + (f"?{qs}" if qs else "")
-        nonce = self._nonce.next()
-        msg = path + (f"?{qs}" if qs else "")
-        headers = self._auth_headers(nonce, msg)
+        headers = self._auth_headers(self._method_of(path), qs.encode())
         return self._request(url, headers=headers)
 
     # ------------------------------------------------------------- public API
