@@ -2927,10 +2927,22 @@ class Executor:
             self._flows_skip = "该交易所无出入金流水源（DD/日亏熔断未启用）"
             if not getattr(self, "_flows_unsupported_logged", False):
                 self._flows_unsupported_logged = True
-                logger.warning("[hl-exec] %s", self._flows_skip)
-                self._event(EV_ERROR,
-                            "出入金流水源不可用：回撤与当日亏损熔断保持「未判」，不会误判"[:300],
-                            data={"src": "flows_unsupported"})
+                logger.debug("[hl-exec] %s", self._flows_skip)
+                # executor 实例可能每轮重建 → 用 DB 键做跨实例/跨重启的一次性去重，
+                # 否则「能力边界」会被写成一堆 error 事件，把值班员刷醒。
+                try:
+                    notified = str(self.db.get_config_str(
+                        "flows_unsupported_notified", "") or "")
+                except Exception:                                  # noqa: BLE001
+                    notified = "1"          # 读不到就當已通知，宁可少报也不刷屏
+                if notified != "1":
+                    try:
+                        self.db.set_config("flows_unsupported_notified", "1")
+                    except Exception as e:                         # noqa: BLE001
+                        logger.warning("[hl-exec] 写 flows_unsupported_notified 失败：%s", e)
+                    self._event(EV_ERROR,
+                                "出入金流水源不可用：回撤与当日亏损熔断保持「未判」，不会误判"[:300],
+                                data={"src": "flows_unsupported"})
             return 0
         try:
             interval = int(getattr(self.p, "flow_sync_s", self.FLOW_SYNC_DEFAULT)
@@ -3704,8 +3716,9 @@ class Executor:
                 # 不判。留痕分两档（避免正常节奏刷满事件表）：
                 #   闸门内跳过（30 分钟同步间隔内的常规轮次）→ 只打 info 日志；
                 #   接口失败/无地址 → 记一条事件，并在面板写「等待流水同步」。
-                if self._flows_skip == "尚未到流水同步间隔":
-                    logger.debug("[hl-exec] 流水闸门内：本轮跳过当日亏损熔断判断")
+                if (self._flows_skip == "尚未到流水同步间隔"
+                        or self._flows_skip.startswith("该交易所无出入金流水源")):
+                    logger.debug("[hl-exec] 流水不可判（%s）：本轮跳过当日亏损熔断", self._flows_skip)
                 else:
                     self._event(EV_DD,
                                 f"本轮 L1 未判（{self._flows_skip or '未同步到出入金流水'}），"
