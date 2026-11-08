@@ -110,7 +110,7 @@ def hl_coin(symbol: str, strict: bool = False) -> str:
     if symbol in HL_COIN_NAMES:
         return HL_COIN_NAMES[symbol]
     raise FeedError(
-        f"未配置 HL coin 映射：{symbol}（不在注册表 symbol_registry / env HL_COIN_MAP）")
+        f"未配置 Kraken 合约映射：{symbol}（不在注册表 symbol_registry / env HL_COIN_MAP）")
 
 
 def _hl_post(payload: dict, timeout: int = 20):

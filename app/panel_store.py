@@ -88,6 +88,9 @@ class SnapshotInfo:
         self._clock = clock
         self.stale_s = float(stale_s)
         self._skip_next = False          # 写操作后强制走一次实时
+        # 场所属性透传：视图层用 venue_address_free 判「是否需要钱包地址」，
+        # 不透传会把 Kraken（无地址概念）误判成 HL 并拦住快照。
+        self.venue_address_free = bool(getattr(fallback, "venue_address_free", False))
 
     # ---------------------------------------------------------------- 读数
     def snapshot(self, address: str, mids: Optional[Dict[str, float]] = None) -> dict:

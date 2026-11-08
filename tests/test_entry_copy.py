@@ -9,8 +9,8 @@
 - 托管模式 = 调用方（engine._tick_symbol）传 executor_managed=True，即 `executor is not None`
   （mode=live/dry；mode=off 时 main.build_executor() 返回 None ⇒ 纯提醒模式）。
   文案保留：标题 / 入场 / 止损触发价 / 止损单计划 / 止盈不设 / 确认链接；
-  MEXC 下单段整段退役 → 一行「▶ 系统将自动在 Hyperliquid 执行，成交后推送回报」；
-  风险行不写具体 U 数 →「风险：单笔 X% 权益（实际以 HL 开仓回报为准）」；
+  MEXC 下单段整段退役 → 一行「▶ 系统将自动在 Kraken 执行，成交后推送回报」；
+  风险行不写具体 U 数 →「风险：单笔 X% 权益（实际以 Kraken 开仓回报为准）」；
   人工模式的「4 小时内自己市价平仓」也不出现（离场由 executor.on_exit 接管）。
 - 人工模式（executor_managed 默认 False）= 旧行为**逐字符不变**，本文件用整串 literal 钉住，
   防止有人顺手「统一文案」把人工流改坏。
@@ -91,7 +91,7 @@ class TestManagedEntryCopy(unittest.TestCase):
 
     def test_replaces_mexc_guide_with_auto_exec_line(self):
         text = engine.format_entry(self.c, self.sig, _Order(), 7, executor_managed=True)
-        self.assertIn("▶ 系统将自动在 Hyperliquid 执行，成交后推送回报", text)
+        self.assertIn("▶ 系统将自动在 Kraken 执行，成交后推送回报", text)
 
     def test_has_no_mexc_manual_guidance_at_all(self):
         text = engine.format_entry(self.c, self.sig, _Order(), 7, executor_managed=True)
@@ -102,7 +102,7 @@ class TestManagedEntryCopy(unittest.TestCase):
 
     def test_risk_line_has_no_u_amount_or_config_equity(self):
         text = engine.format_entry(self.c, self.sig, _Order(), 7, executor_managed=True)
-        self.assertIn("风险：单笔 2.00% 权益（实际以 HL 开仓回报为准）", text)
+        self.assertIn("风险：单笔 2.00% 权益（实际以 Kraken 开仓回报为准）", text)
         # 配置 equity 口径（1000U）与实际 U 数都不许出现
         self.assertNotIn("1,000U", text)
         self.assertNotIn("20.0U", text)
@@ -114,10 +114,10 @@ class TestManagedEntryCopy(unittest.TestCase):
             "【双均线】BTC_USDT 做多信号（4h 收盘 10-14 02:00 北京时间）",
             "入场：市价（当前 83,000）",
             "止损触发价：80,600（距离 2.89%）",
-            "▶ 系统将自动在 Hyperliquid 执行，成交后推送回报",
+            "▶ 系统将自动在 Kraken 执行，成交后推送回报",
             "止损单：计划委托，触发价 80,600，卖出平仓，触发参考=最新成交价",
             "止盈：不设",
-            "风险：单笔 2.00% 权益（实际以 HL 开仓回报为准）",
+            "风险：单笔 2.00% 权益（实际以 Kraken 开仓回报为准）",
         ])
 
     def test_manual_exit_advice_not_present(self):
@@ -278,7 +278,7 @@ class TestTickWiring(unittest.TestCase):
         with mock.patch.object(engine, "walk", side_effect=self._walk("entry")):
             sent = engine.tick(self.db, self.cfg, self.notifier, executor=ex)
         self.assertEqual(len(sent), 1)
-        self.assertIn("自动在 Hyperliquid 执行", sent[0])
+        self.assertIn("自动在 Kraken 执行", sent[0])
         self.assertNotIn("单位选 USDT", sent[0])
         self.assertNotIn("张", sent[0])
 
@@ -288,7 +288,7 @@ class TestTickWiring(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertIn("单位选 USDT", sent[0])
         self.assertIn("约 1 张", sent[0])
-        self.assertNotIn("自动在 Hyperliquid 执行", sent[0])
+        self.assertNotIn("自动在 Kraken 执行", sent[0])
 
     def test_managed_tick_emits_managed_missed_copy(self):
         with mock.patch.object(engine, "walk", side_effect=self._walk("entry_missed")):

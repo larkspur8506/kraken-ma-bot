@@ -147,7 +147,7 @@ class TestEntryHook(Base):
         # MEXC 人工下单指引（逐仓/单位选 USDT/张数），因为执行器已接管、这些数字
         # 按配置 equity 算出来是误导。执行器拒绝接管只影响「谁来开仓」，不影响
         # 文案分流（文案分流只看 executor 是否为 None）。旧断言 assertIn("下单") 随之失效。
-        self.assertIn("自动在 Hyperliquid 执行", sent[0])
+        self.assertIn("自动在 Kraken 执行", sent[0])
         self.assertNotIn("单位选 USDT", sent[0])
         self.assertEqual(len(self.notifier.messages), 1)
 
@@ -189,7 +189,7 @@ class TestEntryHook(Base):
         self.assertEqual(len(sent), 1, "人工操作卡必须照发（dry 不许吞信号）")
         self.assertIn("入场：市价", sent[0])            # 人工操作卡正文完好（PR B：无确认链接）
         self.assertNotIn("/c/", sent[0])
-        self.assertTrue(any("HL影子" in m for m in self.notifier.messages),
+        self.assertTrue(any("Kraken影子" in m for m in self.notifier.messages),
                         "应推送一条影子提醒，供逐条比对")
         # 影子期不发任何真实委托，仓位仍停在 pending 等人工确认
         self.assertEqual([c for c in ex.ex.calls if c[0] == "order"], [])

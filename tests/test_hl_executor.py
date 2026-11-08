@@ -232,7 +232,7 @@ class TestDryMode(Base):
         self.assertTrue(any("dry" in e["message"] for e in self.events()))
         # 影子提醒里要有可核对的数字（数量/止损/风险/名义）
         shadow = self.notifier.messages[-1]
-        self.assertIn("HL影子", shadow)
+        self.assertIn("Kraken影子", shadow)
         self.assertIn("止损", shadow)
         self.assertIn("风险", shadow)
 
@@ -242,7 +242,7 @@ class TestDryMode(Base):
         pid = self.add_signal()
         self.assertFalse(self.executor().on_entry(pid))
         self.assertEqual(self.orders("entry")[0]["status"], "planned")
-        self.assertIn("HL影子", self.notifier.messages[-1])
+        self.assertIn("Kraken影子", self.notifier.messages[-1])
 
     def test_dry_never_closes_a_real_position(self):
         """模式从 live 退回 dry 时，交易所还有真实仓位 → 不能替引擎关本地账。"""
