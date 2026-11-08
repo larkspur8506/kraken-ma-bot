@@ -465,6 +465,16 @@ _DD_ST_TXT = {
 }
 
 
+def _flows_supported(deps: Any) -> bool:
+    """该交易所有没有**出入金流水**端点。
+
+    Kraken Futures 没有公开的流水端点（`KrInfo.flows_supported = False`），
+    所有「剔除出入金的盈亏曲线 / 回撤熔断 / 资金费 / 资金流水」在那边都没有数据源。
+    渲染层据此整块不画，而不是画一个恒空的「暂不可用」。
+    """
+    return getattr(getattr(deps, "info", None), "flows_supported", True) is not False
+
+
 def _dd_meta(deps: DashboardDeps, cfg: Any, flows_ok: bool) -> Dict[str, Any]:
     """总览「策略回撤」那一行的数据源：**只读**持久化状态，不重算 TWR 链。
 
@@ -662,6 +672,8 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     base_url = str(_call(deps.base_url_fn, MAINNET_DEFAULT) or MAINNET_DEFAULT)
     mode = str(_call(deps.mode_fn, "off") or "off")
     cfg = _call(deps.config_fn)
+    # venue 是否提供出入金流水（Kraken 期货：否）。渲染层用它决定整块不画。
+    flows_supported = _flows_supported(deps)
 
     # ---------------- 交易所快照 ----------------
     snap: Optional[dict] = None
@@ -900,7 +912,9 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             sig["pnl_source"] = d.get("pnl_source")
         # 单粒度资金费（feat/funds-ledger）：**只挂 HL 仓行**（非 HL 忽略），且该仓
         # 在 hl_funding 里有归集行；没有资金费记录的仓不带键，渲染层不加小字。
-        if posfields.is_hl(d) and d.get("id") is not None:
+        # Kraken 期货 `user_funding_history` 恒空 → 库里可能残留迁移前的 HL 旧行，
+        # 按 venue 能力直接不产这个键（否则会拿旧数据冒充当前资金费）。
+        if flows_supported and posfields.is_hl(d) and d.get("id") is not None:
             fs = fund_by_pos.get(int(d["id"]))
             if fs is not None:
                 sig["funding_sum"] = round(fs, 6)
@@ -1092,7 +1106,12 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         },
         # 盈亏曲线（已剔除出入金）+ TWR 指数。旧键 equity_curve（原始权益曲线）已按
         # 用户要求**整个删掉**，不是开关 —— 全仓只有这一个图表源。
+        # 该 venue 没有流水端点时（Kraken 期货）`curve` 仍是同一份结构（/api 消费方
+        # 不变），只是面板渲染层整块不画 —— 判据是 `flows_supported`。
         "curve": curve,
+        # venue 是否提供出入金流水端点（False = Kraken 期货；面板据此隐藏
+        # 盈亏曲线 / 策略回撤 / 资金费 / 资金流水，见 _render_body）。
+        "flows_supported": flows_supported,
         # 策略绩效（上线以来）：总览卡片数据源（只读聚合，见 _perf_stats）。
         "perf": perf,
         # API 有效期（P3 R3）：状态条徽章唯一常驻出处；/admin 的 get_payload 会用
@@ -1349,7 +1368,7 @@ tr:last-child td{border-bottom:0}
 .chart-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;
             font-size:12px;color:var(--muted);margin-bottom:2px}
 .chart-head b{color:var(--fg)}
-/* 盈亏曲线的定位容器：SVG preserveAspectRatio=none 铺满后，右轴刻度以 HTML
+/* 图表的定位容器：SVG preserveAspectRatio=none 铺满后，右轴刻度以 HTML
    覆盖层（.axlbl）按 y 百分比叠在图上 —— 相对定位锚点在这里。 */
 .chartbox{position:relative}
 .chartbox .axlbl{position:absolute;right:4px;transform:translateY(-50%);font-size:10px;
@@ -2131,6 +2150,19 @@ def _perf_line_html(p: dict) -> str:
             f"{u_seg}</div>")
 
 
+def _perf_block_html(p: dict) -> str:
+    """「上线以来」一行的渲染兜底：只读聚合，**不依赖出入金流水**。
+
+    抽成函数是为了让 Kraken（无流水端点、曲线整卡不画）也能单独拿到这一行 ——
+    它的数字来自已平仓记录与 account.total_realized，与流水无关。
+    """
+    try:
+        return _perf_line_html(p) or ""
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] 上线以来统计行渲染失败：%s", e)
+        return ""
+
+
 def _dd_line_html(meta: Dict[str, Any]) -> str:
     """「策略回撤 …」那一行（§7）：可见文字，不靠 title 悬停。
 
@@ -2164,6 +2196,9 @@ def _dd_line_html(meta: Dict[str, Any]) -> str:
 
 def _render_body(p: dict) -> str:
     mode = str(p.get("mode") or "off")
+    # 该 venue 有没有出入金流水端点（Kraken 期货 = 没有）。面板据此整块不画
+    # 「盈亏曲线 / 策略回撤 / 资金费」—— 那些 U 全是流水口径，缺源就是缺源。
+    no_flows = p.get("flows_supported") is False
     net = _as_dict(p.get("network"))
     acc = _as_dict(p.get("account"))
     system = _as_dict(p.get("system"))
@@ -2226,14 +2261,18 @@ def _render_body(p: dict) -> str:
     # 的数值在每仓下方 tr.subm 小字行**原样补足**（宽屏 CSS 隐藏小字行、窄屏隐藏列，
     # 同一时刻同一事实只显示一份 —— 纯 CSS 显隐，零 JS）。表格仍是单一实现，
     # 不复制第二套「手机版表」。
+    # 「本单资金费」列：数据源是交易所资金费流水；Kraken 期货 `user_funding_history`
+    # 恒空 → 整列不渲染（表头 / 单元格 / 小字行 / colspan 四处同步，不留空列错位）。
+    show_fund_col = not no_flows
+    ncol = 13 if show_fund_col else 12
     o.append("<h2>仓位</h2>")
     o.append("<div class='tscroll'><div class='tablewrap'><table><thead><tr>"
              "<th>币种</th><th>方向</th><th class='num hidem'>数量</th><th class='num'>入场</th>"
              "<th class='num'>标记</th><th class='num'>浮盈浮亏</th><th class='num'>R</th>"
              "<th class='num'>止损</th><th class='num'>止损距离</th><th class='num hidem'>杠杆</th>"
              "<th class='num hidem'>保证金</th><th class='num hidem'>强平价</th>"
-             "<th class='num hidem'>本单资金费</th>"
-             "</tr></thead><tbody>")
+             + ("<th class='num hidem'>本单资金费</th>" if show_fund_col else "")
+             + "</tr></thead><tbody>")
     for pos in (_as_dict(x) for x in positions):
         upnl_txt, upnl_cls = _sign(pos.get("unrealized_pnl"))
         side_txt = "多" if _num(pos.get("side"), 1) >= 0 else "空"
@@ -2241,6 +2280,7 @@ def _render_body(p: dict) -> str:
         r_txt, r_cls = _sign(pos.get("r_unrealized"), "R")
         # 本单资金费（正=收入）：交易所 cumFunding.sinceOpen 已在 status_payload
         # 换算成收入视角；交易所没给（老快照）就如实显示「—」，不猜 0。
+        # Kraken 期货没有资金费流水 → 该列整列不渲染（fund_txt 仍算，仅小字行用）。
         fund_txt, fund_cls = _sign(pos.get("funding_income"))
         # ROE%（对齐 HL 网页习惯）＝ 浮盈 ÷ 本仓保证金。保证金 0/取不到时只显 U
         # 不显 % —— 除数都没有，百分比是编出来的。
@@ -2270,17 +2310,18 @@ def _render_body(p: dict) -> str:
                  + _td(_fmt(pos.get("margin_used")), "num hidem")
                  + _td(_fmt(pos.get("liq_px")) if _opt_num(pos.get("liq_px")) else "—",
                        "num hidem")
-                 + _td(fund_txt, f"num hidem {fund_cls}".strip())
+                 + (_td(fund_txt, f"num hidem {fund_cls}".strip()) if show_fund_col else "")
                  + "</tr>")
         # 小字行：与表格同一份 payload 数值、同一套格式化函数（同一事实一种写法），
         # 只是载体不同 —— 窄屏隐藏列时由它补足，宽屏整个 <tr> 被 CSS 藏掉。
-        o.append("<tr class='subm'><td colspan='13'>"
+        subm_fund = f" · 本单资金费 {fund_txt}" if show_fund_col else ""
+        o.append(f"<tr class='subm'><td colspan='{ncol}'>"
                  f"数量 {_fmt_sz(pos.get('size'))} · "
                  f"{'全仓（Kraken 不做逐仓杠杆设置）' if not _opt_num(pos.get('leverage')) else '杠杆 %.0fx' % _num(pos.get('leverage'), 1)}"
                  f"{' 逐' if pos.get('isolated') else ''} · "
                  f"保证金 {_fmt(pos.get('margin_used'))} U · "
-                 f"强平 {_fmt(pos.get('liq_px')) if _opt_num(pos.get('liq_px')) else '—'} · "
-                 f"本单资金费 {fund_txt}</td></tr>")
+                 f"强平 {_fmt(pos.get('liq_px')) if _opt_num(pos.get('liq_px')) else '—'}"
+                 f"{subm_fund}</td></tr>")
     mr = _mr_view(p)
     if mr is not None and mr["holding"]:
             upnl_txt, upnl_cls = _sign(mr["upnl"])
@@ -2304,14 +2345,14 @@ def _render_body(p: dict) -> str:
                            "num hidem")
                      + _td(_fmt(mr.get("margin")), "num hidem")
                      + _td("—", "num hidem")
-                     + _td("—", "num hidem")
+                     + (_td("—", "num hidem") if show_fund_col else "")
                      + "</tr>")
-            o.append("<tr class='subm'><td colspan='13'>"
+            o.append(f"<tr class='subm'><td colspan='{ncol}'>"
                      f"离场线(SMA5) {_fmt(mr.get('exit_line'))} · 距离场 {dist_txt} · "
                      f"数量 {_fmt_sz(mr.get('qty'))} · 保证金 {_fmt(mr.get('margin'))} U · "
                      f"下一次评估 {_et_iso_local(mr.get('next_eval_et'))}</td></tr>")
     if not positions and not (mr is not None and mr["holding"]):
-        o.append(f"<tr><td colspan='13' class='muted'>"
+        o.append(f"<tr><td colspan='{ncol}' class='muted'>"
                  f"{'交易所无持仓' if reachable else '交易所数据暂不可读'}"
                  f"（信号 / 下单 / 成交见「记录」页）</td></tr>")
     o.append("</tbody></table></div></div>")
@@ -2372,63 +2413,66 @@ def _render_body(p: dict) -> str:
              '可用 = 权益 − 持仓/挂单占用</div>')
     o.append("</div>")
 
-    # ---------------- 盈亏曲线（已剔除出入金）+ 收益指数 ----------------
-    # 页面只有这一张图（旧「权益曲线」已删掉，没有开关、没有视图切换）：
-    # 主曲线 = 累计盈亏（U），虚线 = 收益指数 TWR（起点 100，右轴）。
-    # 流水读不到时**不画任何曲线**，也不退回权益 —— 那条线正是要删掉的误导源。
-    o.append("<h2>盈亏曲线（已剔除出入金）</h2>")
-    o.append("<div class='chart-wrap'>")
-    if curve_meta.get("flows_ok") is False:
-        o.append("<div class='chart-head'><span class='muted'>暂无数据</span></div>")
-        o.append(_pnl_svg([], []))
-        note = str(curve_meta.get("flows_note")
-                   or "无出入金流水源（Kraken 期货无该端点），盈亏曲线不画")
-        o.append(f"<div class=\"legend\">{_esc(note)}</div>")
-    elif len(shown_pnl) >= 2:
-        # 摘要行四个数字**按所选窗口重算**（P1 功能二）：都在同一份曲线序列上切窗，
-        # 不另起炉灶 —— span=all 时与 curve.meta 的全期数字逐字相同（首点 pnl=0、
-        # 指数=100），两种口径不会打架。
-        w_pnl = shown_pnl[-1][1] - shown_pnl[0][1]
-        # 峰谷回撤复用 flows 的同一份实现（同一事实一种写法，不复制第二份逻辑）。
-        w_dd = hl_flows._max_drawdown([v for _, v in shown_pnl])
-        dep_span = _as_dict(curve_meta.get("net_deposit_span"))
-        w_dep = (_opt_num(dep_span.get(span)) if span in ("7", "30") else None)
-        if w_dep is None:
-            w_dep = _opt_num(curve_meta.get("net_deposit")) or 0.0
-        if len(shown_twr) >= 2 and shown_twr[0][1] > 0:
-            # 区间链式收益：指数末点 ÷ 首点 − 1（窗口内任意一点都是链式乘积，直接相除）。
-            w_twr = (shown_twr[-1][1] / shown_twr[0][1] - 1.0) * 100.0
-            twr_label = "收益指数（区间）"
+    # Kraken 期货没有出入金流水端点（KrInfo.flows_supported=False）→ 这张卡整块
+    # 不渲染，连 <h2>盈亏曲线</h2> 也不出现：曲线/净入金/TWR/最大回撤全是流水口径，
+    # 缺源时画一个恒空图只会让人以为「还没同步，再等等」。
+    if not no_flows:
+        # ---------------- 盈亏曲线（已剔除出入金）+ 收益指数 ----------------
+        # 页面只有这一张图（旧「权益曲线」已删掉，没有开关、没有视图切换）：
+        # 主曲线 = 累计盈亏（U），虚线 = 收益指数 TWR（起点 100，右轴）。
+        # 流水读不到时**不画任何曲线**，也不退回权益 —— 那条线正是要删掉的误导源。
+        o.append("<h2>盈亏曲线（已剔除出入金）</h2>")
+        o.append("<div class='chart-wrap'>")
+        if curve_meta.get("flows_ok") is False:
+            o.append("<div class='chart-head'><span class='muted'>暂无数据</span></div>")
+            o.append(_pnl_svg([], []))
+            note = str(curve_meta.get("flows_note")
+                       or "无出入金流水源（Kraken 期货无该端点），盈亏曲线不画")
+            o.append(f"<div class=\"legend\">{_esc(note)}</div>")
+        elif len(shown_pnl) >= 2:
+            # 摘要行四个数字**按所选窗口重算**（P1 功能二）：都在同一份曲线序列上切窗，
+            # 不另起炉灶 —— span=all 时与 curve.meta 的全期数字逐字相同（首点 pnl=0、
+            # 指数=100），两种口径不会打架。
+            w_pnl = shown_pnl[-1][1] - shown_pnl[0][1]
+            # 峰谷回撤复用 flows 的同一份实现（同一事实一种写法，不复制第二份逻辑）。
+            w_dd = hl_flows._max_drawdown([v for _, v in shown_pnl])
+            dep_span = _as_dict(curve_meta.get("net_deposit_span"))
+            w_dep = (_opt_num(dep_span.get(span)) if span in ("7", "30") else None)
+            if w_dep is None:
+                w_dep = _opt_num(curve_meta.get("net_deposit")) or 0.0
+            if len(shown_twr) >= 2 and shown_twr[0][1] > 0:
+                # 区间链式收益：指数末点 ÷ 首点 − 1（窗口内任意一点都是链式乘积，直接相除）。
+                w_twr = (shown_twr[-1][1] / shown_twr[0][1] - 1.0) * 100.0
+                twr_label = "收益指数（区间）"
+            else:
+                w_twr = _opt_num(curve_meta.get("twr_total_pct")) or 0.0
+                twr_label = "收益指数"
+            # 小字一行（iOS 没有悬停，口径必须落在可见文字上）：四个数字一次说完。
+            # 统计行里的负值用现有 neg 类标红（净入金为负=净出金）。
+            o.append(f"<div class='chart-head'><span>{curve_span}（{len(shown_pnl)} 个快照）</span>"
+                     f"<span>累计盈亏 <b class='{'pos' if w_pnl >= 0 else 'neg'}'>"
+                     f"{w_pnl:+,.2f} U</b></span>"
+                     f"<span>{_span_links(span, str(p.get('admin_k') or ''), int(_num(p.get('refresh'))))}</span></div>")
+            o.append(f"<div class=\"legend\">{curve_span}口径：累计盈亏 {_neg_txt(w_pnl, f'{w_pnl:+,.2f}U')} · "
+                     f"净入金 {_neg_txt(w_dep, f'{w_dep:,.2f}U')} · 最大回撤 {w_dd:,.2f}U · "
+                     f"{twr_label} {_neg_txt(w_twr, f'{w_twr:+.2f}%')}</div>")
+            o.append(_pnl_svg(shown_pnl, shown_twr))
+            tail = f" · {_SNAPSHOT_RETENTION_NOTE}" if span == "all" else ""
+            o.append('<div class="legend">实线=累计盈亏（U，左轴）· '
+                     f'虚线=收益指数（起点 100，右轴）{tail}</div>')
         else:
-            w_twr = _opt_num(curve_meta.get("twr_total_pct")) or 0.0
-            twr_label = "收益指数"
-        # 小字一行（iOS 没有悬停，口径必须落在可见文字上）：四个数字一次说完。
-        # 统计行里的负值用现有 neg 类标红（净入金为负=净出金）。
-        o.append(f"<div class='chart-head'><span>{curve_span}（{len(shown_pnl)} 个快照）</span>"
-                 f"<span>累计盈亏 <b class='{'pos' if w_pnl >= 0 else 'neg'}'>"
-                 f"{w_pnl:+,.2f} U</b></span>"
-                 f"<span>{_span_links(span, str(p.get('admin_k') or ''), int(_num(p.get('refresh'))))}</span></div>")
-        o.append(f"<div class=\"legend\">{curve_span}口径：累计盈亏 {_neg_txt(w_pnl, f'{w_pnl:+,.2f}U')} · "
-                 f"净入金 {_neg_txt(w_dep, f'{w_dep:,.2f}U')} · 最大回撤 {w_dd:,.2f}U · "
-                 f"{twr_label} {_neg_txt(w_twr, f'{w_twr:+.2f}%')}</div>")
-        o.append(_pnl_svg(shown_pnl, shown_twr))
-        tail = f" · {_SNAPSHOT_RETENTION_NOTE}" if span == "all" else ""
-        o.append('<div class="legend">实线=累计盈亏（U，左轴）· '
-                 f'虚线=收益指数（起点 100，右轴）{tail}</div>')
+            o.append("<div class='chart-head'><span class='muted'>暂无数据（等执行器落快照）</span></div>")
+            o.append(_pnl_svg([], []))
+        # 策略回撤（DD Guard）：**任何分支都要有这一行** —— 曲线画不出来（流水坏）时更需要
+        # 告诉人「回撤判据现在可不可信」，而「暂不可用」本身就是一句结论。
+        o.append(_dd_line_html(curve_meta))
+        # 「上线以来」一行（原策略绩效整卡，2026-10-29 用户要求精简并入本区块）。
+        o.append(_perf_block_html(p))
     else:
-        o.append("<div class='chart-head'><span class='muted'>暂无数据（等执行器落快照）</span></div>")
-        o.append(_pnl_svg([], []))
-    # 策略回撤（DD Guard）：**任何分支都要有这一行** —— 曲线画不出来（流水坏）时更需要
-    # 告诉人「回撤判据现在可不可信」，而「暂不可用」本身就是一句结论。
-    o.append(_dd_line_html(curve_meta))
-    # 「上线以来」一行（原策略绩效整卡，2026-10-29 用户要求精简并入本区块）。
-    try:
-        perf_line = _perf_line_html(p)
-        if perf_line:
-            o.append(perf_line)
-    except Exception as e:                                        # noqa: BLE001
-        logger.warning("[hl-views] 上线以来统计行渲染失败：%s", e)
-    o.append("</div>")
+        # 「上线以来」不依赖流水（perf 来自已平仓记录 + account.total_realized）→
+        # 保留，单独成一块，不把曲线容器带出来。
+        o.append("<h2>策略绩效</h2>")
+        o.append(_perf_block_html(p))
 
     # ---------------- 三标的动态（含 /why 原因行与闸门） ----------------
     # 2026-10-29 用户要求与「仓位」表对换：仓位移到最顶，本块跟在盈亏曲线之后。

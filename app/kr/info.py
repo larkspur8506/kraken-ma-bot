@@ -500,6 +500,12 @@ class KrInfo:
             })
         return out
 
+    #: 本 venue 没有逐账户资金费端点（Kraken 期货：/history/funding 之类不存在，
+    #: 实测取不到任何逐账户记录）。与 `flows_supported` 同一语义：**能力边界**，
+    #: 不是故障。executor 据此整段跳过资金费同步 —— 不调接口、不写事件、不打日志。
+    #: HL 版 info 不声明此属性，executor 用 getattr(..., True) 取值 → 行为不变。
+    funding_supported = False
+
     def user_funding_history(self, address: str, start_ms: int,
                              end_ms: Optional[int] = None) -> List[dict]:
         """无公开逐账户资金费端点（已实测 404），返回空——面板资金费汇总缺数属已知 PR-3 项。"""

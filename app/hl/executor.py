@@ -338,6 +338,8 @@ class ExecParams:
     # 平仓/止损/监控一概不看它。
     max_signal_age_min: int = SIGNAL_AGE_DEFAULT_MIN
     max_fail_streak: int = 3
+    # ⚠️ Kraken 下不生效（仅 HL 有意义）：L1 当日亏损熔断要求「本轮真的同步到出入金
+    #    流水」，Kraken 无流水源 → 永远走「未判」分支，不会拿它误 kill。
     max_daily_loss_pct: float = 0.05
     deadman_minutes: int = 30
     # 死手开关（HL 原生 scheduleCancel）：默认**关闭**。理由见 docs/HL_RUNBOOK.md —— 它的语义是
@@ -386,11 +388,13 @@ class ExecParams:
     # 出入金流水同步间隔（秒）：盈亏曲线要剔出入金，流水从交易所账本拉。
     # 低频事件（本账户至今 2 笔）→ 不必每轮拉，默认 30 分钟。范围 300~86400，
     # 由 Config.hl_flow_sync_s / DB 键同名控制；**没有面板开关**（用户明确要求）。
+    # ⚠️ Kraken 不生效：无出入金流水源 → `_sync_flows` 在读它之前就整段返回。
     flow_sync_s: int = 1800
     # 回撤熔断（DD Guard）：判据 = 策略口径 TWR 峰谷回撤（已剔除出入金）。
     #   dd_guard    —— 总开关。关 = L2/L3 全不生效（L1 修好口径后照旧生效）。
     #   dd_warn_pct / dd_kill_pct —— 覆盖阈值；0 = 按 risk_pct 档位自动（§3.4）。
     # 默认全开 + 全自动：升档时线必须同批跟着走，所以默认不把 25/30 抄成常量。
+    # ⚠️ Kraken 不生效：DD Guard 依赖「本轮真同步到出入金流水」，无流水源 → 静默未判。
     dd_guard: bool = True
     dd_warn_pct: float = 0.0
     dd_kill_pct: float = 0.0
@@ -2927,10 +2931,22 @@ class Executor:
             self._flows_skip = "该交易所无出入金流水源（DD/日亏熔断未启用）"
             if not getattr(self, "_flows_unsupported_logged", False):
                 self._flows_unsupported_logged = True
-                logger.warning("[hl-exec] %s", self._flows_skip)
-                self._event(EV_ERROR,
-                            "出入金流水源不可用：回撤与当日亏损熔断保持「未判」，不会误判"[:300],
-                            data={"src": "flows_unsupported"})
+                logger.debug("[hl-exec] %s", self._flows_skip)
+                # executor 实例可能每轮重建 → 用 DB 键做跨实例/跨重启的一次性去重，
+                # 否则「能力边界」会被写成一堆 error 事件，把值班员刷醒。
+                try:
+                    notified = str(self.db.get_config_str(
+                        "flows_unsupported_notified", "") or "")
+                except Exception:                                  # noqa: BLE001
+                    notified = "1"          # 读不到就當已通知，宁可少报也不刷屏
+                if notified != "1":
+                    try:
+                        self.db.set_config("flows_unsupported_notified", "1")
+                    except Exception as e:                         # noqa: BLE001
+                        logger.warning("[hl-exec] 写 flows_unsupported_notified 失败：%s", e)
+                    self._event(EV_ERROR,
+                                "出入金流水源不可用：回撤与当日亏损熔断保持「未判」，不会误判"[:300],
+                                data={"src": "flows_unsupported"})
             return 0
         try:
             interval = int(getattr(self.p, "flow_sync_s", self.FLOW_SYNC_DEFAULT)
@@ -2983,6 +2999,13 @@ class Executor:
         # + warning、下轮随闸门重试 —— **绝不影响 _flows_fresh**（那是流水自己的可信
         # 标记，回撤/DD Guard 靠它 fail-closed；资金费是纯记账，没资格弄脏它）。
         # 失败事件 24h 去重（L①）：事件是喊人的，复读 48 遍不是喊人是刷屏。
+        # 【venue 能力边界】KrInfo 有 `user_funding_history` 但恒返回 []（Kraken 期货
+        # 没有公开的逐账户资金费端点）→ 只靠 hasattr 判不出来，必须看显式能力标记。
+        # 显式不支持就整段跳过：不调 sync_funding（省一趟空转）、不写事件、不打日志
+        # —— 这是 venue 能力而不是故障，再报一次只是把真问题淹掉。
+        # HL 版 info 不声明这个属性 → getattr 默认 True，走下面原路径，行为零变化。
+        if getattr(self.info, "funding_supported", True) is False:
+            return res["added"]
         if not hasattr(self.info, "user_funding_history"):
             # 测试替身/降级 info 没有 userFunding 能力 → 跳过，但首次要说一声（L②），
             # 不再静默——静默跳过会让「资金费为什么一直是空的」无从排查。
@@ -3704,8 +3727,9 @@ class Executor:
                 # 不判。留痕分两档（避免正常节奏刷满事件表）：
                 #   闸门内跳过（30 分钟同步间隔内的常规轮次）→ 只打 info 日志；
                 #   接口失败/无地址 → 记一条事件，并在面板写「等待流水同步」。
-                if self._flows_skip == "尚未到流水同步间隔":
-                    logger.debug("[hl-exec] 流水闸门内：本轮跳过当日亏损熔断判断")
+                if (self._flows_skip == "尚未到流水同步间隔"
+                        or self._flows_skip.startswith("该交易所无出入金流水源")):
+                    logger.debug("[hl-exec] 流水不可判（%s）：本轮跳过当日亏损熔断", self._flows_skip)
                 else:
                     self._event(EV_DD,
                                 f"本轮 L1 未判（{self._flows_skip or '未同步到出入金流水'}），"
