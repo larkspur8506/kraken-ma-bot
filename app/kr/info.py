@@ -59,6 +59,10 @@ def _decimals_of(step: float) -> int:
 
 
 class KrInfo:
+    #: Kraken 无钱包地址概念——views 的快照门卫据此放行空 address（HL 靠 address
+    #: 空值拦「误导性主网数据」，Kraken 不存在该问题，照拦会把面板永远挡在门外）。
+    venue_address_free = True
+
     def __init__(self, api_key: str = "", secret_b64: str = "", base_url: str = "",
                  timeout: float = 15.0, endpoints: Any = None,
                  max_leverage: Optional[Dict[str, int]] = None):
@@ -147,7 +151,12 @@ class KrInfo:
                 "withdrawable": av}
 
     def user_state_dex(self, address: str, dex: str) -> dict:
-        """Kraken 无 builder dex 概念；同账户同仓，原样返回 user_state。"""
+        """Kraken 无 builder dex 概念；同账户同仓，原样返回 user_state。
+
+        marginSummary 保持全账户口径——MR 腿的定仓占用走 position_value，
+        `mr_margin_reserved` 展示项在 Kraken 下与全账户 im 同值（无 dex 拆分），
+        不是 bug；面板文案已按统一账户口径写。
+        """
         return self.user_state(address)
 
     def perp_meta_dex(self, dex: str) -> list:

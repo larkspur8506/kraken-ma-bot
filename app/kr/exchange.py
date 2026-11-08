@@ -99,6 +99,12 @@ def parse_order_response(resp: dict) -> dict:
     return _ok(STATUS_RESTING, oid=oid, raw=resp)
 
 
+def _fmt_num(x: float) -> str:
+    """下单参数的数字字符串化：避开 repr 的科学计数法（1e-05 这类 Kraken 会拒）。"""
+    s = repr(float(x))
+    return format(float(x), "f") if ("e" in s or "E" in s) else s
+
+
 class KrExchange:
     """写路径包装。`endpoints` 参数只为测试注入；生产自建 KrClient。"""
 
@@ -199,12 +205,12 @@ class KrExchange:
         except Exception as e:                               # noqa: BLE001
             return _err(f"coin→symbol 失败：{_exc_text(e)}")
         params: dict[str, Any] = {"symbol": symbol, "side": "buy" if is_buy else "sell",
-                                  "size": repr(float(_sz))}
+                                  "size": _fmt_num(_sz)}
         if trigger_px is not None:
-            params.update({"orderType": _STOP_ORDER, "stopPrice": repr(float(trigger_px)),
+            params.update({"orderType": _STOP_ORDER, "stopPrice": _fmt_num(trigger_px),
                            "triggerSignal": "mark", "reduceOnly": "true" if reduce_only else "false"})
         else:
-            params.update({"orderType": _IOC_ORDER, "limitPrice": repr(float(_px)),
+            params.update({"orderType": _IOC_ORDER, "limitPrice": _fmt_num(_px),
                            "reduceOnly": "true" if reduce_only else "false"})
         if cli:
             params["cliOrdId"] = cli

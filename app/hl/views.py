@@ -662,10 +662,12 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     snap: Optional[dict] = None
     net_err = ""
     t0 = time.time()
-    if not address:
-        net_err = "未配置钱包地址"
-    elif deps.info is None:
+    if deps.info is None:
         net_err = "未配置只读客户端"
+    elif not address and not getattr(deps.info, "venue_address_free", False):
+        # HL：address 空 → 拦住（公开主网数据会误导成自己的账户）。
+        # Kraken（venue_address_free）：没有地址概念，空 address 照常拉快照。
+        net_err = "未配置钱包地址"
     else:
         try:
             snap = deps.info.snapshot(address)

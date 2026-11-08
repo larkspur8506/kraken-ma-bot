@@ -466,13 +466,14 @@ class TestRenewPanel(Base):
         html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
         self.assertIn("<div class='sec'>管理</div>", html)
         self.assertIn("更新 API（续期）", html)
-        # 折叠表单：原生 <details class="msgdetails">
-        self.assertIn('<details class="msgdetails"><summary>在 HL 网页续期后粘贴新私钥',
-                      html)
+        # 折叠表单：原生 <details class="msgdetails">；Kraken 版双字段（PR-4）
+        self.assertIn("粘贴 Kraken Derivatives API key", html)
         self.assertIn("action='/admin/hl/agent/renew'", html)
-        self.assertIn("type='password' name='privkey'", html)
-        self.assertIn("More → API", html)
-        self.assertIn("同名 Hermes", html)
+        self.assertIn("type='text' name='apikey'", html)
+        self.assertIn("type='password' name='apisecret'", html)
+        self.assertIn("Derivatives → More → API", html)
+        self.assertIn("General API=Full", html)
+        self.assertIn("Withdrawal API=No Access", html)
         # 表单在管理卡里，状态卡（代理钱包地址）是另一张卡
         seg = html.split("action='/admin/hl/agent/renew'")[0]
         self.assertNotIn("代理钱包地址", seg.rsplit("<div class='card", 1)[-1])
@@ -556,73 +557,57 @@ class TestRenewPanel(Base):
         self.assertIn("已关闭", html)
 
     def test_renew_endpoint_success_303_to_overview(self):
-        key, addr = new_key()
         seen = {}
 
-        def fake_renew(k):
-            seen["key"] = k
-            return True, "API 已更新：新地址 0xaaaa…bbbb"
+        def fake_renew(apikey, apisecret):
+            seen["pair"] = (apikey, apisecret)
+            return True, "Kraken API 凭据已保存，下一轮生效"
 
         r = self._client(renew=fake_renew).post(
-            "/admin/hl/agent/renew", data={"privkey": key, "k": "tk"},
+            "/admin/hl/agent/renew",
+            data={"apikey": "kr-key-1", "apisecret": "c2VjcmV0", "k": "tk"},
             follow_redirects=False)
         self.assertEqual(r.status_code, 303)
         self.assertIn("tab=overview", r.headers["location"])
         self.assertIn("k=tk", r.headers["location"])
-        self.assertEqual(seen["key"], key)
+        self.assertEqual(seen["pair"], ("kr-key-1", "c2VjcmV0"))
 
     def test_renew_endpoint_failure_400(self):
-        def fake_renew(k):
-            return False, "HL 授权列表里没有名字叫 Hermes 的 API 钱包"
+        def fake_renew(apikey, apisecret):
+            return False, "API Secret 不是合法 base64——Kraken 网页上那串要原样完整复制"
 
         r = self._client(renew=fake_renew).post(
-            "/admin/hl/agent/renew", data={"privkey": "0x" + "1" * 64, "k": "tk"},
+            "/admin/hl/agent/renew",
+            data={"apikey": "kr-key-1", "apisecret": "!!!", "k": "tk"},
             follow_redirects=False)
         self.assertEqual(r.status_code, 400)
-        self.assertIn("Hermes", r.text)
+        self.assertIn("base64", r.text)
 
     def test_renew_endpoint_requires_token(self):
-        r = self._client(renew=lambda k: (True, "x")).post(
-            "/admin/hl/agent/renew", data={"privkey": "0x" + "1" * 64},
+        r = self._client(renew=lambda k, s: (True, "x")).post(
+            "/admin/hl/agent/renew",
+            data={"apikey": "k", "apisecret": "c2VjcmV0"},
             follow_redirects=False)
         self.assertEqual(r.status_code, 401)
 
     def test_renew_endpoint_not_wired(self):
         r = self._client().post("/admin/hl/agent/renew",
-                                data={"privkey": "0x" + "1" * 64, "k": "tk"},
+                                data={"apikey": "k", "apisecret": "c2VjcmV0", "k": "tk"},
                                 follow_redirects=False)
         self.assertEqual(r.status_code, 400)
         self.assertIn("未接线", r.text)
 
     def test_renew_endpoint_swallows_exception_without_key(self):
-        key, _addr = new_key()
-
-        def boom(k):
-            raise RuntimeError(f"oops {k}")
+        def boom(apikey, apisecret):
+            raise RuntimeError(f"oops {apikey}")
 
         r = self._client(renew=boom).post(
-            "/admin/hl/agent/renew", data={"privkey": key, "k": "tk"},
+            "/admin/hl/agent/renew",
+            data={"apikey": "kr-key-1", "apisecret": "c2VjcmV0", "k": "tk"},
             follow_redirects=False)
         self.assertEqual(r.status_code, 400)
-        for i in range(0, len(key) - 8 + 1):
-            self.assertNotIn(key[i:i + 8], r.text, "响应体不许含私钥片段")
-
-    def test_renew_endpoint_full_flow_no_leak(self):
-        """端到端：面板 → renew_key（真校验）→ DB，响应体不含私钥。"""
-        key, addr = new_key()
-
-        def real_renew(k):
-            return A.renew_key(self.db, self.cfg, self.notifier, FakeInfo(
-                agents=self.authorized(addr)), k, address=MAIN_ADDR, now_ms=NOW_MS)
-
-        r = self._client(renew=real_renew).post(
-            "/admin/hl/agent/renew", data={"privkey": key, "k": "tk"},
-            follow_redirects=False)
-        self.assertEqual(r.status_code, 303)
-        body = r.text + r.headers.get("location", "")
-        for i in range(0, len(key) - 8 + 1):
-            self.assertNotIn(key[i:i + 8], body)
-        self.assertEqual(str(self.db.get_config_str(CFG_PRIVATE_KEY)), key)
+        for i in range(0, len("kr-key-1") - 4 + 1):
+            self.assertNotIn("kr-key-1"[i:i + 4], r.text, "响应体不许含凭据片段")
 
 
 # ---------------------------------------------------------------- 单元：派生地址

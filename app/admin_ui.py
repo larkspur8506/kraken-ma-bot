@@ -157,8 +157,9 @@ class AdminDeps:
     # ---- API 钱包到期卡片 + 「更新 API」表单（app.hl.agent） ----
     # agent_state_fn 只读 DB 里的 hl_agent_state 缓存（面板渲染**零网络调用**）
     agent_state_fn: Optional[Callable[[], Dict[str, Any]]] = None
-    # renew_fn(新私钥) -> (ok, 人话文案)；校验/写库/推送都在 app.hl.agent.renew_key 里
-    renew_fn: Optional[Callable[[str], Any]] = None
+    # renew_fn(api_key, api_secret) -> (ok, 人话文案)。Kraken 版（PR-4）：
+    # 校验/写库（kr_api_key + kr_api_secret）/失效只读客户端缓存都在 main._kr_renew。
+    renew_fn: Optional[Callable[..., Any]] = None
     cleanup_enabled_fn: Optional[Callable[[], bool]] = None
     # 「为什么没开仓」（PR-5 /why）：可注入的行数据源，便于测试固定输出（不触网）。
     # 缺省时总览会走 app.why.build_rows（现取 4h K 线、只读）。
@@ -1584,20 +1585,23 @@ def render_agent_renew_block(deps: AdminDeps) -> str:
     """
     from app.hl import agent as agent_mod
     o: List[str] = []
-    # 原生 <details>，零 JS：无 JS 的手机也能展开粘贴
-    o.append("<details class=\"msgdetails\"><summary>在 HL 网页续期后粘贴新私钥</summary>"
+    # 原生 <details>，零 JS：无 JS 的手机也能展开粘贴。
+    # Kraken 版（PR-4）：Derivatives 账户 → API → Generate key；General API=Full、
+    # Withdrawal API=No Access（不能提币）。key/secret 是网页上分开的两条，各一个框。
+    o.append("<details class=\"msgdetails\"><summary>粘贴 Kraken Derivatives API key</summary>"
              "<div class=\"fullmsg\">"
-             "<div class='hint'>步骤：① 电脑/手机浏览器打开 HL 网页 → <b>More → API</b>；"
-             f"② 用<b>同名 {agent_mod.AGENT_NAME}</b> 生成新 API 钱包（有效期选最长的 180 天）；"
-             "③ 复制那串新私钥，粘贴到下面保存。</div>"
+             "<div class='hint'>步骤：① Kraken 网页 → <b>Derivatives → More → API</b>；"
+             "② Generate API key：<b>General API=Full</b>、<b>Withdrawal API=No Access</b>（不能提币）；"
+             "③ 把网页显示的 API Key 和 API Secret 分别粘到下面保存。</div>"
              "<form method='post' action='/admin/hl/agent/renew' autocomplete='off'>"
              f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
-             "<input type='password' name='privkey' autocomplete='off' spellcheck='false' "
-             "placeholder='0x…（64 位十六进制）' required>"
+             "<input type='text' name='apikey' autocomplete='off' spellcheck='false' "
+             "placeholder='API Key' required>"
+             "<input type='password' name='apisecret' autocomplete='off' spellcheck='false' "
+             "placeholder='API Secret（base64）' required>"
              "<button type='submit'>校验并保存</button></form>"
-             "<div class='hint'>保存前会先核对：新私钥对应的地址必须已在 HL 授权给同名 "
-             f"{agent_mod.AGENT_NAME}、且有效期还没过。私钥只写进服务器数据库（执行器签名用），"
-             "不回显、不进日志。主钱包私钥不需要填。</div>"
+             "<div class='hint'>保存后立即生效（只读客户端缓存会重建）。key/secret 只写进服务器数据库"
+             "（执行器签名用），不回显、不进日志。</div>"
              "</div></details>")
     return "".join(o)
 
@@ -1880,21 +1884,23 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
 
     # ---------------- 更新 API（到期续期后热切换私钥） ----------------
     @router.post("/admin/hl/agent/renew")
-    def admin_agent_renew(request: Request, privkey: str = Form(""), k: str = Form("")):
-        """校验新私钥并热切换（form 字段 `privkey`，不是 JSON body）。
+    def admin_agent_renew(request: Request, apikey: str = Form(""),
+                          apisecret: str = Form(""), k: str = Form("")):
+        """保存 Kraken Derivatives API key/secret（form 字段 apikey/apisecret）。
 
-        失败一律 400 + 人话指引；**响应与日志都不含私钥任何片段**（见 app.hl.agent.renew_key：
-        那里只回派生地址与日期，异常路径也只回异常类型）。
+        失败一律 400 + 人话指引；**响应与日志都不含凭据任何片段**。
+        校验只做格式（key 非空、secret 是 base64）；真实有效性由下一轮执行器
+        请求 fail-closed 暴露（签名错 = 全部私有读数报错并停手，不会错单）。
         """
         token = _auth(deps, request, k or None)
         if deps.renew_fn is None:
             raise HTTPException(400, "更新 API 未接线（执行器模块未装配），本次没有保存任何东西")
         try:
-            res = deps.renew_fn(privkey)
+            res = deps.renew_fn(apikey, apisecret)
         except Exception as e:                                    # noqa: BLE001
-            # 只记异常类型：异常 repr 里理论上可能带上入参（例如 SDK 的校验错误）
+            # 只记异常类型：异常 repr 里理论上可能带上入参
             logger.error("[admin] 更新 API 异常：%s", type(e).__name__)
-            raise HTTPException(400, "更新失败（内部错误），私钥未保存，请稍后重试")
+            raise HTTPException(400, "保存失败（内部错误），凭据未保存，请稍后重试")
         ok, msg = (res if isinstance(res, (tuple, list)) and len(res) >= 2 else (False, str(res)))
         if not ok:
             raise HTTPException(400, str(msg))

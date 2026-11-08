@@ -106,6 +106,26 @@ class TestAppAssembly(unittest.TestCase):
         self.assertEqual(res.get("level"), "ok")
         self.assertEqual(res.get("source"), "kraken-key-no-expiry")
 
+    def test_kr_renew_validation_and_cache_reset(self):
+        """「更新 API」Kraken 版：空参/非 base64 拒绝；成功写 DB + 失效只读客户端。"""
+        try:
+            import fastapi                                            # noqa: F401
+        except ImportError:
+            self.skipTest("fastapi 未安装")
+        import base64
+        mod = importlib.import_module("app.main")
+        importlib.reload(mod)
+        ok, _ = mod._kr_renew("", "")
+        self.assertFalse(ok)
+        ok, msg = mod._kr_renew("kr-key-1", "!!!不是base64!!!")
+        self.assertFalse(ok)
+        self.assertIn("base64", msg)
+        mod._hl_info = object()                   # 模拟已有缓存，成功后必须失效
+        ok, _ = mod._kr_renew("kr-key-1", base64.b64encode(b"secret-bytes").decode())
+        self.assertTrue(ok)
+        self.assertIsNone(mod._hl_info, "保存凭据后只读客户端缓存必须失效")
+        self.assertEqual(mod.db.get_config_str("kr_api_key"), "kr-key-1")
+
     @staticmethod
     def _route_paths(app) -> set:
         return set(app.openapi().get("paths", {}).keys())
