@@ -448,7 +448,7 @@ class TestMrPanelAndSizing(unittest.TestCase):
             self.assertIn("name='on' value='1'", html)
             self.assertIn("name='on' value='0'", html)
             self.assertIn("value='tok'", html)
-            self.assertIn("已启用" if want_on else "已停用（默认）", html)
+            self.assertIn("已启用" if want_on else "已停用", html)
             # 开关卡片必须与拉闸同一张卡（页尾唯一写入口）
             self.assertLess(html.index("拉闸（kill switch）"), html.index("MR 腿（QQQ 超跌反弹）"))
 

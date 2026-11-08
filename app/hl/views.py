@@ -489,8 +489,13 @@ def _dd_meta(deps: DashboardDeps, cfg: Any, flows_ok: bool) -> Dict[str, Any]:
                    dd_note="回撤熔断已关闭")
         return out
     if not flows_ok:
-        # 流水读不到 → 指数的历史段不可信（少一笔入金就会被当成亏损）→ 不显示数字
-        out["dd_note"] = "出入金流水读取失败"
+        # 流水读不到 → 指数的历史段不可信（少一笔入金就会被当成亏损）→ 不显示数字。
+        # 若该 venue 根本没有出入金流水端点（Kraken 期货），要说「未启用」而不是
+        # 「读取失败」——后者会让人以为重试几次就会好。
+        if getattr(getattr(deps, "info", None), "flows_supported", True) is False:
+            out["dd_note"] = "该交易所无出入金流水源 → 回撤/日亏熔断未启用"
+        else:
+            out["dd_note"] = "出入金流水读取失败"
         return out
     st = hl_dd.load_state(deps.db)
     if not st:
@@ -926,7 +931,7 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     snaps = (_db_call(deps.db, "hl_snapshots", now - 30 * _DAY, 20000) or []) if include_curve_points else []
     curve = hl_flows.curve(
         snaps, flows, now=now, window_s=30 * _DAY, flows_ok=flows_ok,
-        flows_note="" if flows_ok else "出入金流水读取失败，盈亏曲线暂不可用（系统会自动重试）")
+        flows_note="" if flows_ok else "无出入金流水源（Kraken 期货无该端点），盈亏曲线不画")
     # 回撤熔断（DD Guard）字段并进 curve.meta：面板与 /api/hl/status 共用同一份数字
     # （§10.5 要求 curve meta 里出现 DD 字段）。**只读**执行器持久化的状态。
     if isinstance(curve.get("meta"), dict):
@@ -2377,7 +2382,7 @@ def _render_body(p: dict) -> str:
         o.append("<div class='chart-head'><span class='muted'>暂无数据</span></div>")
         o.append(_pnl_svg([], []))
         note = str(curve_meta.get("flows_note")
-                   or "出入金流水读取失败，盈亏曲线暂不可用（系统会自动重试）")
+                   or "无出入金流水源（Kraken 期货无该端点），盈亏曲线不画")
         o.append(f"<div class=\"legend\">{_esc(note)}</div>")
     elif len(shown_pnl) >= 2:
         # 摘要行四个数字**按所选窗口重算**（P1 功能二）：都在同一份曲线序列上切窗，

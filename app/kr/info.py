@@ -505,9 +505,19 @@ class KrInfo:
         """无公开逐账户资金费端点（已实测 404），返回空——面板资金费汇总缺数属已知 PR-3 项。"""
         return []
 
+    #: 本 venue 没有出入金流水端点（Kraken 期货 /transfers 是 x-internalOnly，
+    #: 实测返回非 JSON）。executor 据此走「显式未判」而不是「同步成功但 0 行」——
+    #: 后者会把充提整笔当盈亏，提现就能误触发 kill。
+    flows_supported = False
+
     def ledger_updates(self, address: str, start_ms: int = 0,
-                       end_ms: Optional[int] = None) -> List[dict]:
-        """出入金：期货 API 无此端点（外部充值在主 Kraken 账户），返回空；PR-3 用面板手工补账。"""
+                       end_ms: Optional[int] = None,
+                       deadline_ts: Optional[float] = None) -> List[dict]:
+        """出入金：Kraken 期货无公开端点（/transfers 内部端点，实测不可用），返回空。
+
+        `deadline_ts` 只是接口兼容（executor 会传），不参与任何预算控制。
+        真正的「不可用」语义由类属性 `flows_supported=False` 承担。
+        """
         return []
 
     def user_fees(self, address: str) -> dict:

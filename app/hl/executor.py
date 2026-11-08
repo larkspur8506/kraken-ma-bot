@@ -2919,6 +2919,19 @@ class Executor:
         # 留下上一轮的 True（fail-closed：算不出回撤就不判，见 _dd_guard）。
         self._flows_fresh = False
         self._flows_skip = ""
+        # 该 venue 没有出入金流水源（Kraken 期货：/transfers 是 x-internalOnly，实测
+        # 返回非 JSON）。**不假装「同步成功但 0 行」**——那会把充值/提现整笔当盈亏，
+        # 提现就能误触发 kill（v2 高1 的老坑）。显式声明不支持：_flows_fresh 保持
+        # False，DD/L1 走「未判」分支且理由写明白，事件只报一次。
+        if getattr(self.info, "flows_supported", True) is False:
+            self._flows_skip = "该交易所无出入金流水源（DD/日亏熔断未启用）"
+            if not getattr(self, "_flows_unsupported_logged", False):
+                self._flows_unsupported_logged = True
+                logger.warning("[hl-exec] %s", self._flows_skip)
+                self._event(EV_ERROR,
+                            "出入金流水源不可用：回撤与当日亏损熔断保持「未判」，不会误判"[:300],
+                            data={"src": "flows_unsupported"})
+            return 0
         try:
             interval = int(getattr(self.p, "flow_sync_s", self.FLOW_SYNC_DEFAULT)
                            or self.FLOW_SYNC_DEFAULT)
@@ -3176,10 +3189,11 @@ class Executor:
         # 不退（实测提现 500U → 误 kill 当日亏损 −50%、index 永久停在 50）。
         if not self._flows_fresh:
             reason = self._flows_skip or "本轮未同步到出入金流水"
-            if reason == "尚未到流水同步间隔":
-                # 闸门内跳过是**正常节奏**（流水 30 分钟一次、tick 5 分钟一轮）：
-                # 不推「口径不可用」（那会变成一天一条恒定噪音），但同样不推进、不判。
-                logger.debug("[hl-exec] 流水闸门内：本轮不推进回撤指数、不判线")
+            if reason == "尚未到流水同步间隔" or reason.startswith("该交易所无出入金流水源"):
+                # 闸门内跳过是**正常节奏**（流水 30 分钟一次、tick 5 分钟一轮）；
+                # 「无流水源」是 venue 能力边界（Kraken 期货没有出入金端点），也是常态。
+                # 两者都不推「口径不可用」（否则一天一条恒定噪音），但同样不推进、不判。
+                logger.debug("[hl-exec] 流水不可判（%s）：本轮不推进回撤指数、不判线", reason)
             else:
                 self._dd_unavailable(alerts, reason, now_ts)
                 self._dd_note_wait(f"等待流水同步（{reason}）")

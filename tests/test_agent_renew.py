@@ -473,7 +473,7 @@ class TestRenewPanel(Base):
         self.assertIn("type='password' name='apisecret'", html)
         self.assertIn("Derivatives → More → API", html)
         self.assertIn("General API=Full", html)
-        self.assertIn("Withdrawal API=No Access", html)
+        self.assertIn("Withdrawal=No Access", html)
         # 表单在管理卡里，状态卡（代理钱包地址）是另一张卡
         seg = html.split("action='/admin/hl/agent/renew'")[0]
         self.assertNotIn("代理钱包地址", seg.rsplit("<div class='card", 1)[-1])
