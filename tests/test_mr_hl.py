@@ -137,6 +137,43 @@ class TestRounding(unittest.TestCase):
         self.assertEqual(_floor_sz(2.6, 2), 2.6)
 
 
+class TestVenuePriceRounding(unittest.TestCase):
+    """PR-12：限价取整优先走 venue 自己的 tickSize（Kraken），别再套 HL 的 5 位有效数字。
+
+    PF_QQQXUSD 的 tickSize=0.1：HL 规则会给 601.23（2 位小数），被 place_order 里的
+    info.round_price 二次取整成 601.2 —— 台账 raw.limit_px 与实发价对不上。
+    """
+
+    @staticmethod
+    def _leg(info):
+        return HlMrLeg(db=None, info=info, exchange=None,
+                       address_fn=lambda: "kraken",
+                       config=HlMrConfig(coin="QQQ", dex="kr"))
+
+    def test_prefers_info_round_price(self):
+        class _Info:
+            def round_price(self, coin, px):
+                self.seen = (coin, px)
+                return round(px / 0.1) * 0.1
+
+        info = _Info()
+        got = self._leg(info)._venue_px(601.234, 3)
+        self.assertEqual(info.seen[0], "QQQ")
+        self.assertAlmostEqual(got, 601.2, places=6)
+
+    def test_falls_back_to_hl_rule_when_round_price_fails(self):
+        class _Info:
+            def round_price(self, coin, px):
+                raise RuntimeError("no tickSize")
+
+        got = self._leg(_Info())._venue_px(601.234, 3)
+        self.assertAlmostEqual(got, _round_px(601.234, 3), places=9)
+
+    def test_falls_back_when_info_has_no_round_price(self):
+        got = self._leg(object())._venue_px(601.234, 3)
+        self.assertAlmostEqual(got, _round_px(601.234, 3), places=9)
+
+
 class TestMrDisabled(unittest.TestCase):
     def test_no_config_means_disabled_no_orders(self):
         with tempfile.TemporaryDirectory() as tmp:

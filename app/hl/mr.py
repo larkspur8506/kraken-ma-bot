@@ -1,4 +1,4 @@
-"""MR（超跌反弹）腿 — HL（xyz:XYZ100）适配，挂在现有进程的 5 分钟 job 里跑。
+"""MR（超跌反弹）腿 — 交易所适配（现为 Kraken PF_QQQXUSD/QQQ），挂 5 分钟 job 跑。
 
 与 lighter-ma-bot 的 `app/mr.py` 同一套规则（信号口径 `app/mr_signal.py` 逐字节
 同码，P3 对抗审核时做两侧一致性断言）；差异只在与交易所的边界：
@@ -9,21 +9,24 @@
   `app/hl/equity_fix.py` 的结论），所以 sizing 基数 = `info.account_equity()`
   （现货 USDC 总额）− MR 仓占用（`marginUsed + uPnL`，与 Lighter 侧同口径）。
   注意 `spotClearinghouseState` **没有 marginSummary**，必须读 `balances`。
-- **市价单**：HL 没有真市价，用激进 IOC 限价（mid ± slippage_bps 带宽），
-  价格按官方规则取整（≤5 位有效数字、≤6−szDecimals 位小数）。
-- **成交只认持仓**：回执 `status=filled` 之外还要看到 xyz dex 的仓真的出现/消失；
+- **市价单**：交易所没有真市价，用激进 IOC 限价（mid ± slippage_bps 带宽）。
+  价格取整走 venue 自己的精度：Kraken 用 `info.round_price()`（tickSize 整数倍），
+  取不到 tickSize 时才回退 HL 的「5 位有效数字」规则（历史兼容，别当现行口径）。
+- **成交只认持仓**：回执 `status=filled` 之外还要看到交易所的仓真的出现/消失；
   `resting`/`dry`/零成交一律不记账（离场未清干净保持 OPEN 重试）。下单前写一条
   `mr_entry_intent` / `mr_exit_intent` 事件：确认因读错误/重启丢失时，下一轮凭意图
   把交易所真实仓位补记进台账（只认同一 signal_date），避免 recon_err 冻结。
-- **杠杆**：入场前 `update_leverage(coin, 5x, cross)`（幂等）——否则该 dex 若是
-  30x 逐仓，−3.3% 就强平，而 MR 本身不挂止损。
+- **杠杆**：入场前 `update_leverage(coin, 5x, cross)`（幂等）。Kraken 期货只有全仓
+  （flex），`KrExchange.update_leverage` 是 no-op；HL 时代这条是为了避免落成 30x 逐仓
+  （−3.3% 就强平，而 MR 不挂止损），历史语义保留。
 - **幂等**：台账 `signal_date` 唯一约束 + 「只在空仓时入场」是护栏；cloid 按 tick 分钟
   派生（同一轮重放同键，跨轮重试换键 —— 已用过的 cloid 重试会被拒）。
-- **费用**：HIP-3 taker 0.09%/边，净盈亏按 0.0009×名义×2 边估算入账
-  （fee_quote 列），funding 用 `userFundingHistory` 实际值。
+- **费用**：Kraken 6 级 taker 2.75bp/边（Tier 1 5bp），净盈亏按 `taker_fee_rate`
+  ×名义×边数估算入账（fee_quote 列）；funding 取交易所实际值（Kraken 无资金费
+  流水 → 恒 0，属已知缺口）。
 - **对账 fail-closed**、**kill/开关只挡入场不挡离场**、**MR 异常不拖死主腿**
   与 Lighter 侧完全一致。
-- **基金级闸门走 `hl_kill`**（2026-11-02 第五轮核对）：HL 的回撤熔断会
+- **基金级闸门走 `hl_kill`**（2026-11-02 第五轮核对）：执行器的回撤熔断会
   `hl_set_kill(origin="dd")`、当日亏损同理，MR 读 `db.hl_kill()` ⇒ 两类熔断都挡得住。
   （Lighter 侧没有这条链路，已在那边显式接 `RiskState`。）
 - **占用口径 = 价格敞口（名义 = 数量 × 标记价）**，不是保证金：5x 下保证金只有名义的
@@ -105,7 +108,11 @@ class HlMrConfig:
 
 
 def _round_px(px: float, sz_decimals: int) -> float:
-    """HL 价格精度：≤5 位有效数字且小数位 ≤ 6−szDecimals（官方规则）。"""
+    """**回退**用的 HL 价格精度：≤5 位有效数字且小数位 ≤ 6−szDecimals。
+
+    Kraken 下不应走到这里：`HlMrLeg._venue_px()` 优先调 `info.round_price()`
+    （tickSize 整数倍）。保留此函数给无 tickSize 的 venue / 测试回放。
+    """
     out = float(f"{px:.5g}")
     return round(out, max(6 - int(sz_decimals), 0))
 
@@ -177,7 +184,7 @@ class HlMrLeg:
 
         返回 (最后一次读到的持仓, read_ok)。`read_ok=False` = 整轮都没读到真相 ——
         离场方必须按「未知」处理，绝不当成「仓已消失」写出假 CLOSED。
-        成交只认持仓，不认回执 —— HL 的 `status=filled` 也可能只成交一部分。
+        成交只认持仓，不认回执 —— 交易所的 `status=filled` 也可能只成交一部分。
         """
         cfg = self.config
         budget = float(cfg.fill_confirm_s if confirm_s is None else confirm_s)
@@ -354,7 +361,7 @@ class HlMrLeg:
         filled_sz = abs(float(pos.get("szi") or 0.0))
         if float(pos.get("szi") or 0.0) <= 0:
             # MR 只做多：空头仓不按 MR 入场认领（手工/别的系统开的）。
-            logger.warning("mr: xyz dex 的 XYZ100 是空头（szi=%s），跳过入场认领",
+            logger.warning("mr: 交易所 %s 是空头（szi=%s），跳过入场认领", self.config.coin,
                            pos.get("szi"))
             return False
         entry_px = float(pos.get("entry_px") or 0.0) or float(payload.get("ref_price") or 0.0)
@@ -371,7 +378,7 @@ class HlMrLeg:
                  "intent_ts": ts, "fill_source": "xyz_dex_position"})
         status["state"] = "entered"
         status["adopted"] = "entry"
-        self._alert(f"MR 入场确认丢失，已按 xyz dex 持仓补记台账 #{trade_id}："
+        self._alert(f"MR 入场确认丢失，已按交易所持仓补记台账 #{trade_id}："
                     f"{self.config.coin} {filled_sz} @≈{entry_px:.2f}（信号 {signal_date}）")
         return True
 
@@ -399,9 +406,27 @@ class HlMrLeg:
             raw={"adopted": True, "price_source": "all_mids", "intent_ts": ts})
         status["state"] = "exited"
         status["adopted"] = "exit"
-        self._alert(f"MR 离场确认丢失，xyz dex 已空仓 → 按当前 mid {mark:.2f} 补记 CLOSED"
+        self._alert(f"MR 离场确认丢失，交易所已空仓 → 按当前 mid {mark:.2f} 补记 CLOSED"
                     f"（台账 #{open_row['id']}，净 {net_pnl:+.2f} USDC，价格为估算）")
         return True
+
+    def _venue_px(self, px: float, sz_decimals: int) -> float:
+        """限价取整：优先 venue 自己的 tickSize（Kraken 只接受 tick 整数倍）。
+
+        HL 规则（≤5 位有效数字 + ≤6−szDecimals 位小数）在 PF_QQQXUSD（tick=0.1）
+        上会给出 2 位小数的价，随后又被 `KrExchange.place_order` 里的
+        `info.round_price` 二次取整 —— 台账 raw.limit_px 与实发价对不上。这里先按
+        tick 取整（同一条规则只跑一遍）；`round_price` 抛错（取不到 tickSize）才回退
+        旧公式，避免精度接口故障把离场卡死。
+        """
+        rp = getattr(self.info, "round_price", None)
+        if callable(rp):
+            try:
+                return float(rp(self.config.coin, px))
+            except Exception as exc:                          # noqa: BLE001
+                logger.warning("mr: round_price(%s, %s) 失败，回退 HL 规则：%s",
+                               self.config.coin, px, exc)
+        return _round_px(px, sz_decimals)
 
     def _sz_decimals(self) -> Optional[int]:
         cfg = self.config
@@ -456,7 +481,8 @@ class HlMrLeg:
         cfg = self.config
         address = (self.address_fn() or "").strip()
         if not address:
-            status["error"] = "HL_ADDRESS 为空"
+            # Kraken 没有钱包地址：main 会填一个占位常量，读到空 = 装配异常。
+            status["error"] = "账户标识为空（Kraken 下应是 main 填的占位常量，说明装配异常）"
             status["state"] = "error"
             return status
         enabled = self._enabled()
@@ -488,10 +514,10 @@ class HlMrLeg:
             holding = True                                    # 刚下单，持仓行还没出现
         elif open_row is not None and pos is None:
             recon_ok = False
-            self._recon_fail("台账有 OPEN 仓但交易所在 xyz dex 没有 XYZ100 持仓（人工核对）")
+            self._recon_fail(f"台账有 OPEN 仓但交易所没有 {cfg.coin} 持仓（人工核对）")
         elif open_row is None and pos is not None:
             recon_ok = False
-            self._recon_fail("交易所有 XYZ100 持仓但台账没有 OPEN（人工核对，不自动吃）")
+            self._recon_fail(f"交易所有 {cfg.coin} 持仓但台账没有 OPEN（人工核对，不自动吃）")
         elif open_row is not None and pos is not None:
             holding = True
         if recon_ok:
@@ -662,7 +688,7 @@ class HlMrLeg:
             status["state"] = "margin_mode_failed"
             return status
         cloid = make_cloid(cfg.coin, _attempt_ms(now), "mr_entry")
-        limit_px = _round_px(mark * (1 + cfg.slippage_bps / 10000.0), sz_dec)
+        limit_px = self._venue_px(mark * (1 + cfg.slippage_bps / 10000.0), sz_dec)
         self.db.hl_log_event(
             _ENTRY_INTENT_KIND,
             f"MR 入场下单意图：{cfg.coin} {sz} @≈{mark:.2f}（信号 {signal_date}）",
@@ -690,10 +716,10 @@ class HlMrLeg:
         filled, _seen = self._await_position(self.address_fn() or "", want=True)
         if filled is None:
             status["state"] = "entry_not_filled"
-            status["error"] = "确认窗口内 xyz dex 没有持仓"
+            status["error"] = f"确认窗口内交易所没有 {cfg.coin} 持仓"
             self._alert_throttled(
                 "entry_not_filled",
-                "MR 入场单回执 filled 但 xyz dex 没有出现持仓——不写台账，下轮重试")
+                f"MR 入场单回执 filled 但交易所没有出现 {cfg.coin} 持仓——不写台账，下轮重试")
             return status
         filled_sz = abs(float(filled.get("szi") or 0.0))
         if filled_sz <= 0:
@@ -783,7 +809,8 @@ class HlMrLeg:
             "dist_to_exit_pct": ((float(exit_line) - mark) / mark * 100.0
                                  if exit_line and mark else None),
             "margin": (pos or {}).get("margin_used"),
-            "leverage": 5.0 if pos else None,
+            # Kraken 全仓没有逐仓杠杆：给交易所读数（KrInfo 给 None），别写死 5x。
+            "leverage": (pos or {}).get("leverage"),
             "liq_price": None,
             "next_eval_et": signal.get("next_eval_et"),
         }
@@ -806,7 +833,7 @@ class HlMrLeg:
             return status
         sz = abs(float(pos["szi"])) if pos else float(open_row["qty"])
         cloid = make_cloid(cfg.coin, _attempt_ms(now), "mr_exit")
-        limit_px = _round_px(mark * (1 - cfg.slippage_bps / 10000.0), sz_dec)
+        limit_px = self._venue_px(mark * (1 - cfg.slippage_bps / 10000.0), sz_dec)
         self.db.hl_log_event(
             _EXIT_INTENT_KIND,
             f"MR 离场下单意图：{cfg.coin} {sz}（信号日 {open_row['signal_date']}）",
@@ -847,7 +874,7 @@ class HlMrLeg:
             status["error"] = f"回执 status={result.get('status')!r}，剩余 {remain}"
             self._alert_throttled(
                 "exit_not_filled",
-                "MR 离场单已受理但 xyz dex 仍有持仓或读不到持仓（零成交/部分成交/"
+                "MR 离场单已受理但交易所仍有持仓或读不到持仓（零成交/部分成交/"
                 "确认读失败）——台账保持 OPEN，下轮重试")
             return status
         funding_paid = self._funding_paid(open_row, now)

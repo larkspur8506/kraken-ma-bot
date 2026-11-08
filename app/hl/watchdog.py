@@ -1,4 +1,4 @@
-"""HL 执行器看守检查（供 Hermes cron 每 5 分钟调用，异常才输出）。
+"""执行器看守检查（Kraken 版；供 Hermes cron 每 5 分钟调用，异常才输出）。
 
 与 cma_watch.py 分工：那个看「提醒服务」，这个看「执行器 + 交易所侧状态」。
 本模块只读：不写库（除 kill switch 的提示不做任何状态变更）、不下单。
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 import os
 import sys
 import time
@@ -38,13 +37,18 @@ def _env(key: str, default: str = "") -> str:
     return (os.environ.get(key) or default).strip()
 
 
-def check_clock_skew(base_url: str = "https://api.hyperliquid.xyz",
+def check_clock_skew(base_url: str = "https://futures.kraken.com",
                      timeout: float = 10.0) -> Optional[float]:
-    """用响应头 Date 估服务器时间偏差（秒）。取不到返回 None。"""
+    """用响应头 Date 估服务器时间偏差（秒）。取不到返回 None。
+
+    Kraken（PR-12 去 HL 残留）：原来 POST `api.hyperliquid.xyz/info`，Kraken 部署下
+    这条等于在量 HL 的时间。改用 Kraken **公开** GET（instruments，无需签名）——
+    时钟偏差仍然有意义：Kraken 的 nonce 必须递增，本机跑快/跑慢都会被拒。
+    """
     try:
-        req = urllib.request.Request(base_url + "/info",
-                                     data=json.dumps({"type": "allMids"}).encode(),
-                                     headers={"Content-Type": "application/json"}, method="POST")
+        req = urllib.request.Request(
+            base_url.rstrip("/") + "/derivatives/api/v3/instruments",
+            headers={"User-Agent": "cma-watchdog"}, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             date_hdr = resp.headers.get("Date")
             resp.read()
@@ -96,6 +100,8 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     # 4) 交易所侧：仓位与止损。
     #    审计三轮 L：地址缺失只跳过交易所侧（4/7/8），不提前 return ——
     #    后面的 24h 失败单、时钟偏差检查与交易所无关，必须照常执行。
+    # 环境变量名沿用 HL_ACCOUNT_ADDRESS（部署侧已存在，改名=改 compose，收益为零）；
+    # Kraken 下它只是 main 填的占位常量， KrInfo 的全部方法都忽略这个参数。
     address = _env("HL_ACCOUNT_ADDRESS")
     if info is None or not address:
         add("未配置 HL_ACCOUNT_ADDRESS，跳过交易所侧检查")
@@ -104,7 +110,7 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
         try:
             snap = info.snapshot(address)
         except HlInfoError as e:
-            add(f"读不到 HL 账户：{e}")
+            add(f"读不到 Kraken 账户：{e}")
     if snap is not None:
         ex_pos = {p["coin"]: p for p in snap.get("positions") or []}
         orders_trusted = bool(snap.get("orders_trusted", False))
@@ -152,7 +158,7 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     if skew is None:
         add("时钟偏差检查失败（拿不到服务器时间）")
     elif abs(skew) > CLOCK_SKEW_MAX_S:
-        add(f"本机与 HL 服务器时间偏差 {skew:+.1f} 秒（>2s 会导致 nonce 被拒）")
+        add(f"本机与 Kraken 服务器时间偏差 {skew:+.1f} 秒（>2s 会导致 nonce 被拒）")
     else:
         add(f"时钟偏差 {skew:+.2f} 秒", ok=True)
 
@@ -166,22 +172,36 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
         add(f"账户权益 {snap.get('equity', 0):,.2f} USDC（可用 {snap.get('withdrawable', 0):,.2f}）",
             ok=True)
 
-    # 8) agent（API 钱包）授权到期 —— 到期后所有下单会被拒，必须提前发现
+    # 8) agent（API 钱包）授权到期 —— HL 时代的概念（代理钱包有到期时间）。
+    #    Kraken 的 API key 没有到期、也没有代理钱包。KrInfo **实现了** agent_status，
+    #    但返回的是 {"kind":"kraken-api","expires":None,"days_left":None}（无 agents /
+    #    max_valid_until）—— 按「有没有这个方法」判会漏，反而把「无 agent」当故障误报。
+    #    判据按 venue 能力：kind 是 kraken-api，或既无 agents 也无到期字段 → 不适用，
+    #    跳过（这是「不适用」，不是「读失败」，不许报成告警）。HL 形状照旧查到期。
     if not address or info is None:
         return notes
+    ag_fn = getattr(info, "agent_status", None)
+    if not callable(ag_fn):
+        add("Kraken API key 无到期概念（也没有代理钱包），跳过 agent 授权检查", ok=True)
+        return notes
     try:
-        ag = info.agent_status(address)
+        ag = ag_fn(address) or {}
+        kraken_no_expiry = (str(ag.get("kind") or "") == "kraken-api"
+                            or ("agents" not in ag and "max_valid_until" not in ag))
+        if kraken_no_expiry:
+            add("Kraken API key 无到期概念（也没有代理钱包），跳过 agent 授权检查", ok=True)
+            return notes
         agents = ag.get("agents") or []
         until = ag.get("max_valid_until")
         if not agents:
             add("账户没有任何 agent（API 钱包）授权 —— 下单会被拒，"
-                "请到 HL 设置里生成 API 钱包并绑定主账户")
+                "请到交易所设置里生成 API 钱包并绑定主账户（仅 HL 时代部署需要）")
         elif until:
             days_left = (float(until) / 1000.0 - time.time()) / 86400.0
             names = "、".join(str(a.get("name") or str(a.get("address"))[:10]) for a in agents[:3])
             if days_left <= AGENT_WARN_DAYS:
                 add(f"agent 授权只剩 {days_left:.1f} 天（{names}）"
-                    f"—— 到期后自动交易会全部失败，请到 HL 设置里重新生成/延长 API 钱包")
+                    f"—— 到期后自动交易会全部失败，请重新生成/延长 API 钱包（仅 HL 时代部署）")
             else:
                 add(f"agent 授权 {len(agents)} 个（{names}），最长还有 {days_left:.0f} 天", ok=True)
         else:
@@ -200,9 +220,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     from app.db import DB
-    from app.hl.info import MAINNET, TESTNET, HlInfo
+    from app.kr.info import KrInfo
 
-    base = TESTNET if _env("HL_TESTNET", "0") in ("1", "true") else MAINNET
+    # Kraken 端点（PR-12 去 HL 残留：原来这里 new 的是 HlInfo 连 Hyperliquid）。
+    # 与 main.hl_info_base() 同口径：HL_TESTNET 复用为沙盒开关。
+    base = ("https://demo-futures.kraken.com"
+            if _env("HL_TESTNET", "0") in ("1", "true")
+            else "https://futures.kraken.com")
     db = DB(args.db)
     # 模式判定必须与 main.hl_mode() 同口径：DB > env > off。
     # 只读 env 的话，面板切到 live 而 env 还是 dry/off 时，看守会在错误的模式下自检
@@ -213,7 +237,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         mode = raw.strip().strip('"')
         if mode not in (MODE_OFF, "dry", "live"):
             mode = MODE_OFF
-    info = HlInfo(base_url=base)
+    # 凭据：DB（面板「更新 API」写入）优先，其次 env —— 与 main.kr_api_key/secret 同序。
+    # 只读消费，缺凭据时公开端点仍可用、私有读数 fail-closed（KrInfo 自身语义）。
+    api_key = (str(db.get_config_str("kr_api_key", "") or "").strip()
+               or _env("KRAKEN_API_KEY"))
+    secret = (str(db.get_config_str("kr_api_secret", "") or "").strip()
+              or _env("KRAKEN_API_SECRET"))
+    info = KrInfo(api_key=api_key, secret_b64=secret, base_url=base)
     problems = run_checks(db, info=info, mode=mode, force=args.dry_run)
     bad = [p for p in problems if p.startswith("⚠️")]
     if args.dry_run:
@@ -222,7 +252,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(" ", p)
         return 0
     if bad:
-        print("⚠️ HL 执行器看守告警")
+        print("⚠️ Kraken 执行器看守告警")
         for p in bad:
             body = p[len("⚠️ "):] if p.startswith("⚠️ ") else p
             print("•", body)

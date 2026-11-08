@@ -164,6 +164,15 @@ class TestHttp(unittest.TestCase):
         self.assertNotIn("HL_PRIVATE_KEY=0xzz", Path(self.env_path).read_text())
         self.assertEqual(self.client.get(f"/admin/hl/key?t={tok}").status_code, 200)  # 令牌仍在
 
+    def test_form_is_labelled_legacy_and_points_kraken_to_panel(self):
+        """PR-12：Kraken 的 key/secret 走面板「更新 API」，本页只是遗留入口。"""
+        tok, _ = keyform.issue_token(self.db)
+        r = self.client.get(f"/admin/hl/key?t={tok}")
+        self.assertIn("录入交易所 API 私钥（遗留页）", r.text)
+        self.assertNotIn("录入 Hyperliquid 代理钱包私钥", r.text)
+        self.assertIn("更新 API", r.text)            # 指向 Kraken 的正确入口
+        self.assertIn("Hyperliquid 代理钱包格式", r.text)   # 格式校验仍是 HL 口径，说清楚
+
     def test_page_says_already_set(self):
         keyform.write_key(KEY, self.env_path)
         tok, _ = keyform.issue_token(self.db)

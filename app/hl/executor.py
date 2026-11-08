@@ -924,15 +924,17 @@ class Executor:
         closedPnl 非 0，而个别交易所/桩数据会给开仓腿也带上非 0 的 closedPnl，
         所以先用 "Open" 把这条路封死。
         """
-        d = str(f["dir"] or "")
-        if "Open" in d:
+        d = str(f["dir"] or "").lower()
+        # dir 大小写不敏感：HL 原生是 "Open Long"/"Close Short"，Kraken 适配层曾输出
+        # 小写（open/close），生产库里的历史成交也一样 —— 两边都认，判据只认语义。
+        if "open" in d:
             return False
         try:
             if int(f["reduce_only"] or 0) == 1:
                 return True
         except (TypeError, ValueError, KeyError, IndexError):
             pass
-        if "Close" in d:
+        if "close" in d:
             return True
         return abs(self._num(f["closed_pnl"])) > 0.0
 
@@ -1273,7 +1275,10 @@ class Executor:
             # 没有 oid 的行不知道撤哪张。
             if c["status"] not in (ST_RESTING, ST_SENT) or not c["oid"]:
                 continue
-            oid = int(c["oid"])
+            # oid 原样传：HL 是整数单号，Kraken 是 UUID **字符串**
+            # （如 "06b9d509-965c-4788-b317-0e5ca11d56fb"）。以前这里 int() 强转，
+            # Kraken 下直接 ValueError → 残留止损撤不掉（真钱事故面）。
+            oid = c["oid"]
             try:
                 res = self.ex.cancel(coin, oid)
             except Exception as e:                                    # noqa: BLE001
@@ -1298,12 +1303,12 @@ class Executor:
         if failed:
             self._alert(f"【Kraken】⚠️ {symbol} 已在交易所被平仓（人工/外部），"
                         f"但残留的 reduce-only 止损单撤不掉：{'；'.join(failed)}。"
-                        f"该单若仍在场上，下次开仓可能被它平掉 —— 请到 HL 手动撤单并核对。",
+                        f"该单若仍在场上，下次开仓可能被它平掉 —— 请到 Kraken 手动撤单并核对。",
                         symbol=symbol)
         elif scan_failed:
             self._alert(f"【Kraken】⚠️ {symbol} 已按成交价关账，但挂单表读取失败"
                         f"（{scan_failed[:120]}），无法确认是否还残留 reduce-only 止损单 —— "
-                        f"请到 HL 看一眼挂单。", symbol=symbol)
+                        f"请到 Kraken 看一眼挂单。", symbol=symbol)
 
     # ------------------------------------------------------------ 数量对账（PR-3）
     def _tick_bucket(self) -> Optional[Dict[str, Tuple[float, float]]]:
@@ -1900,7 +1905,8 @@ class Executor:
         if res.get("ok") and res.get("status") in (STATUS_RESTING, STATUS_FILLED):
             self.db.hl_update_order(symbol, bar_ms, PURPOSE_STOP, status=res["status"],
                                     oid=res.get("oid"), error=None)
-            self.db.set_pos_hl(int(row["id"]), hl_stop_oid=res.get("oid"))
+            self.db.set_pos_hl(int(row["id"]),
+                               hl_stop_oid=res.get("oid"))
             self._event(EV_ORDER, f"{symbol} 止损丢失 → 已自动补挂 @ {px:,.2f}", symbol=symbol)
             self._alert(f"【Kraken】🔧 {coin} 止损单丢失，已自动补挂（原价 {px:,.2f}，"
                         f"新单号 {res.get('oid')}，{sz} {coin}）。自动交易已暂停（kill），"
@@ -1978,7 +1984,10 @@ class Executor:
         if self.p.live and not self.ex.available:
             # 只在 live 校验写通道：dry 期不下单、不需要私钥（否则「先跑影子不用给私钥」就不成立）
             bad.append(f"写通道不可用：{self.ex.init_error or '未配置凭据'}")
-        if plan.below_min_notional:
+        # Kraken 无最小名义金额：hl_params() 把 p.min_notional 装配为 0.0，
+        # size_order_hl 在 0 下 below_min_notional 恒 False；这里再钉一层守卫，
+        # 双保险防止将来有人把 HL 的 10 USDC 下限填回来时把合法小单误拒。
+        if plan.below_min_notional and p.min_notional > 0:
             bad.append(f"名义 {plan.notional:.1f}U 低于交易所下限 {p.min_notional:g}U")
         eq = float(equity if equity is not None else p.equity)
         total = float((snap or {}).get("notional") or 0.0)
@@ -2459,14 +2468,16 @@ class Executor:
                 for r in self.db.hl_recent_orders(100):
                     if (r["symbol"] == symbol and r["purpose"] == purpose
                             and r["status"] in (ST_RESTING, ST_SENT) and r["oid"]):
-                        self.ex.cancel(coin, int(r["oid"]))
+                        # oid 原样传（Kraken 单号是 UUID 字符串，不能 int()）
+                        self.ex.cancel(coin, r["oid"])
                         self._churn_note(coin, side)
                         self.db.hl_update_order(symbol, int(r["bar_ms"]), purpose,
                                                 status="cancelled")
                         cancelled_purposes.append(purpose)
                 continue
             if so is not None and so["oid"] and so["status"] in (ST_RESTING, ST_SENT, ST_FILLED):
-                self.ex.cancel(coin, int(so["oid"]))
+                # oid 原样传（Kraken 单号是 UUID 字符串，不能 int()）
+                self.ex.cancel(coin, so["oid"])
                 self._churn_note(coin, side)
                 self.db.hl_update_order(symbol, bar_ms, purpose, status="cancelled")
                 cancelled_purposes.append(purpose)
@@ -2507,7 +2518,8 @@ class Executor:
             # IOC 挂出未成（resting）≠ 已平仓。绝不能按限价关账 —— 交易所仓位还在，
             # 而止损单已被撤掉。处理：撤掉这张挂单、**立即挂回原止损**（保护仓位）、
             # 拉人工提醒；不关本地账，让下一轮 on_exit / 对账继续跟进。
-            self.ex.cancel(coin, int(res.get("oid") or 0))
+            # oid 原样传（Kraken 单号是 UUID 字符串，不能 int()）
+            self.ex.cancel(coin, res.get("oid") or 0)
             self._churn_note(coin, side)
             self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FAILED,
                                     error="平仓 IOC 未成交（已撤单并挂回止损）")
@@ -2894,16 +2906,29 @@ class Executor:
                 continue
             coin = str(f.get("coin") or "")
             direction = str(f.get("dir") or "")
+            # 成交方向判定大小写不敏感（"Open Long" / "open long" / "Close Short"…）。
+            # 兼容 A 组 Kraken 适配层的新大写输出与生产库里的历史小写行。
+            d_low = direction.lower()
             fee = self._num(f.get("fee"))
             fee_token = f.get("feeToken")
             fee_quote = self._fee_quote(fee, fee_token)
+            # reduce_only 优先用成交自带字段（KrInfo 按成交序列算，反手成交也准），
+            # 没有才回退到 dir 语义判断。
+            ro_raw = f.get("reduce_only")
+            if ro_raw is None:
+                reduce_only = 1 if "close" in d_low else 0
+            else:
+                try:
+                    reduce_only = int(ro_raw)
+                except (TypeError, ValueError):
+                    reduce_only = 1 if "close" in d_low else 0
             self.db.hl_upsert_fill(
                 tid=tid, symbol=reverse.get(coin, f"{coin}_USDT"), coin=coin,
-                side=1 if "Long" in direction else -1, sz=self._num(f.get("sz")),
+                side=1 if "long" in d_low else -1, sz=self._num(f.get("sz")),
                 px=self._num(f.get("px")), fee=fee,
                 fee_token=fee_token, fee_quote=fee_quote, dir=direction,
                 closed_pnl=self._num(f.get("closedPnl")), hash=f.get("hash"),
-                reduce_only=("Close" in direction),
+                reduce_only=reduce_only,
                 # oid 是「哪张单打出的这笔成交」：对账要靠它把平仓成交归到本仓的止损单
                 # （见 _fill_close_proof）。交易所没给就存 NULL —— 不猜。
                 oid=f.get("oid"),
@@ -3426,7 +3451,8 @@ class Executor:
         mine = [f for f in fills if f.get("coin") == coin]
         if not mine:
             return None, []
-        closing = [f for f in mine if "Close" in str(f.get("dir") or "")]
+        # dir 大小写不敏感（HL "Close Long" / 适配层 "close long" 都要认）
+        closing = [f for f in mine if "close" in str(f.get("dir") or "").lower()]
         if not closing:                  # 没有平仓腿 → 不给价（见 docstring）
             return None, mine[:8]
         px = None
@@ -3594,8 +3620,8 @@ class Executor:
             # 「活着但读不到账户」会被误报成「执行器死了」。
             self._event(EV_HEARTBEAT, "executor 心跳（读不到账户快照，已降级）",
                         data={"kill": self.db.hl_kill(), "mode": self.p.mode, "degraded": True})
-            alerts.append("【Kraken】⚠️ 读不到 HL 账户快照（已连续重试），本轮跳过对账/熔断/成交同步。"
-                          "若持续出现请检查网络或 HL 状态。")
+            alerts.append("【Kraken】⚠️ 读不到 Kraken 账户快照（已连续重试），本轮跳过对账/熔断/成交同步。"
+                          "若持续出现请检查网络或 Kraken 状态。")
             return alerts
 
         # 1) 同步成交到本地（面板的「最近成交/手续费累计/今日与累计已实现」全靠 hl_fills；

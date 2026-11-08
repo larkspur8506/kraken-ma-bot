@@ -115,6 +115,9 @@ CREATE TABLE IF NOT EXISTS hl_orders (
     px REAL,
     reduce_only INTEGER DEFAULT 0,
     status TEXT NOT NULL,              -- intent|planned|sent|resting|filled|cancelled|failed|skipped
+    -- oid：交易所订单号。声明成 INTEGER 是历史遗留（HL 用整数单号），**但不重建表**：
+    -- SQLite 动态类型，Kraken 的 UUID 字符串（"06b9d509-…"）照样能存进来。
+    -- 读写两侧一律当**不透明字符串**处理，禁止 int() 强转（见 Executor 撤单路径）。
     oid INTEGER,
     cloid TEXT,
     filled_sz REAL,
@@ -136,6 +139,9 @@ CREATE TABLE IF NOT EXISTS hl_fills (
     -- oid：产生这笔成交的交易所订单号。对账要判「这笔平仓成交是不是本仓的止损单
     -- 打出来的」（见 Executor._fill_close_proof），只靠 tid/价格无从判断；老库由
     -- _migrate 补列，老行留 NULL（NULL 一律按「不知道是哪张单」处理，fail-closed）。
+    -- 同样声明为 INTEGER 只是历史遗留：Kraken 的订单号是 UUID 字符串（如
+    -- "06b9d509-965c-4788-b317-0e5ca11d56fb"），SQLite 动态类型可存；
+    -- 消费侧一律 str() 比较，绝不 int()。
     oid INTEGER,
     ts INTEGER, created_at REAL NOT NULL
 );
@@ -276,6 +282,8 @@ class DB:
                               "WHERE status='closed' AND exit_reason IN ('stop','ma20')")
             logger.info("[db] 迁移：positions 新增 auto_closed 列")
         # HL 执行器列（feat/hl-executor）：执行器模式下由执行器写，人工确认流不参与
+        # hl_entry_oid / hl_stop_oid 声明 INTEGER 是历史遗留：Kraken 单号是 UUID 字符串
+        # （SQLite 动态类型能存），消费侧只做 str() 比较，不做 int() 强转。
         for name, ddl in (("hl_status", "ALTER TABLE positions ADD COLUMN hl_status TEXT"),
                           ("hl_entry_oid", "ALTER TABLE positions ADD COLUMN hl_entry_oid INTEGER"),
                           ("hl_stop_oid", "ALTER TABLE positions ADD COLUMN hl_stop_oid INTEGER"),
@@ -781,6 +789,7 @@ class DB:
         （U）后的金额 —— 只有 fee_token 属于计价币时才等于 fee，其余留 None 由调用方
         决定怎么标注（见 Executor._sync_fills）。列顺序与 CREATE TABLE 一致。
         ``oid`` 是产生这笔成交的订单号（对账判「哪张单平的仓」用），老数据可能为 None。
+        **oid 按原值落库、不做类型转换**：HL 是整数，Kraken 是 UUID 字符串，两者都合法。
         """
         self.conn.execute(
             "INSERT OR IGNORE INTO hl_fills(tid, symbol, coin, side, sz, px, fee, fee_token,"

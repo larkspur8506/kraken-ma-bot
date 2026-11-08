@@ -69,6 +69,10 @@ class TestSnapshot(unittest.TestCase):
         ep = _StubEp(account=ACC, positions=[{
             "symbol": "PF_XBTUSD", "side": "long", "size": 0.01,
             "price": 74000.0, "unrealizedPnl": 10.0, "unrealizedFunding": -0.5}],
+            instruments=[{"symbol": "PF_XBTUSD", "tickSize": 1,
+                          "contractValueTradePrecision": 4,
+                          "marginLevels": [{"numNonContractUnits": 0.0, "initialMargin": 0.01},
+                                           {"numNonContractUnits": 1e6, "initialMargin": 0.02}]}],
             tickers=[{"symbol": "PF_XBTUSD", "markPrice": 75000.0}])
         snap = _mk(ep).snapshot("kr")
         # P0 回归：equity 必须来自 accounts.flex.portfolioValue
@@ -87,6 +91,11 @@ class TestSnapshot(unittest.TestCase):
         self.assertFalse(p["isolated"])
         self.assertAlmostEqual(p["unrealized_pnl"], 10.0)
         self.assertAlmostEqual(p["funding_since_open"], -0.5)
+        # P1-4 回归：保证金 = 名义 × 真实 IM(1%)，不是 value/5；全仓无逐仓杠杆 → None
+        self.assertAlmostEqual(p["margin_used"], 750.0 * 0.01)
+        self.assertAlmostEqual(p["initial_margin"], 0.01)
+        self.assertIsNone(p["leverage"])
+        self.assertAlmostEqual(p["roe"], 10.0 / 7.5)
 
     def test_short_position_maps_negative_szi(self):
         ep = _StubEp(account=ACC, positions=[{
@@ -142,16 +151,48 @@ class TestFills(unittest.TestCase):
         ]
         out = _mk(_StubEp(fills=fills)).user_fills("kr")
         self.assertEqual(len(out), 2)
-        self.assertEqual(out[0]["dir"], "open long")
+        # 跨组契约：dir 必须是 HL 原生大小写（executor 判 "Long"/"Close"、面板 _FILL_BS 精确键）
+        self.assertEqual(out[0]["dir"], "Open Long")
         self.assertEqual(out[0]["reduce_only"], 0)
-        self.assertEqual(out[1]["dir"], "close long")
+        self.assertEqual(out[1]["dir"], "Close Long")
         self.assertEqual(out[1]["reduce_only"], 1)
         self.assertAlmostEqual(out[1]["closedPnl"], 10.0)     # 交易所真值
         self.assertEqual(out[1]["closedPnl_src"], "exchange")
         self.assertEqual(out[0]["oid"], "o1")
         self.assertAlmostEqual(out[0]["fee"], 74000 * 0.01 * 0.000275)  # 估算口径（Kraken 6 级 taker 2.75bp）
+        # P0-3：fee 已是 USD 金额，feeToken 必须给 USD，否则 executor 记成「未知币种」
+        self.assertEqual(out[0]["feeToken"], "USD")
+        self.assertAlmostEqual(out[1]["fee"], 75000 * 0.01 * 0.000275)
+        self.assertEqual(out[1]["feeToken"], "USD")
         # ISO 时间必须解析（旧代码 0 → 按时段过滤永远为空）
         self.assertGreater(out[0]["time"], 1_700_000_000_000)
+
+    def test_open_short_then_close_short(self):
+        fills = [
+            {"fill_id": "s1", "symbol": "PF_ETHUSD", "side": "sell", "size": 1.0,
+             "price": 2000.0, "fillTime": "2026-11-01T00:00:00Z"},
+            {"fill_id": "s2", "symbol": "PF_ETHUSD", "side": "buy", "size": 1.0,
+             "price": 1900.0, "fillTime": "2026-11-01T04:00:00Z", "realized_pnl": 100.0},
+        ]
+        out = _mk(_StubEp(fills=fills)).user_fills("kr")
+        self.assertEqual(out[0]["dir"], "Open Short")
+        self.assertEqual(out[0]["reduce_only"], 0)
+        self.assertEqual(out[1]["dir"], "Close Short")
+        self.assertEqual(out[1]["reduce_only"], 1)
+        self.assertEqual(out[1]["feeToken"], "USD")
+
+    def test_partial_reduce_keeps_open_dir_case(self):
+        """部分平仓（仓位没归零）也必须是平仓腿语义，不能被当成开仓。"""
+        fills = [
+            {"fill_id": "p1", "symbol": "PF_XBTUSD", "side": "buy", "size": 0.02,
+             "price": 70000.0, "fillTime": "2026-11-01T00:00:00Z"},
+            {"fill_id": "p2", "symbol": "PF_XBTUSD", "side": "sell", "size": 0.01,
+             "price": 71000.0, "fillTime": "2026-11-01T04:00:00Z"},
+        ]
+        out = _mk(_StubEp(fills=fills)).user_fills("kr")
+        self.assertEqual(out[1]["dir"], "Close Long")
+        self.assertEqual(out[1]["reduce_only"], 1)
+        self.assertTrue("Long" in out[1]["dir"] and "Close" in out[1]["dir"])
 
     def test_flip(self):
         fills = [
@@ -161,9 +202,21 @@ class TestFills(unittest.TestCase):
              "price": 2100.0, "fillTime": "2026-11-01T04:00:00Z"},
         ]
         out = _mk(_StubEp(fills=fills)).user_fills("kr")
-        self.assertEqual(out[1]["dir"], "long > short")
+        # 反手成交按被平掉的旧仓方向给平仓腿（不能输出 "long > short" 这种描述串）
+        self.assertEqual(out[1]["dir"], "Close Long")
         self.assertEqual(out[1]["reduce_only"], 1)
         self.assertAlmostEqual(out[1]["closedPnl"], 100.0)    # 平掉 1 ETH @2100 vs 2000
+
+    def test_short_flip(self):
+        fills = [
+            {"fill_id": "g1", "symbol": "PF_ETHUSD", "side": "sell", "size": 1.0,
+             "price": 2000.0, "fillTime": "2026-11-01T00:00:00Z"},
+            {"fill_id": "g2", "symbol": "PF_ETHUSD", "side": "buy", "size": 3.0,
+             "price": 1900.0, "fillTime": "2026-11-01T04:00:00Z"},
+        ]
+        out = _mk(_StubEp(fills=fills)).user_fills("kr")
+        self.assertEqual(out[1]["dir"], "Close Short")
+        self.assertEqual(out[1]["reduce_only"], 1)
 
     def test_history_page_uses_derived_pnl(self):
         """历史页 realized_pnl 为 null → 用推演值并标记 derived。"""
@@ -204,6 +257,69 @@ class TestSpecs(unittest.TestCase):
         self.assertAlmostEqual(specs["BTC"]["price_tick"], 1.0)
         self.assertEqual(specs["QQQ"]["sz_decimals"], 3)
         self.assertIn("maxLeverage", specs["BTC"])
+        # 无 marginLevels → 兜底 IM 10%（保守），不是旧代码写死的 5x
+        self.assertAlmostEqual(specs["BTC"]["initial_margin"], 0.10)
+        self.assertEqual(specs["BTC"]["maxLeverage"], 10)
+
+    def test_initial_margin_from_instruments(self):
+        """P1-4：max_leverage 必须来自 /instruments 的 IM（BTC 1%≈100x、QQQX 5%=20x）。"""
+        ep = _StubEp(instruments=[
+            {"symbol": "PF_XBTUSD", "tickSize": 1, "contractValueTradePrecision": 4,
+             "marginLevels": [{"numNonContractUnits": 0.0, "initialMargin": 0.01,
+                               "maintenanceMargin": 0.005},
+                              {"numNonContractUnits": 1e6, "initialMargin": 0.02}]},
+            {"symbol": "PF_QQQXUSD", "tickSize": 0.1, "contractValueTradePrecision": 3,
+             "retailMarginLevels": [{"numNonContractUnits": 0.0, "initialMargin": 0.05},
+                                    {"numNonContractUnits": 25000, "initialMargin": 0.1}]},
+        ])
+        specs = _mk(ep).specs()
+        self.assertAlmostEqual(specs["BTC"]["initial_margin"], 0.01)
+        self.assertEqual(specs["BTC"]["max_leverage"], 100)
+        self.assertEqual(specs["BTC"]["maxLeverage"], 100)     # MR 腿 perp_meta_dex 读它
+        self.assertAlmostEqual(specs["QQQ"]["initial_margin"], 0.05)
+        self.assertEqual(specs["QQQ"]["maxLeverage"], 20)
+
+    def test_explicit_max_leverage_override_wins(self):
+        ep = _StubEp(instruments=[
+            {"symbol": "PF_XBTUSD", "tickSize": 1, "contractValueTradePrecision": 4,
+             "marginLevels": [{"initialMargin": 0.01}]}])
+        info = KrInfo(endpoints=ep, max_leverage={"BTC": 5})
+        self.assertEqual(info.specs()["BTC"]["maxLeverage"], 5)
+
+    def test_perp_meta_dex_exposes_real_max_leverage(self):
+        ep = _StubEp(instruments=[
+            {"symbol": "PF_XBTUSD", "tickSize": 1, "contractValueTradePrecision": 4,
+             "marginLevels": [{"initialMargin": 0.01}]}])
+        meta = _mk(ep).perp_meta_dex("kr")
+        self.assertEqual(meta[0]["name"], "BTC")
+        self.assertEqual(meta[0]["maxLeverage"], 100)
+
+    def test_position_margin_uses_real_im(self):
+        """保证金 = 名义 × 真实 IM，ROE = upnl / 真实保证金，leverage 全仓给 None。"""
+        ep = _StubEp(account=ACC, positions=[{
+            "symbol": "PF_QQQXUSD", "side": "long", "size": 100.0,
+            "price": 600.0, "unrealizedPnl": 40.0}],
+            instruments=[{"symbol": "PF_QQQXUSD", "tickSize": 0.1,
+                          "contractValueTradePrecision": 3,
+                          "marginLevels": [{"initialMargin": 0.05},
+                                           {"initialMargin": 0.1}]}],
+            tickers=[{"symbol": "PF_QQQXUSD", "markPrice": 600.0}])
+        p = _mk(ep).snapshot("kr")["positions"][0]
+        self.assertAlmostEqual(p["position_value"], 60000.0)
+        self.assertAlmostEqual(p["margin_used"], 3000.0)       # 60000 × 5%（不是 /5 = 12000）
+        self.assertAlmostEqual(p["roe"], 40.0 / 3000.0)
+        self.assertIsNone(p["leverage"])
+        self.assertFalse(p["isolated"])
+
+    def test_position_margin_fallback_without_instruments(self):
+        """读不到 /instruments 时按 10% 保守兜底（不能除零、不能算成 0 占用）。"""
+        ep = _StubEp(account=ACC, positions=[{
+            "symbol": "PF_XBTUSD", "side": "long", "size": 0.01,
+            "price": 74000.0, "unrealizedPnl": 10.0}],
+            tickers=[{"symbol": "PF_XBTUSD", "markPrice": 75000.0}])
+        p = _mk(ep).snapshot("kr")["positions"][0]
+        self.assertAlmostEqual(p["margin_used"], 750.0 * 0.10)
+        self.assertIsNone(p["leverage"])
 
     def test_unknown_symbol_ignored(self):
         ep = _StubEp(instruments=[{"symbol": "PF_LTCUSD", "tickSize": 0.1}])

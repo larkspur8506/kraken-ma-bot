@@ -48,7 +48,7 @@ from app.db import DB
 from app.hl import dd as hl_dd
 from app.hl import funding as hl_funding
 from app.hl.pnl import QUOTE_FEE_TOKENS   # M3：费用未折算/老数据缺手续费的判据同源
-from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
+from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _fill_bs,
                         _ST_TXT, _agent_badge_html, _disp, _disp_text, _fee_quoted,
                         _fmt_sz, _kv, _render_body, _stuck_badge_html, normalize_span,
                         _signals_html, normalize_rows, status_payload)
@@ -715,7 +715,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
         cp = _opt_num(r.get("closed_pnl"))
         cp_cls = "pos" if (cp or 0) > 0 else ("neg" if (cp or 0) < 0 else "")
         d = str(r.get("dir") or "")
-        bs = _FILL_BS.get(d, "—")
+        bs = _fill_bs(d)
         # 手续费走 views._fee_quoted（fee_quote 优先、NULL 回退 fee）：与总览的
         # 「净手续费」和净利计算同口径，否则同一笔成交在两处显示不同的数字。
         fee_txt = _fmt(_fee_quoted({"fee": r.get("fee"), "fee_quote": r.get("fee_quote")}), 4)
@@ -772,7 +772,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
         _kind = str(r.get("kind") or "—")
         rows += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
                  f"<td>{_esc(_ALERT_KIND_TXT.get(_kind, _kind))}</td>"
-                 # 标的列与消息正文都走 HL 侧显示名（记录页不得出现内部合约名，2026-11-07）；
+                 # 标的列与消息正文都走交易所侧显示名（记录页不得出现内部合约名，2026-11-07）；
                  # DB 原值不动，只在渲染层换。
                  f"<td>{_esc(_disp(r.get('symbol')) or _coin('', r.get('symbol')) or '—')}</td>"
                  f"<td><span class='{'pos' if ok else 'neg'}'>"
@@ -821,7 +821,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
 
 
 def _coin(coin: Any, symbol: Any) -> str:
-    """优先显示 HL 侧币种名（BTC），否则从 MEXC 合约名（BTC_USDT）截出来。"""
+    """优先显示交易所侧币种名（BTC），否则从内部合约名（XBT_USD / BTC_USDT）截出来。"""
     c = str(coin or "").strip()
     if c:
         return c
@@ -965,7 +965,7 @@ def _subpage_parse(deps: AdminDeps, slug: str, params: Any) -> Dict[str, Any]:
             except ValueError:
                 raw.pop(key)
         elif callable(kind):
-            # 展示名 ↔ 内部键（2026-11-07）：下拉 option 的 value 用 HL 显示名
+            # 展示名 ↔ 内部键（2026-11-07）：下拉 option 的 value 用交易所显示名
             # （页面 HTML 不得出现内部合约名），取数前映射回内部键；
             # 旧链接 / 手输内部键也照认（映射不到就原样透传，行为同以前），
             # 且回显统一改写成显示名，下拉的选中态才对得上。
@@ -1027,7 +1027,7 @@ def _subpage_rows_html(slug: str, rows: List[Dict[str, Any]],
         for r in rows:
             cp = _opt_num(r.get("closed_pnl"))
             cp_cls = "pos" if (cp or 0) > 0 else ("neg" if (cp or 0) < 0 else "")
-            bs = _FILL_BS.get(str(r.get("dir") or ""), "—")
+            bs = _fill_bs(r.get("dir"))
             fee_txt = _fmt(_fee_quoted({"fee": r.get("fee"), "fee_quote": r.get("fee_quote")}), 4)
             out += (f"<tr><td class='num'>{_ts(r.get('ts') or r.get('created_at'))}</td>"
                     f"<td>{_esc(r.get('coin') or _coin('', r.get('symbol')))}</td>"
@@ -1544,7 +1544,7 @@ def _agent_source_txt(src: str) -> str:
 def render_agent_card(deps: AdminDeps) -> str:
     """「API 有效期」状态卡（总览末尾）：地址（截断）/到期日/剩余天数/状态词/自动清仓开关。
 
-    数据只来自 ``hl_agent_state``（DB 缓存）—— 渲染**零网络调用**，面板在 HL 接口
+    数据只来自 ``hl_agent_state``（DB 缓存）—— 渲染**零网络调用**，面板在交易所接口
     全挂时也能打开。state 缺失/损坏时显示「未知」并给出「下一个整点会刷新」的说明。
 
     **只渲染状态，不渲染写操作**：「更新 API（续期）」表单在「参数」页，见
@@ -1648,7 +1648,7 @@ def render_agent_card(deps: AdminDeps) -> str:
         o.append("<div class='hint'>API 状态：还没读到授信信息（系统每个整点检查一次）。"
                  "Kraken API key 在「更新 API」卡维护，无到期概念。</div>")
     elif src == "manual":
-        o.append("<div class='hint'>有效期来自 DB 里的手工兜底值（HL 授权接口没查到同名 Hermes）；"
+        o.append("<div class='hint'>有效期来自 DB 里的手工兜底值（交易所侧授权接口没查到同名 Hermes）；"
                  "可在总览「管理」卡里清除。</div>")
     o.append("<div class='legend'>到期后执行器不能再开仓、平仓、撤单；到期前系统会按剩余天数提醒"
              f"（≤{agent_mod.THRESH_CLEANUP} 天且有仓位时自动清仓；agent_expiry_cleanup 沿用 DB 里的 "

@@ -1,5 +1,10 @@
 """一次性私钥录入页（给「不方便用 SSH」的场景兜底，例如手机）。
 
+**遗留说明（Kraken 版）**：Kraken 的 API key/secret 由面板「更新 API」（`_kr_renew`）
+写进 DB（kr_api_key / kr_api_secret），**不用**本页；本页只写 env 文件里的
+HL_PRIVATE_KEY，格式校验也仍是 Hyperliquid 的 0x+64hex。保留它只为兼容历史部署
+（HL 时代用代理钱包私钥签名），Kraken 下打开只会看到「格式不对」，属预期。
+
 为什么要这个：私钥不该贴在聊天里，也不该让我（agent）经手；但手机在蜂窝网络下
 连不上 oracle1:22 是常事。于是让用户在**手机浏览器**里粘贴提交 —— 走 HTTPS 直达服务器。
 
@@ -196,12 +201,14 @@ def render_form(deps: KeyFormDeps, token: str = "", message: str = "", ok: bool 
                 "<div class='muted'>令牌是一次性的、默认 15 分钟有效。请让 Hermes 重新签发一个。</div></div>")
     else:
         mins = st["expires_in_s"] // 60
-        body = (msg + "<div class='card'><h1>录入 Hyperliquid 代理钱包私钥</h1>"
+        body = (msg + "<div class='card'><h1>录入交易所 API 私钥（遗留页）</h1>"
                 f"<div class='muted'>令牌有效：约 {mins} 分钟 · 提交一次即作废 · 私钥只写入服务器上的 env 文件，"
                 "不进数据库、不进日志</div>"
+                "<div class='muted'>Kraken 版请用面板「更新 API」（key / secret 写 DB）；"
+                "本页只接受历史 Hyperliquid 代理钱包格式 0x + 64 位 hex。</div>"
                 "<form method='post' autocomplete='off'>"
                 f"<input type='hidden' name='t' value='{_html_escape(str(token), quote=True)}'>"
-                "<label>代理钱包（API wallet）私钥</label>"
+                "<label>API 私钥（遗留：Hyperliquid 代理钱包 0x + 64 位 hex）</label>"
                 "<input type='password' name='key' autocomplete='off' spellcheck='false' "
                 "placeholder='0x…（64 位 hex）' required>"
                 "<button type='submit'>提交</button></form></div>"
