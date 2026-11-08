@@ -239,6 +239,23 @@ def kr_api_key() -> str:
     return db_key or _env("KRAKEN_API_KEY")
 
 
+def kr_secret() -> str:
+    """Kraken API secret（base64）：env KRAKEN_API_SECRET → DB kr_api_secret →
+    兼容回落 hl_private_key()（迁移期同一个 DB 键，PR-3 决定不改名）。
+
+    与 hl_private_key 同级纪律：明文只进 KrClient 构造，不进日志/响应/事件。
+    """
+    env_s = _env("KRAKEN_API_SECRET")
+    if env_s:
+        return env_s
+    try:
+        db_s = str(db.get_config_str("kr_api_secret", "") or "").strip()
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("读 DB kr secret 失败（回落）：%s", type(e).__name__)
+        db_s = ""
+    return db_s or hl_private_key()
+
+
 def get_hl_info():
     """只读客户端（面板/看护/执行器共用）。
 
@@ -251,7 +268,7 @@ def get_hl_info():
     global _hl_info
     if _hl_info is None:
         from app.kr.info import KrInfo
-        _hl_info = KrInfo(api_key=kr_api_key(), secret_b64=hl_private_key(),
+        _hl_info = KrInfo(api_key=kr_api_key(), secret_b64=kr_secret(),
                           base_url=hl_info_base())
     return _hl_info
 
@@ -394,7 +411,7 @@ def build_executor():
         from app.kr.exchange import KrExchange
         from app.hl.executor import Executor
         info = get_hl_info()
-        ex = KrExchange(api_key=kr_api_key(), secret_b64=p.private_key,
+        ex = KrExchange(api_key=kr_api_key(), secret_b64=kr_secret(),
                         base_url=p.base_url, dry_run=(p.mode == "dry"),
                         max_slippage_pct=p.max_slippage_pct, info=info)
         return Executor(db, p, info, ex, notifier=notifier)
@@ -578,7 +595,7 @@ def _build_mr_leg() -> Optional[Any]:
         from app.kr.exchange import KrExchange
         from app.hl.mr import HlMrConfig, HlMrLeg
         info = get_hl_info()
-        ex = KrExchange(api_key=kr_api_key(), secret_b64=p.private_key,
+        ex = KrExchange(api_key=kr_api_key(), secret_b64=kr_secret(),
                         base_url=p.base_url, dry_run=(p.mode == "dry"),
                         max_slippage_pct=p.max_slippage_pct, info=info)
         # Kraken 侧无 dex 限定名：coin 直接用 display coin「QQQ」（registry/specs/
@@ -896,14 +913,17 @@ def _admin_deps():
         mode_fn=hl_mode,
         token_fn=lambda: config.admin_token,
         address_fn=lambda: hl_params().account_address,
-        private_key_fn=lambda: hl_params().private_key,
+        private_key_fn=lambda: kr_secret(),
         mids_fn=pinfo.all_mids,                        # 与 snapshot 里的现价共用同一份快照
         # 写路径（参数/模式/开关/kill）成功后失效面板缓存
         set_config=_panel_write(getattr(db, "set_config", None)),
         hl_set_kill=_panel_write(getattr(db, "hl_set_kill", None)),
-        # 到期检查 + 面板「更新 API」：都走 app.hl.agent（面板卡片只读 state，零网络）
+        # 到期检查（agent_state_fn）固定 ok：Kraken key 无有效期；
+        # 「更新 API」写 kr_api_key/kr_api_secret（_kr_renew），HL agent 体系退役
         agent_state_fn=lambda: _agent_state(),
-        renew_fn=lambda key: _renew_agent_key(key),
+        # Kraken 版「更新 API」：写 kr_api_key/kr_api_secret（_kr_renew）；
+        # HL 的 agent renew_key 与到期检查整体退役（到期检查固定 ok）
+        renew_fn=lambda k, s: _kr_renew(k, s),
         cleanup_enabled_fn=lambda: _cleanup_on(),
         # /why 诊断（只读）：阶段 B 起优先读快照里的六步结论，缺失才现取
         why_rows_fn=lambda: _why_rows(),
@@ -942,9 +962,9 @@ def _why_rows(live: bool = False) -> list:
 
 
 def _agent_state() -> dict:
-    """面板用：读 ``hl_agent_state`` 缓存（**不**现调 HL API）。"""
-    from app.hl import agent as agent_mod
-    return agent_mod.read_state(db)
+    """面板用：Kraken key 无有效期、无代理钱包授权体系——固定返回该形状，
+    不再读 ``hl_agent_state``（那是 HL agent 授权体系的缓存，Kraken 版无人写入）。"""
+    return {"level": "ok", "source": "kraken-key-no-expiry", "days_left": None}
 
 
 def _cleanup_on() -> bool:
@@ -952,17 +972,33 @@ def _cleanup_on() -> bool:
     return agent_mod.cleanup_switch(db, current_config())
 
 
-def _renew_agent_key(new_key: str) -> tuple:
-    """面板「更新 API」：校验 + 写 DB + 刷新 state + 推送。返回 (ok, 文案)。"""
-    from app.hl import agent as agent_mod
-    cfg = current_config()
-    return agent_mod.renew_key(
-        db, cfg, notifier, get_hl_info(), new_key,
-        address=_env("HL_ACCOUNT_ADDRESS"),
-        current_key=hl_private_key(),
-        prefix=cfg.alert_prefix,
-        log_event=lambda kind, msg, **kw: db.hl_log_event(kind, msg),
-    )
+def _kr_renew(api_key: str, api_secret: str) -> tuple:
+    """面板「更新 API」（Kraken 版）：格式校验 + 写 DB + 失效只读客户端缓存。
+
+    真实有效性不在这里验（Kraken 无「预演签名」端点）：签错 = 下一轮全部私有
+    读数报错、执行器 fail-closed 停手——不会错单，面板会把错误如实显示。
+    返回 (ok, 人话文案)；响应/日志不含凭据任何片段。
+    """
+    key = str(api_key or "").strip()
+    sec = str(api_secret or "").strip()
+    if not key or not sec:
+        return False, "两个输入框都要填：API Key 和 API Secret（Kraken 网页上分开的两条）"
+    if "\n" in key or "\n" in sec or "\r" in key or "\r" in sec:
+        return False, "凭据中间含换行——请分别只粘贴那一串，一次一条"
+    import base64 as _b64
+    try:
+        _b64.b64decode(sec, validate=True)
+    except Exception:                                             # noqa: BLE001
+        return False, "API Secret 不是合法 base64——Kraken 网页上那串要原样完整复制"
+    db.set_config("kr_api_key", key)
+    db.set_config("kr_api_secret", sec)
+    global _hl_info
+    _hl_info = None                     # 只读客户端带凭据，必须重建
+    try:
+        db.hl_log_event("agent_renew", "Kraken API 凭据已更新（面板保存）")
+    except Exception:                                             # noqa: BLE001
+        pass
+    return True, "Kraken API 凭据已保存，下一轮生效"
 
 
 def _mount_admin_ui() -> None:
