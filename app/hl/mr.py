@@ -53,7 +53,10 @@ MR_EVENT_KIND = "mr_admin"
 _ENTRY_INTENT_KIND = "mr_entry_intent"
 _EXIT_INTENT_KIND = "mr_exit_intent"
 #: taker 费率（HIP-3 xyz 实测 0.09%/边）——净盈亏的估算项。
-TAKER_FEE_RATE = 0.0009
+#: 单边 taker 费率，用于 fee_est（每次开/平各算一次名义 × 该值）。
+#: 旧值 0.0009 是 HL 的往返口径（4.5bp/边 × 2）且被当成单边用了 → 双倍高估。
+#: Kraken 6 级 taker 2.75bp；掉回 Tier 1 是 5bp。真实运行时以 HlMrConfig.taker_fee_rate 为准。
+TAKER_FEE_RATE = 0.000275
 
 
 @dataclass(frozen=True)
@@ -63,10 +66,12 @@ class HlMrConfig:
     #: HIP-3 的 coin 全程用 **dex 限定名**：meta?dex=xyz 返回 `xyz:XYZ100`、
     #  candleSnapshot/ordering 同名（裸名 candleSnapshot 直接 500，2026-11-01 部署
     #  冒烟实测）。allMids 无此键 → _mark 自动走 K 线收盘回退，无需处理。
+    # 默认值保持 HL 形状（测试/回放用）；运行期由 main._build_mr_leg 显式传
+    # coin="QQQ" / dex="kr"（Kraken 的 PF_QQQXUSD）。
     coin: str = "xyz:XYZ100"
     dex: str = "xyz"
     exposure: float = 0.5               # 名义 = 权益 × 0.5
-    min_notional: float = 10.0
+    min_notional: float = 10.0          # 仅作小单提醒（Kraken 最小 1 张合约，约 $7.6~$660 视标的）
     slippage_bps: int = 15              # IOC 限价的保护带宽（单边）
     candle_hours: int = 500             # 1h×500 ≈ 21 天会话
     #: funding 基线（%名义/小时）。实测 2026-01-22~11-01 中位 0.0004%/h（3.5%/年）。
@@ -94,6 +99,9 @@ class HlMrConfig:
     #: （`resting`/`dry`/部分成交都不算成交；2026-11-02 复核 P1）。
     fill_confirm_s: float = 12.0
     fill_poll_s: float = 1.0
+    #: 单边 taker 费率（fee_est 用）。**加在末尾**：dataclass 位置参数构造不能错位。
+    #: Kraken 6 级 2.75bp；改账号档位时同步 KR_TAKER_FEE。
+    taker_fee_rate: float = TAKER_FEE_RATE
 
 
 def _round_px(px: float, sz_decimals: int) -> float:
@@ -381,7 +389,7 @@ class HlMrLeg:
         qty = float(open_row["qty"] or 0.0)
         entry_price = float(open_row["entry_price"] or 0.0)
         notional = float(open_row["notional"] or 0.0)
-        fee_est = TAKER_FEE_RATE * (notional + qty * mark)
+        fee_est = float(getattr(self.config, "taker_fee_rate", TAKER_FEE_RATE)) * (notional + qty * mark)
         net_pnl = (mark - entry_price) * qty - fee_est
         self.db.mr_close_trade(
             int(open_row["id"]), exit_price=mark, exit_order_id="",
@@ -852,7 +860,7 @@ class HlMrLeg:
                                * float(p.get("price") or 0.0) for p in partials)
         partial_pnl = sum((float(p.get("price") or 0.0) - entry_price)
                           * float(p.get("qty") or 0.0) for p in partials)
-        fee_est = TAKER_FEE_RATE * (notional + sz * exit_px + partial_notional)
+        fee_est = float(getattr(self.config, "taker_fee_rate", TAKER_FEE_RATE)) * (notional + sz * exit_px + partial_notional)
         funding_pct = (funding_paid / notional * 100.0 if notional > 0 else None)
         net_pnl = ((exit_px - entry_price) * sz - funding_paid - fee_est + partial_pnl)
         self.db.mr_close_trade(

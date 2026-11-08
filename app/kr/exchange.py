@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Kraken flex 永续无逐仓/无杠杆设置：这里只给「杠杆安全上限」闸门用
 # （executor 拿 maxLeverage 判断 plan.leverage 是否越界）。实际保证金是全仓口径。
-DEFAULT_MAX_LEVERAGE = {"BTC": 50, "ETH": 50, "SOL": 50, "QQQ": 10}
+DEFAULT_MAX_LEVERAGE = {"BTC": 100, "ETH": 100, "SOL": 100, "QQQ": 20}
 
 _IOC_ORDER = "ioc"
 _STOP_ORDER = "stp"

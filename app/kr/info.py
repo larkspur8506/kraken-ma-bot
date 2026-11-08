@@ -30,7 +30,11 @@ logger = logging.getLogger(__name__)
 
 # taker 费率兜底（fee 字段缺失时的估算口径；实测 schedule 见
 # docs/KRAKEN_MIGRATION_PLAN.md —— crypto/股票永续 Tier1 taker 0.05%）。
-DEFAULT_TAKER_FEE = 0.0005
+# Kraken Futures 手续费（**不是 HL 的 5bp**）。用户当前 6 级：taker 0.0275% / maker 0.0075%；
+# 长期掉回 Tier 1 时 taker 0.05%。这里取 6 级 taker 作默认（真实费率目前无法从 API 读取：
+# /fills 不带 fee 字段），要改就改 KR_TAKER_FEE / KR_MAKER_FEE，别在代码里硬编码第二次。
+DEFAULT_TAKER_FEE = 0.000275
+DEFAULT_MAKER_FEE = 0.000075
 
 
 class KrInfoError(KrAuthError, _HlInfoError):
@@ -138,7 +142,9 @@ class KrInfo:
 
     def __init__(self, api_key: str = "", secret_b64: str = "", base_url: str = "",
                  timeout: float = 15.0, endpoints: Any = None,
-                 max_leverage: Optional[Dict[str, int]] = None):
+                 max_leverage: Optional[Dict[str, int]] = None,
+                 taker_fee: Optional[float] = None,
+                 maker_fee: Optional[float] = None):
         if endpoints is not None:
             self._ep = endpoints
         else:
@@ -147,6 +153,10 @@ class KrInfo:
                 api_key=api_key, secret_b64=secret_b64,
                 base_url=base_url or DEFAULT_BASE, timeout=timeout))
         self._max_lev = dict(DEFAULT_MAX_LEVERAGE_OVERRIDE or max_leverage or {})
+        #: 计费口径（用于 fills 的 fee 字段与面板「净手续费」）。Kraken 的 /fills 不带
+        #: fee，拿不到真实值，只能按账号费率档配置；默认 6 级 taker 2.75bp。
+        self._taker_fee = float(taker_fee if taker_fee is not None else DEFAULT_TAKER_FEE)
+        self._maker_fee = float(maker_fee if maker_fee is not None else DEFAULT_MAKER_FEE)
         self._specs_cache: Optional[Dict[str, dict]] = None
         self._specs_ts = 0.0
 
@@ -494,7 +504,7 @@ class KrInfo:
                 "coin": coin, "px": px, "sz": sz, "side": "buy" if is_buy else "sell",
                 "time": t, "hash": f"kr:{tid}", "dir": direction,
                 "closedPnl": closed_val, "closedPnl_src": closed_src,
-                "fee": sz * px * DEFAULT_TAKER_FEE,
+                "fee": sz * px * self._taker_fee,
                 "fee_estimated": 1, "tid": tid, "oid": oid,
                 "reduce_only": 1 if close_qty > 0 else 0,
             })
@@ -527,7 +537,7 @@ class KrInfo:
         return []
 
     def user_fees(self, address: str) -> dict:
-        return {"takerFee": DEFAULT_TAKER_FEE, "makerFee": 0.0002}
+        return {"takerFee": self._taker_fee, "makerFee": self._maker_fee}
 
     # ---------------------------------------------------------------- 代理钱包
     def agent_status(self, address: str) -> dict:

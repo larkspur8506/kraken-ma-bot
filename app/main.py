@@ -274,8 +274,12 @@ def get_hl_info():
     global _hl_info
     if _hl_info is None:
         from app.kr.info import KrInfo
+        _cfg = current_config()
         _hl_info = KrInfo(api_key=kr_api_key(), secret_b64=kr_secret(),
-                          base_url=hl_info_base())
+                          base_url=hl_info_base(),
+                          # 计费口径：Kraken 的 /fills 不带 fee，只能按账号费率档配
+                          taker_fee=float(getattr(_cfg, "kr_taker_fee", 0.000275)),
+                          maker_fee=float(getattr(_cfg, "kr_maker_fee", 0.000075)))
     return _hl_info
 
 

@@ -236,10 +236,11 @@ def _drift_line(drift: float, signal_px: float,
 
 
 def fmt_entry_alert(coin: str, side: int, sz: float, entry_px: float, stop: float,
-                    stop_dist: float, notional: float, margin: float, liq: float,
+                    stop_dist: float, notional: float, margin: Optional[float],
+                    liq: Optional[float],
                     risk_u: float, equity: float, signal_px: float, oid, stop_oid,
                     when: "dt.datetime", tz_label: str,
-                    leverage: float = 5.0,
+                    leverage: Optional[float] = 5.0,
                     signal_age_min: Optional[float] = None) -> str:
     """开仓回报：价格 / 数量 / 保证金 / 强平 / 风险 分行排，别糊成一坨。
 
@@ -248,18 +249,27 @@ def fmt_entry_alert(coin: str, side: int, sz: float, entry_px: float, stop: floa
 
     `signal_age_min` = 成交距信号 bar 收盘的分钟数；> `DELAY_LABEL_MIN` 时那一行
     的标签从「滑点」改成「延迟」并标出晚了几分钟。
+
+    **Kraken 全仓（2026-11-08 对抗审查）**：`leverage=None` 表示该 venue 没有逐仓语义
+    （Kraken 独立衍生品钱包是全仓，IM 由合约档位决定，BTC/ETH/SOL 1%≈100x、QQQX 5%≈20x）。
+    此时标题写「全仓」；`margin`/`liq` 传 None → 显示「以交易所为准」而不是拿配置里的 5x
+    逐仓公式编一个数（那会把保证金高估 20 倍、强平价说成入场 ±20%）。
     """
     drift = ((entry_px - signal_px) / signal_px * 100) if signal_px else 0.0
     stop_pct = ((stop - entry_px) / entry_px * 100) if entry_px else 0.0
     pct = (risk_u / equity * 100) if equity else 0.0
     return "\n".join([
-        f"【Kraken】✅ 已开仓 · {coin} {_side_word(side)} {leverage:g}x 逐仓",
+        (f"【Kraken】✅ 已开仓 · {coin} {_side_word(side)} 全仓"
+         if leverage is None else
+         f"【Kraken】✅ 已开仓 · {coin} {_side_word(side)} {leverage:g}x 逐仓"),
         "",
         f"成交价    {_fmt_u(entry_px)}",
         f"数量      {sz:g} {coin}（名义 {_fmt_u(notional, 1)} U）",
         f"止损价    {_fmt_u(stop)}（{stop_pct:+.2f}%）",
-        f"保证金    ≈{_fmt_u(margin, 1)} U",
-        f"强平价    {_fmt_u(liq)}",
+        ("保证金    — （以交易所为准）" if margin is None
+         else f"保证金    ≈{_fmt_u(margin, 1)} U"),
+        ("强平价    — （以交易所为准）" if liq is None
+         else f"强平价    {_fmt_u(liq)}"),
         f"风险      {_fmt_u(risk_u)} U（权益的 {pct:.1f}%）",
         _drift_line(drift, signal_px, signal_age_min),
         f"时间      {when.strftime('%m-%d %H:%M')} {tz_label}",
@@ -2255,13 +2265,20 @@ class Executor:
                     0.0, (time.time() * 1000.0 - (int(bar_ms) + SIGNAL_BAR_MS)) / 60_000.0)
         except (TypeError, ValueError):                       # 脏 bar：按「滑点」显示
             signal_age_min = None
+        # Kraken 全仓：plan 里的 margin/liq 是 HL 逐仓公式（notional/leverage、
+        # liq_price(entry, leverage)），直接显示会把保证金高估 20 倍、强平价说成
+        # 入场 ±20%。这两个数只进告警文案，不写库/不进面板表 → 宁可不显示。
+        _kr = callable(getattr(self.info, "price_tick", None))
         self._alert_fill(fmt_entry_alert(
             coin=coin, side=side, sz=filled_sz, entry_px=avg_px, stop=stop,
-            stop_dist=plan2.stop_dist, notional=plan2.notional, margin=plan2.margin,
-            liq=plan2.liq_price, risk_u=plan2.risk_u, equity=eff_equity,
+            stop_dist=plan2.stop_dist, notional=plan2.notional,
+            margin=None if _kr else plan2.margin,
+            liq=None if _kr else plan2.liq_price,
+            risk_u=plan2.risk_u, equity=eff_equity,
             signal_px=float(row["entry_price"] or avg_px), oid=res.get("oid"),
             stop_oid=stop_res.get("oid"), when=dt.datetime.now(DISPLAY_TZ), tz_label=TZ_LABEL,
-            leverage=float(self.p.leverage or 5.0), signal_age_min=signal_age_min))
+            leverage=None if _kr else float(self.p.leverage or 5.0),
+            signal_age_min=signal_age_min))
         self._event(EV_ORDER, f"{symbol} 开仓完成：{filled_sz} @ {avg_px:,.2f}，止损单已挂",
                     symbol=symbol, data={"risk_u": plan2.risk_u, "notional": plan2.notional})
         # 5) 开仓确认时的数量核对（PR-3）：下单前算的 sz 与真实成交可能差一个 tick
