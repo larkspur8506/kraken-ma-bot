@@ -1162,9 +1162,10 @@ class TestPanelAndWiring(unittest.TestCase):
             app = FastAPI()
             app.include_router(build_admin_router(deps))
             c = TestClient(app)
-            # 兜底有值 → 总览「管理」卡渲染清除按钮
+            # 兜底有值也不再渲染清除按钮（Kraken 版没有该 UI，HL agent 体系退役）；
+            # 端点仍保留且能清脏值 —— 下面照样验它。
             html = c.get("/admin", params={"k": "tk"}).text
-            self.assertIn("action='/admin/hl/agent/fallback/clear'", html)
+            self.assertNotIn("action='/admin/hl/agent/fallback/clear'", html)
             # 参数页的写入口彻底没了
             r = c.post("/admin/params", data={"hl_agent_valid_until_ms": "1840000000000",
                                               "k": "tk"}, follow_redirects=False)

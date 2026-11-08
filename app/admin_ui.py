@@ -1524,6 +1524,15 @@ def render_agent_card(deps: AdminDeps) -> str:
 
     addr = agent_mod.mask_addr(state.get("address"))
     src = _agent_source_txt(str(state.get("source") or ""))
+    if str(state.get("source") or "") == "kraken-key-no-expiry":
+        # Kraken：key 无到期、无代理钱包地址、无「到期前自动清仓」这套东西 ——
+        # 只报一行状态，不摆五行空壳（手机上一张卡够用）。
+        return ("<details class='card agent-card'><summary>API 状态</summary>"
+                "<div class='grid'><div class='kv'>"
+                "<span class='k'>Kraken Futures API</span>"
+                "<span class='v pos'>已配置 · 无到期</span></div></div>"
+                "<div class='legend'>key/secret 只存服务器 DB，只用于签名，不能提币；"
+                "换 key 走下方「更新 API」。</div></details>")
     if level == "no_expiry":
         until_txt = "不限期（Kraken API 无到期）"
         left_txt = "不会到期"
@@ -1590,9 +1599,8 @@ def render_agent_renew_block(deps: AdminDeps) -> str:
     # Withdrawal API=No Access（不能提币）。key/secret 是网页上分开的两条，各一个框。
     o.append("<details class=\"msgdetails\"><summary>粘贴 Kraken Derivatives API key</summary>"
              "<div class=\"fullmsg\">"
-             "<div class='hint'>步骤：① Kraken 网页 → <b>Derivatives → More → API</b>；"
-             "② Generate API key：<b>General API=Full</b>、<b>Withdrawal API=No Access</b>（不能提币）；"
-             "③ 把网页显示的 API Key 和 API Secret 分别粘到下面保存。</div>"
+             "<div class='hint'>Kraken → Derivatives → More → API：<b>General API=Full</b>、"
+             "<b>Withdrawal=No Access</b>；把 Key 与 Secret（base64）粘到下面保存。</div>"
              "<form method='post' action='/admin/hl/agent/renew' autocomplete='off'>"
              f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
              "<input type='text' name='apikey' autocomplete='off' spellcheck='false' "
@@ -1600,8 +1608,7 @@ def render_agent_renew_block(deps: AdminDeps) -> str:
              "<input type='password' name='apisecret' autocomplete='off' spellcheck='false' "
              "placeholder='API Secret（base64）' required>"
              "<button type='submit'>校验并保存</button></form>"
-             "<div class='hint'>保存后立即生效（只读客户端缓存会重建）。key/secret 只写进服务器数据库"
-             "（执行器签名用），不回显、不进日志。</div>"
+             "<div class='hint'>保存即生效。key/secret 只进服务器 DB，不回显、不进日志。</div>"
              "</div></details>")
     return "".join(o)
 
@@ -1643,11 +1650,8 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
     # ---- 只读：执行模式 + 地址/私钥（原开关页的说明段搬到这里）----
     o.append("<div class='hint'>执行模式："
              + _badge(_MODE_CLS[mode], "模式", _MODE_TXT[mode],
-                      "面板只显示当前生效值；改模式走容器内 sqlite（见 docs/HL_RUNBOOK.md）")
-             + (f"&nbsp;钱包地址：已配置（{_esc(addr[:6])}&hellip;{_esc(addr[-4:])}）"
-                if addr else "&nbsp;钱包地址：未配置")
-             + f"&nbsp;｜ 私钥：{'已配置' if has_key else '未配置'}"
-             + "&nbsp;｜ 地址/私钥来自 env/DB，面板只读不改。</div>")
+                      "改模式：改 compose 里的 HL_EXEC_MODE 后重建容器")
+             + "</div>")
 
     # ---- 拉闸（kill switch）：交互与开关页「应急操作」卡逐字一致 ----
     o.append("<div class='sec'>拉闸（kill switch）</div>")
@@ -1664,10 +1668,10 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
              "触发（暂停开仓）</button>"
              f"<button class='{'gray' if kill else 'red'}' type='submit' name='on' value='0'>"
              "解除（恢复正常）</button></form>")
-    # 解除 DD 熔断会顺带重置回撤基线 —— 这件事必须写在按钮旁（否则「人工解」被误解成
-    # 「回撤清零」，下次误以为熔断线没生效）。
-    o.append("<div class='hint'>origin=dd（回撤熔断）时「解除」会在同一请求里重置回撤基线，"
-             "否则下一轮又立刻熔断；其它来源的停手只解锁、不动基线。</div>")
+    # 解除 DD 熔断会顺带重置回撤基线（否则下一轮又立刻熔断）；说明收进 title，
+    # 手机上不再多几行字。
+    o.append("<div class='hint' title='origin=dd 时「解除」会同时重置回撤基线，其它来源只解锁'>"
+             "触发后只挡新开仓，平仓与交易所止损照常。</div>")
 
     # ---- MR 腿（QQQ 超跌反弹）：与拉闸同一张卡，不单独占一栏（2026-11-02 用户要求）----
     # 它是**独立腿**（Kraken 的 PF_QQQXUSD，默认停用），但开关语义与拉闸一致：
@@ -1675,10 +1679,9 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
     # 页尾这张卡是面板唯一的写入口，MR 开关排在应急动作之后、续期之前。
     o.append("<div class='sec'>MR 腿（QQQ 超跌反弹）</div>")
     mr_on, mr_bits = _mr_switch(deps)
-    o.append("<div class='hint'>当前：<b>" + ("已启用" if mr_on else "已停用（默认）") + "</b>"
+    o.append("<div class='hint'>当前：<b>" + ("已启用" if mr_on else "已停用") + "</b>"
              + (f" · {_esc(mr_bits)}" if mr_bits else "")
-             + "&nbsp;｜ 只挡新入场，已持仓仍按信号离场（与拉闸同理）。"
-             + "&nbsp;PF_QQQXUSD（Kraken QQQ 永续）· 名义 = 权益×0.5。</div>")
+             + "&nbsp;｜ PF_QQQXUSD · 名义 = 权益×0.5 · 只挡新入场</div>")
     o.append("<form method='post' action='/admin/hl/mr'>"
              f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
              f"<button class='{'red' if not mr_on else 'gray'}' type='submit' name='on' value='1'>"
@@ -1689,16 +1692,6 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
     # ---- 更新 API ----
     o.append("<div class='sec'>更新 API</div>")
     o.append(render_agent_renew_block(deps))
-
-    # ---- 清除手工兜底有效期（只有真有值时才渲染）----
-    if cur_until:
-        o.append("<div class='sec'>手工兜底有效期</div>")
-        o.append(f"<div class='hint'>DB 里当前的手工兜底有效期：{_esc(cur_until)}（毫秒时间戳）。"
-                 "面板没读到 API 授信值时才会用到它；值过期/填错会让执行器按错误的"
-                 "到期日行动，所以这里只提供「清除」。</div>")
-        o.append("<form method='post' action='/admin/hl/agent/fallback/clear' class='inline'>"
-                 f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
-                 "<button class='gray' type='submit'>清除兜底</button></form>")
     o.append("</div>")
     return "".join(o)
 

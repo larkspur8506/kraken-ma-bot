@@ -277,28 +277,27 @@ class TestAdminCard(BaseCase):
         self.assertNotIn("name='mode'", html)
         self.assertNotIn("confirm_live", html)
 
-    def test_fallback_clear_only_rendered_when_value_present(self):
-        """没有兜底值时不渲染「清除兜底」（没值可清）；有值时出现且能清掉。"""
+    def test_fallback_clear_not_rendered_in_kraken(self):
+        """Kraken 版没有「手工兜底有效期」（HL agent 授权体系退役），整块不渲染。
+
+        兜底值哪怕残留在 DB 里也不再摆到手机上；清除 route 仍保留（幂等无害）。
+        """
         html = self.body(tab="overview")
         self.assertNotIn("action='/admin/hl/agent/fallback/clear'", html)
         self.db.set_config("hl_agent_valid_until_ms", "1830000000000")
         html = self.body(tab="overview")
-        self.assertIn("action='/admin/hl/agent/fallback/clear'", html)
-        self.assertIn("1830000000000", html)
-        r = self.post("/admin/hl/agent/fallback/clear")
-        self.assertEqual(r.status_code, 303)
-        self.assertIn("tab=overview", r.headers["location"])
-        # set_config 走 json.dumps：空串在 DB 里是 '""'
-        self.assertFalse(str(self.db.get_config_str("hl_agent_valid_until_ms") or "").strip())
+        self.assertNotIn("action='/admin/hl/agent/fallback/clear'", html)
+        self.assertNotIn("清除兜底", html)
         # 卡片按 cfg 读这个键；apply_db 对空串是「不改动」语义（Config._CLEARABLE_STR 为空），
         # 而本夹具复用了同一个 Config 实例 → 换一个干净实例再验渲染条件（等价于进程重启）。
         self.cfg_cache["cfg"] = Config()
         self.assertNotIn("action='/admin/hl/agent/fallback/clear'", self.body(tab="overview"))
 
-    def test_management_card_shows_credentials_state(self):
+    def test_management_card_hides_hl_credentials(self):
+        """Kraken 没有代理钱包地址/私钥，管理卡不再摆这两项空壳。"""
         html = self.body(tab="overview")
-        self.assertIn("私钥：未配置", html)
-        self.assertIn("已配置", html)          # 地址
+        self.assertNotIn("私钥：", html)
+        self.assertNotIn("钱包地址：", html)
 
 
 class TestRecordsTab(BaseCase):
