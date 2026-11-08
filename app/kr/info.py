@@ -124,16 +124,26 @@ class KrInfo:
 
     # ---------------------------------------------------------------- 账户
     def user_state(self, address: str) -> dict:
-        """归一 /account + /openpositions 成 HL clearinghouseState 近似形状。"""
+        """归一 /account + /openpositions 成 HL clearinghouseState 近似形状。
+
+        assetPositions 用 **HL 原生形状**（position.coin/szi/entryPx/…）——
+        MR 腿（HlMrLeg._read_account）与旧 HL 消费方都按这个形状读仓。
+        """
         acct = self._ep.account() or {}
         pv = _num(acct.get("pv") or acct.get("portfolioValue"))
         av = _num(acct.get("av") or acct.get("availableMargin"))
         im = _num(acct.get("im") or acct.get("initialMargin"))
         positions = self._positions(mids=None)
         notional = sum(p["position_value"] for p in positions)
+        asset_positions = [{
+            "position": {"coin": p["coin"], "szi": p["side"] * p["size"],
+                         "entryPx": p["entry_px"], "positionValue": p["position_value"],
+                         "unrealizedPnl": p["unrealized_pnl"],
+                         "leverage": {"type": "cross", "marginUsed": p["margin_used"]}},
+        } for p in positions]
         return {"marginSummary": {"accountValue": pv, "withdrawable": av,
                                   "totalMarginUsed": im, "totalNtlPos": notional},
-                "assetPositions": positions,
+                "assetPositions": asset_positions,
                 "withdrawable": av}
 
     def user_state_dex(self, address: str, dex: str) -> dict:

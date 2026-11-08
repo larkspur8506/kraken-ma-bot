@@ -95,12 +95,22 @@ _KR_SYMBOLS: Dict[str, str] = {
     "ETH": "PF_ETHUSD",
     "SOL": "PF_SOLUSD",
     "QQQ": "PF_QQQXUSD",
+    # HL MR 腿的 xStock 名（xyz:XYZ100 / 裸 XYZ100）：kr_symbol 取冒号后段查表，
+    # 老执行器代码迁移期可以直接传旧名，两个入口都落到同一张合约。
+    "XYZ100": "PF_QQQXUSD",
 }
 
 
 def kr_symbol(coin: str) -> Optional[str]:
-    """display coin → Kraken 合约名；未登记返回 None（调用方 fail-closed）。"""
-    return _KR_SYMBOLS.get(str(coin or "").strip().upper())
+    """display coin → Kraken 合约名；未登记返回 None（调用方 fail-closed）。
+
+    接受 dex 限定名（HL MR 腿的 `xyz:XYZ100` 形态）：取冒号后段再查表，
+    所以 `xyz:XYZ100` / `XYZ100` 都能落到 PF_QQQXUSD。
+    """
+    c = str(coin or "").strip().upper()
+    if ":" in c:
+        c = c.split(":")[-1]
+    return _KR_SYMBOLS.get(c)
 
 
 def kr_coin(trade_symbol: str) -> Optional[str]:

@@ -124,6 +124,40 @@ class TestSpecs(unittest.TestCase):
         self.assertEqual(_mk(ep).specs(), {})
 
 
+class TestUserStateHLShape(unittest.TestCase):
+    """PR-2：user_state_dex 必须给 HL 原生 assetPositions 形状（MR 腿消费方）。"""
+
+    def test_positions_mapped_to_hl_shape(self):
+        ep = _StubEp(account=ACC, positions=[{
+            "symbol": "PF_QQQXUSD", "side": "long", "netQty": 0.5,
+            "avgFillPrice": 650.0, "markPrice": 660.0,
+            "calculatedUnrealizedPnl": 5.0}])
+        st = _mk(ep).user_state_dex("kr", "kr")
+        self.assertAlmostEqual(st["marginSummary"]["accountValue"], 1000.0)
+        item = st["assetPositions"][0]["position"]
+        self.assertEqual(item["coin"], "QQQ")
+        self.assertAlmostEqual(item["szi"], 0.5)
+        self.assertAlmostEqual(item["entryPx"], 650.0)
+        self.assertAlmostEqual(item["positionValue"], 330.0)
+        self.assertEqual(item["leverage"]["type"], "cross")
+        # mr._read_account 的过滤条件（cfg.coin / bare）必须直接命中
+        self.assertIn(item["coin"], ("QQQ",))
+
+    def test_candles_hl_keys(self):
+        class _CandlesEp(_StubEp):
+            def charts_history(self, sym, res, from_s, to_s):
+                return [{"time": 1700000000000, "open": 1, "high": 2, "low": 0.5,
+                         "close": 1.5, "volume": 9}]
+        row = _mk(_CandlesEp()).candles("QQQ", "1h", 1, 2)[0]
+        for k in ("t", "o", "h", "l", "c", "v"):
+            self.assertIn(k, row)
+
+    def test_registry_dex_qualified_name(self):
+        from app import symbol_registry as registry
+        self.assertEqual(registry.kr_symbol("xyz:XYZ100"), "PF_QQQXUSD")
+        self.assertEqual(registry.kr_symbol("XYZ100"), "PF_QQQXUSD")
+
+
 class TestFailClosed(unittest.TestCase):
     def test_account_zero_raises(self):
         with self.assertRaises(KrInfoError):
