@@ -323,8 +323,7 @@ class KrInfo:
                 raise KrInfoError(f"{sym} 持仓方向缺失（side={side_txt!r}）")
             side = 1 if side_txt == "long" else -1
             entry = _num(item.get("price"))
-            upnl = _num(item.get("unrealizedPnl"),
-                        (0.0 if entry <= 0 else 0.0))
+            upnl = _num(item.get("unrealizedPnl"))
             mark = _num((mids or {}).get(coin))
             if mark <= 0 and entry > 0:
                 # Kraken 不返回标记价：用 未实现盈亏 反推（upnl = (mark-entry)*signed_qty）
