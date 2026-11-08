@@ -20,8 +20,9 @@ DEFAULT_THEME = "auto"
 
 # 用户可见产品名（P3 命名重设计）。工程名 crypto-ma-alert（repo/容器/镜像/日志前缀）
 # 一律不改 —— 这里只管「页面上叫什么」。副题一句话说清产品现状：标的 / 周期 / 交易所。
+# PR-1 起执行场所是 Kraken Futures（MR 腿 QQQ 同在 Kraken）——副题随场所走。
 PRODUCT_NAME = "双均线交易台"
-PRODUCT_SUBTITLE = "BTC / ETH / SOL · 4h 密集突破 · Hyperliquid 自动执行"
+PRODUCT_SUBTITLE = "BTC / ETH / SOL · 4h 密集突破 · Kraken 自动执行"
 # /hl 独立页与 /admin 共用同一个头部块（h1 + muted 副题）；.h1sub 样式在 views.DASH_CSS。
 H1_BLOCK = (f"<h1>{PRODUCT_NAME}</h1>"
             f"<div class='h1sub'>{PRODUCT_SUBTITLE}</div>")

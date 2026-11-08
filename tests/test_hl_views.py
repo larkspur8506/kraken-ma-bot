@@ -889,7 +889,7 @@ class TestLatencyFromSnapshot(BaseCase):
         self._with_panel_net({"latency_ms": 456.7, "ts": FIXED_NOW - 300.0})
         html = render_dashboard(self.payload())
         self.assertIn("Kraken 延迟 <b>457 ms</b>", html)
-        self.assertIn("调度器上一轮读 Hyperliquid 的耗时", html)
+        self.assertIn("调度器上一轮读 Kraken 的耗时", html)
         self.assertIn("本次渲染没有访问交易所", html)
 
     def test_page_without_measurement_shows_dash_not_fake_ms(self):

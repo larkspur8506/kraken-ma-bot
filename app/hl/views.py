@@ -2188,12 +2188,12 @@ def _render_body(p: dict) -> str:
     # 卡单徽章（P3 R2）：只在 >0 时出现，正常态状态条不出现「卡单」字样。
     o.append(_stuck_badge_html(system))
     lat_txt = f"{latency:.0f} ms" if latency is not None else "—"
-    # 这是「服务器 → Hyperliquid」的耗时（容器每次拉账户快照的开销），不是你到面板的网络延迟。
+    # 这是「服务器 → Kraken」的耗时（容器每次拉账户快照的开销），不是你到面板的网络延迟。
     # 快照模式（阶段 B）下本次渲染没访交易所，数字来自调度器上一轮的实测，标题必须说清。
     if bool(net.get("latency_from_snapshot")):
-        lat_title = "调度器上一轮读 Hyperliquid 的耗时（本次渲染没有访问交易所）；与你的浏览器到本站的延迟无关"
+        lat_title = "调度器上一轮读 Kraken 的耗时（本次渲染没有访问交易所）；与你的浏览器到本站的延迟无关"
     else:
-        lat_title = ("oracle1 上的容器请求 Hyperliquid /info 的耗时（含失败重试）；"
+        lat_title = ("oracle1 上的容器请求 Kraken /derivatives 的耗时（含失败重试）；"
                      "与你的浏览器到本站的延迟无关")
     o.append(f"<span class='badge' title='{_esc(lat_title)}'>"
              f"<span class='{('pos' if latency is not None else 'muted')}'>&#9679;</span>"
@@ -2568,7 +2568,7 @@ def build_router(deps: DashboardDeps) -> Any:
         - `curve=0`（默认）：不展开 30 天逐点 `curve.pnl`/`curve.twr`（省 ~440KB），保留 `curve.meta`；
           传 `?curve=1` 返回完整点列。
         - `live=0`（默认）：若注入了 `snapshot_info_fn` 则优先读面板快照（缺失/过期自动回落实时），
-          省去每轮实连 Hyperliquid 的 ~1s 延迟；传 `?live=1` 强制走实时客户端。
+          省去每轮实连 Kraken 的 ~1s 延迟；传 `?live=1` 强制走实时客户端。
         """
         if _admin_required(deps, k, request):
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
@@ -2586,7 +2586,7 @@ def build_router(deps: DashboardDeps) -> Any:
         - `curve=0`（默认）：不展开 30 天逐点 `curve.pnl`/`curve.twr`（省 ~410KB）；
           传 `?curve=1` 返回完整点列（要画图才传）。
         - `live=0`（默认）：若注入了 `snapshot_info_fn` 则优先读面板快照（缺失/过期
-          自动回落实时），省去每轮实连 Hyperliquid 的 ~1s 延迟；`?live=1` 强制实时。
+          自动回落实时），省去每轮实连 Kraken 的 ~1s 延迟；`?live=1` 强制实时。
         - 当前无已知外部消费方（trade-hub / 脚本 / cron 均不读它），参数保持向后兼容。
         """
         if _admin_required(deps, k, request):

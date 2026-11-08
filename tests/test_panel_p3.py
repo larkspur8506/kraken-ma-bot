@@ -32,7 +32,7 @@ NOW = 1760000000.0
 TOKEN = "p3-tk"
 ADDR = "0xTestAccount000000000000000000000000"
 PRODUCT = "双均线交易台"
-SUBTITLE = "BTC / ETH / SOL · 4h 密集突破 · Hyperliquid 自动执行"
+SUBTITLE = "BTC / ETH / SOL · 4h 密集突破 · Kraken 自动执行"
 
 try:
     from fastapi import FastAPI
