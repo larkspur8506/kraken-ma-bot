@@ -1357,11 +1357,11 @@ def _status_strip(p: dict) -> str:
     if lat is not None and lat_from_snapshot:
         age_txt = _opt_num(net.get("latency_age_s"))
         lat_title = ("调度器上一轮" + (f"（{_age_txt(age_txt)}）" if age_txt is not None else "")
-                     + "读 Hyperliquid 的耗时；本次渲染没有访问交易所，也不是你到面板的延迟")
+                     + "读 Kraken 的耗时；本次渲染没有访问交易所，也不是你到面板的延迟")
     elif from_snapshot:
         lat_title = "读数是调度器快照，本次渲染没有访问交易所 —— 所以这里不显示网络延迟"
     else:
-        lat_title = "服务器请求 Hyperliquid 的耗时，与你到面板的延迟无关"
+        lat_title = "服务器请求 Kraken 的耗时，与你到面板的延迟无关"
     kill_reason = str(p.get("kill_reason") or "").strip()
     # 熔断触发且原因非空 → 值里带上原因（可见文字）；iOS Safari 无 title 悬停，
     # 原先原因只在 title 里、手机上读不到。未触发时值不变，title 保留。
