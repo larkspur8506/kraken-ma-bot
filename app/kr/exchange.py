@@ -36,8 +36,12 @@ _STOP_ORDER = "stp"
 
 
 def make_cloid(symbol: str, bar_ms: int, purpose: str) -> str:
-    """确定性 cliOrdId（0x + 32 hex，34 字符 ≤ Kraken 64 上限）。与 HL 同构。"""
-    h = hashlib.sha256(f"krb:{symbol}:{bar_ms}:{purpose}".encode()).hexdigest()[:32]
+    """确定性 cliOrdId（0x + 32 hex，34 字符 ≤ Kraken 64 上限）。
+
+    与 HL 侧 **同源推导**（同 `cma:` 前缀、同输入）——同一 (symbol, bar_ms,
+    purpose) 在两个场所得到同一个 cloid，DB 记账/幂等键跨场馆不歧义。
+    """
+    h = hashlib.sha256(f"cma:{symbol}:{bar_ms}:{purpose}".encode()).hexdigest()[:32]
     return "0x" + h
 
 

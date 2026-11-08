@@ -99,16 +99,17 @@ class TestFetchPolicy(unittest.TestCase):
         return [Bar(open_ms=NOW - (n - i) * IV, open=83000.0, high=83100.0, low=82900.0,
                     close=83050.0, volume=1.0) for i in range(n)]
 
-    def test_primary_source_is_hl(self):
-        self.assertEqual([n for n, _ in market.SOURCES], ["hl-candle"])
+    def test_primary_source_is_kr(self):
+        # PR-1：实盘信号源切 Kraken charts（交易场所自有数据，fail-closed）
+        self.assertEqual([n for n, _ in market.SOURCES], ["kr-chart"])
         self.assertIn("mexc-contract", [n for n, _ in market.DIAGNOSTIC_SOURCES])
 
-    def test_fetch_uses_hl(self):
-        market.SOURCES = [("hl-candle", lambda s: self._bars())]
+    def test_fetch_uses_kr(self):
+        market.SOURCES = [("kr-chart", lambda s: self._bars())]
         market.DIAGNOSTIC_SOURCES = [("mexc-contract", lambda s: (_ for _ in ()).throw(
             AssertionError("不能用到诊断源")))]
         feed = market.fetch("BTC_USDT", now_ms=NOW)
-        self.assertEqual(feed.source, "hl-candle")
+        self.assertEqual(feed.source, "kr-chart")
 
     def test_hl_failure_does_not_fall_back(self):
         """HL 挂了 → 必须抛 FeedError（宁可停手，不用别家数据）"""

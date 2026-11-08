@@ -83,36 +83,28 @@ class TestAppAssembly(unittest.TestCase):
             self.assertEqual(sorted(i["sizes"] for i in m["icons"]), ["192x192", "512x512"])
             self.assertTrue(all(i["purpose"] == "any" for i in m["icons"]))
 
-    def test_agent_check_passes_mode_and_handles_off(self):
-        """装配级：_agent_check 必须把当前模式传下去，off 下不喊「清仓失败」。"""
+    def test_agent_check_kraken_no_expiry(self):
+        """装配级：Kraken key 无有效期/无代理钱包授权，到期检查固定 ok，
+        不得再触碰 app.hl.agent（旧 HL 授权体系整体退役）。"""
         try:
             import fastapi                                            # noqa: F401
         except ImportError:
             self.skipTest("fastapi 未安装")
         mod = importlib.import_module("app.main")
         importlib.reload(mod)
-        seen = {}
-
-        class Info:
-            def extra_agents(self, address):
-                return [{"name": "Hermes", "address": "0xabc",
-                         "validUntil": int(__import__("time").time() * 1000) + 86_400_000}]
-        mod.get_hl_info = lambda: Info()
-        mod.db.set_config("hl_exec_mode", "off")
-
-        def fake_check(db, cfg, notifier, info, **kw):
-            seen.update(kw)
-            return {"level": "cleanup", "source": "api"}
-
         from app.hl import agent as agent_mod
+
+        def boom(*a, **kw):
+            raise AssertionError("Kraken 版 _agent_check 不应再调用 app.hl.agent.check_once")
+
         orig = agent_mod.check_once
-        agent_mod.check_once = fake_check
+        agent_mod.check_once = boom
         try:
-            mod._agent_check()
+            res = mod._agent_check()
         finally:
             agent_mod.check_once = orig
-        self.assertEqual(seen.get("mode"), "off", "_agent_check 必须把实际模式传下去")
-        self.assertTrue(callable(seen.get("cleanup")), "清仓器必须接线")
+        self.assertEqual(res.get("level"), "ok")
+        self.assertEqual(res.get("source"), "kraken-key-no-expiry")
 
     @staticmethod
     def _route_paths(app) -> set:

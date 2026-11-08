@@ -40,8 +40,8 @@ NOW = 1_760_000_000.0
 # 三条注脚的原文（与源码逐字一致；用常量便于「渲染原文」断言）
 LEGEND_ACCOUNT = ("已实现为交易所口径，未扣手续费与资金费 · 可提 = 现货 − 仓位/挂单占用")
 LEGEND_SYSTEM = ("卡单 = 持续 3 分钟未推进才计入 · "
-                 "HL 延迟 = 容器请求 /info 耗时（含失败重试），与本机网速无关")
-LEGEND_FEED = "信号源固定 hl-candle（fail-closed：源失败即跳过本轮，不换源）"
+                 "Kraken 延迟 = 容器请求 /derivatives 耗时（含失败重试），与本机网速无关")
+LEGEND_FEED = "信号源固定 kr-chart（fail-closed：源失败即跳过本轮，不换源）"
 
 _TITLE_ATTR = re.compile(r"""\s+title\s*=\s*("[^"]*"|'[^']*')""")
 _TAG = re.compile(r"<[^>]+>")

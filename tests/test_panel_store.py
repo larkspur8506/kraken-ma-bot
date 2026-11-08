@@ -234,8 +234,12 @@ class TestWiring(unittest.TestCase):
         for k, v in self.ENV.items():
             os.environ[k] = v
         import app.hl.info as hl_info
+        import app.kr.info as kr_info
         self._real_cls = hl_info.HlInfo
+        self._real_kr_cls = kr_info.KrInfo
+        # PR-1：main.get_hl_info 走 KrInfo，替身两个类都要换（HlInfo 留着给 hl 包内旧代码）
         hl_info.HlInfo = CountingHlInfo
+        kr_info.KrInfo = CountingHlInfo
         CountingHlInfo.instances = []
         importlib.reload(importlib.import_module("app.config"))
         self.mod = importlib.reload(importlib.import_module("app.main"))
@@ -243,7 +247,9 @@ class TestWiring(unittest.TestCase):
 
     def tearDown(self):
         import app.hl.info as hl_info
+        import app.kr.info as kr_info
         hl_info.HlInfo = self._real_cls
+        kr_info.KrInfo = self._real_kr_cls
         for key, val in self._backup.items():
             if val is None:
                 os.environ.pop(key, None)
@@ -262,7 +268,7 @@ class TestWiring(unittest.TestCase):
         row = self.mod.panel_snapshot_store().latest()
         self.assertIsNotNone(row)
         self.assertEqual(row["why"], [{"symbol": "BTC_USDT", "ok": False}])
-        # 快照里必须带上「调度器这一轮读数花了多久」——面板的 HL 延迟只能来自这里
+        # 快照里必须带上「调度器这一轮读数花了多久」——面板的 Kraken 延迟只能来自这里
         # （渲染本身不访问交易所，测不到，也不能编）。
         net = row["snapshot"].get("panel_net")
         self.assertIsInstance(net, dict, "快照缺 panel_net：面板就只能显「—」")
@@ -299,7 +305,7 @@ class TestWiring(unittest.TestCase):
         with self.TestClient(self.mod.app) as c:
             r = c.get("/admin", params={"k": "snap-tk"})
             self.assertEqual(r.status_code, 200)
-        self.assertIn("HL 延迟 <b>457 ms</b>", r.text, "快照实测值没渲染出来")
+        self.assertIn("Kraken 延迟 <b>457 ms</b>", r.text, "快照实测值没渲染出来")
         self.assertIn("5 分钟前", r.text)              # 标题里说清是哪一轮测的
         self.assertIn("本次渲染没有访问交易所", r.text)
         self.assertEqual(self.info.total, 0, "显示延迟不许回头去访问交易所")
@@ -311,9 +317,9 @@ class TestWiring(unittest.TestCase):
         with self.TestClient(self.mod.app) as c:
             r = c.get("/admin", params={"k": "snap-tk"})
             self.assertEqual(r.status_code, 200)
-        self.assertIn("HL 延迟 <b>—</b>", r.text)
-        self.assertNotIn("HL 延迟 <b>0 ms</b>", r.text)
-        self.assertNotIn("HL 延迟 <b>1 ms</b>", r.text)
+        self.assertIn("Kraken 延迟 <b>—</b>", r.text)
+        self.assertNotIn("Kraken 延迟 <b>0 ms</b>", r.text)
+        self.assertNotIn("Kraken 延迟 <b>1 ms</b>", r.text)
 
     def test_status_api_defaults_to_snapshot_and_supports_live_flag(self):
         """`/api/hl/status` 默认走快照（零网络）且不展开全量 curve；`?live=1` 走实时，`?curve=1` 展开点列。"""
@@ -341,7 +347,7 @@ class TestWiring(unittest.TestCase):
         with self.TestClient(self.mod.app) as c:
             r = c.get("/admin", params={"k": "snap-tk"})
             self.assertEqual(r.status_code, 200)
-            self.assertIn("HL 延迟 <b>", r.text)
+            self.assertIn("Kraken 延迟 <b>", r.text)
             self.assertIn(" ms</b>", r.text)
 
     def test_panel_without_snapshot_falls_back_and_still_renders(self):

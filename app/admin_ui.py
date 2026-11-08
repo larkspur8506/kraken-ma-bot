@@ -1335,7 +1335,7 @@ def _panel_age_badge(age: Any) -> str:
 
 
 def _status_strip(p: dict) -> str:
-    """顶部常显状态条：执行模式 / 熔断 / 对账 / 卡单(>0) / HL 延迟 / API 有效期 / 更新时间。
+    """顶部常显状态条：执行模式 / 熔断 / 对账 / 卡单(>0) / Kraken 延迟 / API 有效期 / 更新时间。
 
     P3 R2/R3：卡单与 API 有效期两个徽章从这里唯一常驻（原「系统」卡的卡单行、
     原「API 有效期」卡的常驻整卡均已删）—— 徽章渲染与 /hl 状态条共用 views 的
@@ -1374,7 +1374,7 @@ def _status_strip(p: dict) -> str:
         _badge("pos" if not mismatch else "neg", "对账", "一致" if not mismatch else "不一致"),
         # 卡单徽章（P3 R2）：>0 才出现（琥珀），正常态状态条不出现「卡单」字样。
         _stuck_badge_html(system),
-        _badge("pos" if lat is not None else "muted", "HL 延迟",
+        _badge("pos" if lat is not None else "muted", "Kraken 延迟",
                f"{lat:.0f} ms" if lat is not None else "—", lat_title),
         # API 有效期徽章（P3 R3）：唯一常驻出处，≤14 天琥珀、≤7 天红、已清仓红。
         _agent_badge_html(p.get("agent")),
