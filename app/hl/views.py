@@ -1757,8 +1757,8 @@ def _feed_line(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]],
                last_bar: Dict[str, Any]) -> str:
     """标的卡末尾的数据源小字行（2026-10-29 精简：正常态不渲染，异常才出现）。
 
-    正常：不产生 DOM（正常态静默；信号源固定 hl-candle、fail-closed，正常没话可说）。
-    失败：`数据源 hl-candle 失败（最后错误 HH:MM） · 已处理到 …`，用 neg 样式醒目
+    正常：不产生 DOM（正常态静默；信号源固定 kr-chart、fail-closed，正常没话可说）。
+    失败：`数据源 kr-chart 失败（最后错误 HH:MM） · 已处理到 …`，用 neg 样式醒目
     （源失败即 fail-closed 跳过本轮，这是最该被看见的异常）。字段缺失时如实写
     「无记录 / —」，绝不编时间。feed 里没这个标的 → 「数据源 无记录」。
     """
@@ -1768,7 +1768,7 @@ def _feed_line(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]],
     if fd is None:
         return _whyline(f"数据源 无记录 · 已处理到 {bar_txt}", "muted")
     # 失败行的 source 可能为空（引擎 mark_feed 失败路径不写源名）；本系统信号源
-    # 固定 hl-candle（fail-closed、不换源），空缺时兜底写实名，不算编造。
+    # 固定 kr-chart（fail-closed、不换源），空缺时兜底写实名，不算编造。
     src = str(fd.get("source") or "kr-chart")
     if fd.get("ok"):
         return ""

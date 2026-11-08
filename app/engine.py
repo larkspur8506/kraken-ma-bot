@@ -124,8 +124,8 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
     `executor_managed`（执行模式）：True = 执行器已接管（mode=live/dry，调用方
     `_tick_symbol` 传 `executor is not None`）。此时提醒里**不能出现 MEXC 人工下单指引**
     （逐仓 5x / 单位选 USDT / 输入 X USDT / N 张）—— 那些数字是按配置 equity 算的
-    人工口径，与 HL 实际成交（跟随实时权益、coin 数量）不是一个口径，照着做就是误导。
-    风险行同理不再写具体 U 数，只报目标风险比例并注明以 HL 开仓回报为准。
+    人工口径，与 Kraken 实际成交（跟随实时权益、coin 数量）不是一个口径，照着做就是误导。
+    风险行同理不再写具体 U 数，只报目标风险比例并注明以 Kraken 开仓回报为准。
     默认 False（纯提醒模式）保持原有 MEXC 文案逐字符不变。
     """
     if stale:
@@ -143,7 +143,7 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
     ]
     if executor_managed:
         # 托管模式：MEXC 人工下单段（含张数建议）整段退役，换成一句执行说明。
-        lines.append("▶ 系统将自动在 Hyperliquid 执行，成交后推送回报")
+        lines.append("▶ 系统将自动在 Kraken 执行，成交后推送回报")
     elif order is None:
         # 场所规格缺失（registry 里没有该标的的 MEXC 段）：**信号与提醒照常产出**，
         # 只把张数段换成一句显式说明。旧版这里会 KeyError，被 tick 的 per-symbol
@@ -161,7 +161,7 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
     ]
     if executor_managed:
         # 权益口径不同（配置 equity vs 实时生效权益）→ 不写具体 U 数。
-        lines.append(f"风险：单笔 {risk_pct * 100:.2f}% 权益（实际以 HL 开仓回报为准）")
+        lines.append(f"风险：单笔 {risk_pct * 100:.2f}% 权益（实际以 Kraken 开仓回报为准）")
     elif order is not None:
         lines.append(
             f"风险：{order.risk_u:.1f}U"
@@ -405,7 +405,7 @@ def symbol_snapshot(cfg, bars: Sequence[strategy.Bar], ind: Dict[str, List[Optio
     """面板区块要的一行快照（纯计算、无 I/O）。
 
     口径（全部复用 strategy 现成的序列，不重新实现一套常数）：
-    - price = 最新一根**未收盘** bar 的 close（与信号同一份 hl-candle，市场层已给）
+    - price = 最新一根**未收盘** bar 的 close（与信号同一份 kr-chart，市场层已给）
     - sma20 = **最后一根已收盘 bar** 的 SMA20 —— 离场判定看的就是这条线
     - sma200 = 同一根已收盘 bar 的 SMA200 —— 做空（③）的趋势过滤线，面板琥珀要用
       （持仓标的也照存，无副作用）

@@ -40,6 +40,9 @@ from app.notify import get_notifier
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("cma")
 
+# Kraken 无钱包地址：统一占位值（见 hl_params 注释）
+KR_ADDRESS = "kraken"
+
 DB_PATH = os.environ.get("DB_PATH", "/app/data/crypto_ma.db")
 db = DB(DB_PATH)
 config = Config()
@@ -100,7 +103,10 @@ def hl_params():
     base = hl_info_base()
     return ExecParams(
         mode=hl_mode(),
-        account_address=_env("HL_ACCOUNT_ADDRESS"),
+        # Kraken 没有「钱包地址」概念：占位值保证下游 address 门卫（面板快照、MR 腿
+        # 的 HL_ADDRESS 空值检查）不再把功能整体跳过（对抗审查 P0：MR 腿曾因空地址
+        # 直接返回 error，永远不下单）。KrInfo 的所有方法都忽略这个参数。
+        account_address=_env("HL_ACCOUNT_ADDRESS") or KR_ADDRESS,
         private_key=hl_private_key(),
         base_url=base,
         coin_map=coin_map,

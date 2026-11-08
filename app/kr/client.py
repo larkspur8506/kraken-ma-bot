@@ -22,6 +22,13 @@ class KrApiError(RuntimeError):
 def _raise_if_error(resp: dict, status: int, what: str) -> dict:
     if not isinstance(resp, dict):
         raise KrApiError(f"{what}：响应不是 dict（{str(resp)[:120]}）", status, resp)
+    if status >= 400:
+        # 401/403（鉴权失败）在 Kraken 可能回 {"error":"...","message":"..."} 而不是
+        # {"result":"error"}。**不在这里抛**，下游 `.get("openPositions")` 会得到 None →
+        # 空列表 → fail-open（把「读不到」当成「空仓」）。对抗审查 P0。
+        detail = (resp.get("error") or resp.get("message")
+                  or resp.get("errors") or resp)
+        raise KrApiError(f"{what}：HTTP {status} {str(detail)[:300]}", status, resp)
     if resp.get("result") == "error":
         errs = resp.get("errors") or []
         msg = "; ".join(str(e.get("message") or e) for e in errs) if errs \
@@ -40,8 +47,13 @@ class KrEndpoints:
 
     # ------------------------------------------------------------ private
     def account(self) -> dict:
-        resp, st = self.c.get_private(f"{API}/account")
-        return _raise_if_error(resp, st, "account")
+        """账户快照：端点名是 **/accounts（复数）**。
+
+        对抗审查 P0：旧代码调 `/account`（单数）→ 404，所有账户读取失败，
+        执行器 fail-closed 全程停手（不会错单，但系统完全不工作）。
+        """
+        resp, st = self.c.get_private(f"{API}/accounts")
+        return _raise_if_error(resp, st, "accounts")
 
     def openpositions(self) -> list:
         resp, st = self.c.get_private(f"{API}/openpositions")
@@ -51,9 +63,11 @@ class KrEndpoints:
         resp, st = self.c.get_private(f"{API}/openorders")
         return _raise_if_error(resp, st, "openorders").get("openOrders") or []
 
-    def fills(self, last_fill_time_ms: int = 0) -> list:
-        """成交分页：lastFillTime=上次最大 fillTime，交易所按时间递增返回。"""
-        params = {"lastFillTime": str(int(last_fill_time_ms))} if last_fill_time_ms else {}
+    def fills(self, last_fill_time: str | int | None = None) -> list:
+        """成交分页（官方语义）：不传 = 最近 100 条（带 realized_pnl）；
+        传 `lastFillTime`（原始 ISO 字符串）= 该时间**之前**的 100 条。
+        """
+        params = {"lastFillTime": str(last_fill_time)} if last_fill_time else {}
         resp, st = self.c.get_private(f"{API}/fills", params)
         return _raise_if_error(resp, st, "fills").get("fills") or []
 
@@ -62,11 +76,14 @@ class KrEndpoints:
         return _raise_if_error(resp, st, "sendorder")
 
     def cancelorder(self, order_id: str) -> dict:
-        resp, st = self.c.post(f"{API}/cancelorder", {"orderId": str(order_id)})
+        """撤单：新版参数名是 `order_id`（旧代码传 orderId → 交易所不认，撤单静默失败）。"""
+        resp, st = self.c.post(f"{API}/cancelorder", {"order_id": str(order_id)})
         return _raise_if_error(resp, st, "cancelorder")
 
-    def cancelallorders(self) -> dict:
-        resp, st = self.c.post(f"{API}/cancelallorders", {})
+    def cancelallorders(self, symbol: str = "") -> dict:
+        """撤全部挂单；带 symbol 时只撤该合约（Kraken 支持 per-symbol 撤单）。"""
+        params = {"symbol": symbol} if symbol else {}
+        resp, st = self.c.post(f"{API}/cancelallorders", params)
         return _raise_if_error(resp, st, "cancelallorders")
 
     # ------------------------------------------------------------ public

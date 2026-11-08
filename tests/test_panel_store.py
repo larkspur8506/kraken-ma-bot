@@ -356,11 +356,16 @@ class TestWiring(unittest.TestCase):
             self.assertEqual(r.status_code, 200)
             self.assertGreaterEqual(self.info.snapshots, 1, "没有快照时必须回落实时读取")
 
-    def test_capture_without_address_returns_false(self):
+    def test_capture_without_address_still_works(self):
+        """Kraken 无钱包地址概念：address 为空也照常落快照（venue_address_free）。
+
+        HL 版靠 address 门卫挡「公开主网数据误导成自己账户」；Kraken 的会话凭据
+        就是账户本身，没有这个歧义，拦住反而让面板永远读不到快照。
+        """
         os.environ.pop("HL_ACCOUNT_ADDRESS", None)
         self.mod = importlib.reload(importlib.import_module("app.main"))
-        self.assertFalse(self.mod.capture_panel_snapshot("tick", with_why=True))
-        self.assertIsNone(self.mod.panel_snapshot_store().latest())
+        self.assertTrue(self.mod.capture_panel_snapshot("tick", with_why=False))
+        self.assertIsNotNone(self.mod.panel_snapshot_store().latest())
 
     def test_capture_swallows_exchange_errors(self):
         class Boom(CountingHlInfo):

@@ -253,7 +253,7 @@ def fmt_entry_alert(coin: str, side: int, sz: float, entry_px: float, stop: floa
     stop_pct = ((stop - entry_px) / entry_px * 100) if entry_px else 0.0
     pct = (risk_u / equity * 100) if equity else 0.0
     return "\n".join([
-        f"【HL执行】✅ 已开仓 · {coin} {_side_word(side)} {leverage:g}x 逐仓",
+        f"【Kraken】✅ 已开仓 · {coin} {_side_word(side)} {leverage:g}x 逐仓",
         "",
         f"成交价    {_fmt_u(entry_px)}",
         f"数量      {sz:g} {coin}（名义 {_fmt_u(notional, 1)} U）",
@@ -293,7 +293,7 @@ def fmt_exit_alert(coin: str, side: int, entry_px: float, exit_px: float, sz: fl
     except (TypeError, ValueError):
         pass
     lines = [
-        f"【HL执行】{head} · {coin} {_side_word(side)}",
+        f"【Kraken】{head} · {coin} {_side_word(side)}",
         "",
         f"离场原因  {why}",
         f"平仓价    {_fmt_u(exit_px)}（开仓 {_fmt_u(entry_px)}）",
@@ -462,11 +462,11 @@ class _RoundNote:
         if self.kind != "autoclear":                             # pragma: no cover
             return ""
         if not kill:
-            return (f"【HL执行】✅ 已自动恢复自动交易（对账连续 {n} 轮正常，"
+            return (f"【Kraken】✅ 已自动恢复自动交易（对账连续 {n} 轮正常，"
                     f"此前的对账异常已自动消化）")
         # 本轮后面又被别的判据要求停手（回撤熔断 / 当日亏损）：停手优先，
         # 但必须说清「对账这条线已经没事了」，而不是让用户以为对账还在异常。
-        return (f"【HL执行】ℹ️ 对账异常已收敛（连续 {n} 轮正常），"
+        return (f"【Kraken】ℹ️ 对账异常已收敛（连续 {n} 轮正常），"
                 f"但{reason or '其它保护'}仍要求停手 → 自动交易仍处暂停，未解除。")
 
 
@@ -566,7 +566,7 @@ class Executor:
         c = self._coin_or_none(symbol)
         if c is None:
             raise registry.SymbolNotConfigured(
-                f"未配置 HL coin 映射：{symbol}（不在注册表 symbol_registry / executor coin_map）")
+                f"未配置 Kraken 合约映射：{symbol}（不在注册表 symbol_registry / executor coin_map）")
         return c
 
     def _alert_fill(self, text: str) -> None:
@@ -677,7 +677,7 @@ class Executor:
             # → 记成问题（fail-closed，走既有告警/停手口径），但不抛异常打断整轮对账。
             coin = self._coin_or_none(r["symbol"])
             if coin is None:
-                problems.append(f"未配置 HL coin 映射：{r['symbol']}（本地仓 #{r['id']}，无法对账）")
+                problems.append(f"未配置 Kraken 合约映射：{r['symbol']}（本地仓 #{r['id']}，无法对账）")
                 continue
             seen.add(coin)
             if coin not in ex_pos:
@@ -1089,7 +1089,7 @@ class Executor:
                         symbol=symbol, data={"pid": pid, "grace_s": grace_s})
             # 只在这一支推送（同一仓第二次进来 rounds>0，不会再走到这里）：
             # 用户需要知道「交易已经平了、账在核对中」，而不是从面板自己去猜状态词。
-            self._alert(f"【HL执行】⏳ {symbol} 已探测到交易所无仓，平仓成交待核对 —— "
+            self._alert(f"【Kraken】⏳ {symbol} 已探测到交易所无仓，平仓成交待核对 —— "
                         f"已进入宽限（最多 {int(grace_s // 60)} 分钟，自动重试；"
                         f"期间该标的暂不开新仓）")
             return {"position_id": pid, "symbol": symbol, "first_seen": now,
@@ -1282,12 +1282,12 @@ class Executor:
             failed.append(f"{oid}（{err}）")
 
         if failed:
-            self._alert(f"【HL执行】⚠️ {symbol} 已在交易所被平仓（人工/外部），"
+            self._alert(f"【Kraken】⚠️ {symbol} 已在交易所被平仓（人工/外部），"
                         f"但残留的 reduce-only 止损单撤不掉：{'；'.join(failed)}。"
                         f"该单若仍在场上，下次开仓可能被它平掉 —— 请到 HL 手动撤单并核对。",
                         symbol=symbol)
         elif scan_failed:
-            self._alert(f"【HL执行】⚠️ {symbol} 已按成交价关账，但挂单表读取失败"
+            self._alert(f"【Kraken】⚠️ {symbol} 已按成交价关账，但挂单表读取失败"
                         f"（{scan_failed[:120]}），无法确认是否还残留 reduce-only 止损单 —— "
                         f"请到 HL 看一眼挂单。", symbol=symbol)
 
@@ -1302,6 +1302,18 @@ class Executor:
             return bucket
         except TypeError:            # 桩/带 __slots__ 的实现不可弱引用：退化成不缓存
             return None
+
+    def _round_px(self, coin: str, px: float, sz_dec: int) -> float:
+        """价格取整：venue 自带 `round_price`（Kraken 按 tickSize）优先，否则 HL 规则。
+
+        对抗审查 P0：Kraken 的 PF_XBTUSD tick=1，HL 的「≤5 位有效数字」规则会产出
+        `75798.3` 这类非 tick 整数倍价格 → 交易所 `invalidPrice` 全拒（开仓/止损都挂不上）。
+        Kraken 的 KrInfo.round_price 读不到 tick 时抛错 —— 宁可拒单也不发非法价。
+        """
+        fn = getattr(self.info, "round_price", None)
+        if callable(fn):
+            return float(fn(coin, px))
+        return hl_sizing.round_price(px, sz_dec)
 
     def _size_tick(self, coin: str) -> Optional[float]:
         """该合约 1 tick 的数量（10^-szDecimals）。读不到规格返回 None → 由调用方跳过。
@@ -1732,7 +1744,7 @@ class Executor:
                     symbol=symbol,
                     data={"coin": coin, "side": int(side or 1), "hits": n, "limit": limit,
                           "window_s": CHURN_WINDOW_S})
-        self._alert(f"【HL执行】⚠️ {coin} {side_word} 撤单/重挂过于频繁"
+        self._alert(f"【Kraken】⚠️ {coin} {side_word} 撤单/重挂过于频繁"
                     f"（10 分钟内 {n} 次，阈值 {limit}）—— 已暂停该标的的修复类动作"
                     f"（补挂/复价），等 10 分钟窗口滑出后自动恢复。\n"
                     f"平仓与首次止损挂单不受影响；kill 未置位（这不是对账异常）。"
@@ -1816,8 +1828,8 @@ class Executor:
         # 映射缺失 → 不知道交易所上的标的，**绝不动交易所**（补挂/平仓都不做），只提示
         coin = self._coin_or_none(symbol)
         if coin is None:
-            self._event(EV_ERROR, f"未配置 HL coin 映射：{symbol}，不自动补挂止损", symbol=symbol)
-            self._alert(f"【HL执行】⛔ {symbol} 未配置 HL coin 映射，无法自动补挂止损/平仓"
+            self._event(EV_ERROR, f"未配置 Kraken 合约映射：{symbol}，不自动补挂止损", symbol=symbol)
+            self._alert(f"【Kraken】⛔ {symbol} 未配置 Kraken 合约映射，无法自动补挂止损/平仓"
                         f"（fail-closed）—— 请人工核对交易所并处理。")
             return
         bar_ms = int(row.get("signal_bar_ms") or 0)
@@ -1828,7 +1840,7 @@ class Executor:
         if not self.p.live:
             self._event(EV_ERROR, f"dry 模式：{symbol} 止损缺失，不动交易所，仅提示",
                         symbol=symbol)
-            self._alert(f"【HL执行】⚠️ {coin} 交易所仓位缺止损单，但执行器不是 live 模式，"
+            self._alert(f"【Kraken】⚠️ {coin} 交易所仓位缺止损单，但执行器不是 live 模式，"
                         f"未自动处理 —— 请人工查看并处理。")
             return
         stop = float(row.get("stop_price") or 0.0)
@@ -1839,14 +1851,14 @@ class Executor:
         if stop <= 0 or sz <= 0:
             self._event(EV_ERROR, f"{symbol} 止损丢失且参数不全（stop={stop} sz={sz}），未动作",
                         symbol=symbol)
-            self._alert(f"【HL执行】🛑 {coin} 止损单丢失，但本地缺少止损价/数量，**未能自动处理**，"
+            self._alert(f"【Kraken】🛑 {coin} 止损单丢失，但本地缺少止损价/数量，**未能自动处理**，"
                         f"请立刻人工查看交易所持仓！")
             return
         try:
             sz_dec = int((self.info.specs([coin]).get(coin) or {}).get("sz_decimals", 5))
         except HlInfoError:
             sz_dec = 5
-        px = hl_sizing.round_price(stop, sz_dec)
+        px = self._round_px(coin, stop, sz_dec)
         # 闸门（PR-4）：修复类补挂是「重复动作」，要过静置 + churn。
         #   静置（成交回报后 15s）→ **只延迟**，绝不升级成平仓：刚成交那 15s 里
         #   「补挂」与「已挂好但快照还没刷新」无法区分，据此平仓等于每笔成交都平一次。
@@ -1876,7 +1888,7 @@ class Executor:
                                     oid=res.get("oid"), error=None)
             self.db.set_pos_hl(int(row["id"]), hl_stop_oid=res.get("oid"))
             self._event(EV_ORDER, f"{symbol} 止损丢失 → 已自动补挂 @ {px:,.2f}", symbol=symbol)
-            self._alert(f"【HL执行】🔧 {coin} 止损单丢失，已自动补挂（原价 {px:,.2f}，"
+            self._alert(f"【Kraken】🔧 {coin} 止损单丢失，已自动补挂（原价 {px:,.2f}，"
                         f"新单号 {res.get('oid')}，{sz} {coin}）。自动交易已暂停（kill），"
                         f"核对后可恢复。")
             return
@@ -1884,7 +1896,7 @@ class Executor:
         self._event(EV_ERROR, f"{symbol} 止损补挂失败（{res.get('error')}）→ 立即平仓",
                     symbol=symbol, data={"place": res})
         try:
-            limit_px = hl_sizing.round_price(self.ex.slippage_limit(coin, side != 1), sz_dec)
+            limit_px = self._round_px(coin, self.ex.slippage_limit(coin, side != 1), sz_dec)
         except Exception as ex:                                     # noqa: BLE001
             limit_px = float((snap.get("positions") or [{}])[0].get("mark_px") or px)
             logger.warning("[hl-exec] 平仓限价计算失败（用标价）：%s", ex)
@@ -1896,7 +1908,7 @@ class Executor:
         if ok_close:
             self._close_local(int(row["id"]), float(close.get("avg_px") or limit_px),
                               "stop_missing", sz)
-        self._alert(f"【HL执行】🛑 {coin} 止损单丢失且补挂失败（{res.get('error')}），"
+        self._alert(f"【Kraken】🛑 {coin} 止损单丢失且补挂失败（{res.get('error')}），"
                     f"已{'市价平仓' if ok_close else '尝试平仓但结果异常'}（{close.get('status')}）。"
                     f"**请立刻人工核对交易所**！")
 
@@ -1929,7 +1941,7 @@ class Executor:
         #    没有映射就没法定位交易所标的，影子模式也不能静默走「猜一个前缀」的旧路。
         coin = self._coin_or_none(symbol)
         if coin is None:
-            bad.append(f"未配置 HL coin 映射：{symbol}（拒绝开仓）")
+            bad.append(f"未配置 Kraken 合约映射：{symbol}（拒绝开仓）")
         # 宽限期（closing）：同标的有「平仓成交待核对」的行 → 直接拦，不依赖仓位槽。
         # 理由：那一笔的成交还没归属确定，此时再开一笔同标的的仓，两边成交在
         # (coin, 时间窗) 上就混在一起了 —— 关账会归错仓、数量对账也会来回抖。
@@ -2053,8 +2065,8 @@ class Executor:
         if coin is None:
             self.db.hl_record_intent(symbol, symbol, bar_ms, PURPOSE_ENTRY, side, 0.0,
                                      status=ST_SKIPPED)
-            self._event(EV_ERROR, f"未配置 HL coin 映射：{symbol}，拒绝开仓", symbol=symbol)
-            self._alert(f"【HL执行】⛔ {symbol} 未配置 HL coin 映射，**拒绝开仓**"
+            self._event(EV_ERROR, f"未配置 Kraken 合约映射：{symbol}，拒绝开仓", symbol=symbol)
+            self._alert(f"【Kraken】⛔ {symbol} 未配置 Kraken 合约映射，**拒绝开仓**"
                         f"（fail-closed：无法定位交易所标的，绝不猜合约名）。"
                         f"请到 app/symbol_registry.py 登记该标的。")
             return True
@@ -2075,7 +2087,7 @@ class Executor:
                 # live 下不能回落人工卡：人工卡按配置 equity（1000U）算金额，与
                 # 真实账户差一个数量级，照着下单就是风险放大（审计三轮 P1-H5）。
                 # 已接管 → 引擎只补推这条告警（有 alert_logs 补推兜底）。
-                self._alert(f"【HL执行】⚠️ {coin} 信号到达但读不到账户快照，本轮**未下单**。"
+                self._alert(f"【Kraken】⚠️ {coin} 信号到达但读不到账户快照，本轮**未下单**。"
                             f"这笔信号不会自动重试（占用的仓位槽约 8 小时后自动释放）。")
                 return True
             return False
@@ -2086,7 +2098,7 @@ class Executor:
         except HlInfoError as e:
             self._event(EV_ERROR, f"读不到合约规格，放弃开仓：{e}", symbol=symbol)
             if self.p.live:
-                self._alert(f"【HL执行】⚠️ {coin} 信号到达但读不到合约规格，本轮**未下单**。"
+                self._alert(f"【Kraken】⚠️ {coin} 信号到达但读不到合约规格，本轮**未下单**。"
                             f"这笔信号不会自动重试（占用的仓位槽约 8 小时后自动释放）。")
                 return True
             return False
@@ -2097,14 +2109,14 @@ class Executor:
         except Exception as e:                                       # noqa: BLE001
             self._event(EV_ERROR, f"取不到 {coin} mid，放弃开仓：{e}", symbol=symbol)
             if self.p.live:
-                self._alert(f"【HL执行】⚠️ {coin} 信号到达但取不到行情，本轮**未下单**。"
+                self._alert(f"【Kraken】⚠️ {coin} 信号到达但取不到行情，本轮**未下单**。"
                             f"这笔信号不会自动重试（占用的仓位槽约 8 小时后自动释放）。")
                 return True
             return False
         if mid <= 0:
             self._event(EV_ERROR, f"{coin} mid 非法（{mid}），放弃开仓", symbol=symbol)
             if self.p.live:
-                self._alert(f"【HL执行】⚠️ {coin} 信号到达但行情非法，本轮**未下单**。"
+                self._alert(f"【Kraken】⚠️ {coin} 信号到达但行情非法，本轮**未下单**。"
                             f"这笔信号不会自动重试（占用的仓位槽约 8 小时后自动释放）。")
                 return True
             return False
@@ -2127,12 +2139,12 @@ class Executor:
             self._event(EV_DECISION, "开仓被闸门拒绝：" + "；".join(gates), symbol=symbol,
                         data={"plan": plan.__dict__})
             if self.p.live:
-                self._alert(f"【HL执行】{coin} 信号被闸门拒绝（未下单）：\n- " + "\n- ".join(gates))
+                self._alert(f"【Kraken】{coin} 信号被闸门拒绝（未下单）：\n- " + "\n- ".join(gates))
             else:
                 # dry 影子也必须把「实盘会被拒」说出来（2026-10-30 复审 P3）：静默吞掉
                 # 会让影子期误以为这笔放行了。不发人工卡是有意的——实盘同样被拒，
                 # 没有可执行的人工动作。
-                self._alert(f"【HL影子】{coin} 若为实盘，开仓会被闸门拒绝：\n- "
+                self._alert(f"【Kraken影子】{coin} 若为实盘，开仓会被闸门拒绝：\n- "
                             + "\n- ".join(gates) + "\n（dry 模式：未下任何单）")
             return True
 
@@ -2150,7 +2162,7 @@ class Executor:
             # 关键：dry 必须返回 False，让引擎照常发人工操作卡 ——
             # 否则信号被静默吞掉，仓位停在 pending 占住该标的的槽，影子期反而没有可比对的人工动作。
             self._alert("\n".join([
-                f"【HL影子】{coin} 若为实盘会开仓 {plan.sz} {coin} @~{mid:,.1f}",
+                f"【Kraken影子】{coin} 若为实盘会开仓 {plan.sz} {coin} @~{mid:,.1f}",
                 f"止损 {stop:,.1f}（{plan.stop_dist * 100:.2f}%）｜风险 {plan.risk_u:.1f}U｜"
                 f"名义 {plan.notional:,.0f}U｜杠杆 {plan.leverage:g}x",
                 "（dry 模式：未下任何单，下面的人工提醒照常）",
@@ -2164,8 +2176,7 @@ class Executor:
 
         # 2) 入场 IOC 限价
         try:
-            limit_px = hl_sizing.round_price(self.ex.slippage_limit(coin, side == 1, mid),
-                                             sz_decimals)
+            limit_px = self._round_px(coin, self.ex.slippage_limit(coin, side == 1, mid), sz_decimals)
         except Exception as e:                                       # noqa: BLE001
             return self._entry_failed(symbol, bar_ms, f"计算限价失败：{e}")
         res = self.ex.place_order(coin, side == 1, plan.sz, limit_px,
@@ -2192,8 +2203,8 @@ class Executor:
         #    闸门：这是 ACT_STOP_FIRST（放行清单）——**首张止损单永不过闸**：
         #    它出现的那一刻仓位已经成交、还没有任何保护，任何延迟都是裸仓窗口。
         stop_res = self.ex.place_order(coin, side != 1, filled_sz,
-                                       hl_sizing.round_price(stop, sz_decimals),
-                                       reduce_only=True, trigger_px=hl_sizing.round_price(stop, sz_decimals),
+                                       self._round_px(coin, stop, sz_decimals),
+                                       reduce_only=True, trigger_px=self._round_px(coin, stop, sz_decimals),
                                        cloid=self.ex._cloid(symbol, bar_ms, PURPOSE_STOP))
         self.db.hl_record_intent(symbol, coin, bar_ms, PURPOSE_STOP, side, filled_sz,
                                  px=stop, reduce_only=True, status=ST_SENT,
@@ -2204,13 +2215,12 @@ class Executor:
             # 没有保护的仓位不允许存在 → 立刻平掉。
             # 平仓限价必须按**平仓方向**算滑点（side != 1），不能用上面开仓方向的 limit_px
             try:
-                close_px = hl_sizing.round_price(
-                    self.ex.slippage_limit(coin, side != 1, mid), sz_decimals)
+                close_px = self._round_px(coin, self.ex.slippage_limit(coin, side != 1, mid), sz_decimals)
             except Exception:                                        # noqa: BLE001
                 close_px = limit_px
             close = self.ex.place_order(coin, side != 1, filled_sz, close_px, reduce_only=True)
             closed_ok = bool(close.get("ok")) and close.get("status") == STATUS_FILLED
-            msg = (f"【HL执行】⚠️ {coin} 止损单挂失败（{stop_res['error']}），"
+            msg = (f"【Kraken】⚠️ {coin} 止损单挂失败（{stop_res['error']}），"
                    + ("已立即平仓" if closed_ok else f"平仓未确认（{close.get('status')}）——仓位可能仍在交易所")
                    + "。本次未持仓，请人工核对。")
             self._event(EV_ERROR, f"止损挂单失败 → 立即平仓：{stop_res['error']}",
@@ -2303,7 +2313,7 @@ class Executor:
                                error=str(msg)[:300])
         self._event(EV_ERROR, f"开仓失败：{msg}", symbol=symbol)
         if self.p.live:
-            self._alert(f"【HL执行】⚠️ {coin} 开仓失败：{msg}")
+            self._alert(f"【Kraken】⚠️ {coin} 开仓失败：{msg}")
         return True
 
     # ------------------------------------------------------------ 离场
@@ -2341,8 +2351,8 @@ class Executor:
         # 而不是拿一个猜出来的合约名去平仓/撤单（可能平错标的）。
         coin = self._coin_or_none(symbol)
         if coin is None:
-            self._event(EV_ERROR, f"未配置 HL coin 映射：{symbol}，不自动离场", symbol=symbol)
-            self._alert(f"【HL执行】⛔ {symbol} 未配置 HL coin 映射，无法自动平仓/撤单"
+            self._event(EV_ERROR, f"未配置 Kraken 合约映射：{symbol}，不自动离场", symbol=symbol)
+            self._alert(f"【Kraken】⛔ {symbol} 未配置 Kraken 合约映射，无法自动平仓/撤单"
                         f"（fail-closed）—— 请人工核对交易所并处理。")
             return False
         bar_ms = int(row["signal_bar_ms"])
@@ -2372,12 +2382,12 @@ class Executor:
                 self._event(EV_DECISION,
                             f"{symbol} 止损离场：交易所已无该仓，成交价核对中（宽限内自动重试）",
                             symbol=symbol)
-                self._alert(f"【HL执行】ℹ️ {coin} 交易所已无该仓，成交价核对中"
+                self._alert(f"【Kraken】ℹ️ {coin} 交易所已无该仓，成交价核对中"
                             f"（宽限内自动重试），无需人工操作")
                 return True
             self._close_local(position_id, px or ref_price, "stop", sz)
             r = self._r_multiple(row, px or ref_price)
-            self._alert(f"【HL执行】🛑 止损离场 · {coin} {'做多' if side == 1 else '做空'}\n"
+            self._alert(f"【Kraken】🛑 止损离场 · {coin} {'做多' if side == 1 else '做空'}\n"
                         f"止损单已由交易所触发 @ {px or ref_price:,.2f}，本地已关账（R {r:+.2f}）")
             return True
         if reason == "stop" and snap is None:
@@ -2389,7 +2399,7 @@ class Executor:
             # 本地关账后就没人管它了。只提醒，留给下一轮/人工。
             self._event(EV_ERROR, f"{symbol} 止损事件但快照不可读，未关账（下一轮再核对）",
                         symbol=symbol)
-            self._alert(f"【HL执行】⚠️ {coin} 判定止损离场，但账户快照读取失败，"
+            self._alert(f"【Kraken】⚠️ {coin} 判定止损离场，但账户快照读取失败，"
                         f"本地暂未关账 —— 请人工核对交易所。")
             return True
 
@@ -2406,7 +2416,7 @@ class Executor:
             # 真实仓位在交易所、执行器却不是 live：绝不能替引擎把本地关账（会造成本地/交易所不一致），
             # 交给人工，并且必须喊出来。
             self._event(EV_DECISION, f"dry 模式：不代平真实仓位 {symbol}（{reason}）", symbol=symbol)
-            self._alert(f"【HL执行】⚠️ {coin} 触发离场（{reason}）但执行器不是 live 模式，"
+            self._alert(f"【Kraken】⚠️ {coin} 触发离场（{reason}）但执行器不是 live 模式，"
                         f"交易所仍有真实仓位 —— 请人工平仓并撤掉止损单")
             return True
 
@@ -2446,14 +2456,14 @@ class Executor:
             sz = abs(float(ex_pos.get(coin, {}).get("size") or 0.0))
         if sz <= 0:
             self._event(EV_ERROR, f"{symbol} 离场时无法确定持仓量，跳过（请人工处理）", symbol=symbol)
-            self._alert(f"【HL执行】⚠️ {coin} 离场异常：交易所查不到该仓位，已跳过，请人工核对")
+            self._alert(f"【Kraken】⚠️ {coin} 离场异常：交易所查不到该仓位，已跳过，请人工核对")
             return True
         try:
             sz_dec = int((self.info.specs([coin]).get(coin) or {}).get("sz_decimals", 5))
         except HlInfoError:
             sz_dec = 5
         try:
-            limit_px = hl_sizing.round_price(self.ex.slippage_limit(coin, side != 1), sz_dec)
+            limit_px = self._round_px(coin, self.ex.slippage_limit(coin, side != 1), sz_dec)
         except Exception as e:                                       # noqa: BLE001
             limit_px = ref_price
             self._event(EV_ERROR, f"平仓限价计算失败（用参考价）：{e}", symbol=symbol)
@@ -2469,7 +2479,7 @@ class Executor:
             self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FAILED,
                                     error=str(res.get("error"))[:300])
             self._event(EV_ERROR, f"平仓失败：{res['error']}", symbol=symbol)
-            self._alert(f"【HL执行】⚠️ {coin} 平仓失败：{res['error']}\n"
+            self._alert(f"【Kraken】⚠️ {coin} 平仓失败：{res['error']}\n"
                         f"（止损单已撤！请立即人工平仓或手动挂回止损）")
             return True
         if res["status"] != STATUS_FILLED:
@@ -2483,7 +2493,7 @@ class Executor:
             # 重挂止损用独立 purpose（exit:rehang）：与开仓止损（stop@入场bar）、
             # 事后补挂（stop:fix）都不同源 —— HL 的 cloid 账户级永久唯一，
             # 复用任何一个都会被拒单，重挂失败=仓位裸奔。
-            re_stop_px = hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec)
+            re_stop_px = self._round_px(coin, float(row["actual_stop"] or row["stop_price"]), sz_dec)
             rehang_cloid = self._attempt_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG)
             # 闸门（PR-4）：重挂止损是「replace」，要过 churn（不过静置 —— 上面已经
             # 撤掉了止损，这里再等 15s 就是纯裸仓）。熔断时**不重挂**，直接落到下面
@@ -2507,14 +2517,14 @@ class Executor:
             if re_ok:
                 self._event(EV_ERROR, f"{symbol} 平仓未成交（resting），已撤单并重挂止损"
                                       f"（{re_stop.get('status')} @ {re_stop_px:,.2f}）", symbol=symbol)
-                self._alert(f"【HL执行】⚠️ {coin} 平仓单未成交（已撤）。"
+                self._alert(f"【Kraken】⚠️ {coin} 平仓单未成交（已撤）。"
                             f"止损单已重新挂回 @ {re_stop_px:,.2f}。请人工核对并处理。")
                 return True
             # 重挂失败 → 不允许无保护持仓存在 → 立即市价平掉（与开仓挂止损失败同一口径）
             self._event(EV_ERROR, f"{symbol} 平仓未成交且止损重挂失败"
                                   f"（{re_stop.get('error')}）→ 立即平仓", symbol=symbol)
             try:
-                close_px = hl_sizing.round_price(self.ex.slippage_limit(coin, side != 1), sz_dec)
+                close_px = self._round_px(coin, self.ex.slippage_limit(coin, side != 1), sz_dec)
             except Exception:                                        # noqa: BLE001
                 close_px = limit_px
             close = self.ex.place_order(coin, side != 1, sz, close_px, reduce_only=True)
@@ -2526,10 +2536,10 @@ class Executor:
                                         avg_px=px, raw=str(close.get("raw"))[:2000])
                 self._close_local(position_id, px, reason, sz)
                 r = self._r_multiple(row, px)
-                self._alert(f"【HL执行】⚠️ {coin} 平仓未成交、止损重挂失败，已市价平仓"
+                self._alert(f"【Kraken】⚠️ {coin} 平仓未成交、止损重挂失败，已市价平仓"
                             f" @ {px:,.2f}（R {r:+.2f}）。请人工核对。")
             else:
-                self._alert(f"【HL执行】🛑 {coin} 平仓未成交且止损重挂失败、市价平仓未确认"
+                self._alert(f"【Kraken】🛑 {coin} 平仓未成交且止损重挂失败、市价平仓未确认"
                             f"（{close.get('status')}）——仓位可能仍在交易所且无止损，"
                             f"请立即人工处理！")
             return True
@@ -2557,7 +2567,7 @@ class Executor:
                 sz_dec = int((self.info.specs([coin]).get(coin) or {}).get("sz_decimals", 5))
             except HlInfoError:
                 sz_dec = 5
-            re_px = hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec)
+            re_px = self._round_px(coin, float(row["actual_stop"] or row["stop_price"]), sz_dec)
             rehang_cloid = self._attempt_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG)
             # 闸门（PR-4）：部分成交后重挂剩余量止损，同样按 replace 过 churn。
             # 熔断时不重挂 → 落到下面的「重挂失败 → 市价平掉剩余量」（保护动作不过闸）。
@@ -2585,13 +2595,13 @@ class Executor:
             if re_ok:
                 self._event(EV_ERROR, f"{symbol} 部分成交后止损已按剩余量 {remain} 重挂",
                             symbol=symbol)
-                self._alert(f"【HL执行】⚠️ {coin} 平仓部分成交（{filled}/{sz}），剩余 {remain} "
+                self._alert(f"【Kraken】⚠️ {coin} 平仓部分成交（{filled}/{sz}），剩余 {remain} "
                             f"{coin} 已重挂止损 @ {re_px:,.2f}，本地保持持仓，下一轮继续离场。")
             else:
                 self._event(EV_ERROR, f"{symbol} 部分成交后止损重挂失败（{re_stop.get('error')}）"
                                       f" → 尝试市价平掉剩余量", symbol=symbol)
                 try:
-                    close_px2 = hl_sizing.round_price(self.ex.slippage_limit(coin, side != 1), sz_dec)
+                    close_px2 = self._round_px(coin, self.ex.slippage_limit(coin, side != 1), sz_dec)
                 except Exception:                                    # noqa: BLE001
                     close_px2 = limit_px
                 try:
@@ -2601,7 +2611,7 @@ class Executor:
                     close2 = {"ok": False, "status": "error",
                               "error": f"{type(ex).__name__}: {ex}"}
                 c2_ok = bool(close2.get("ok")) and close2.get("status") == STATUS_FILLED
-                self._alert(f"【HL执行】🛑 {coin} 平仓部分成交且剩余量止损重挂失败，"
+                self._alert(f"【Kraken】🛑 {coin} 平仓部分成交且剩余量止损重挂失败，"
                             f"已尝试市价平剩余 {remain}（{'成功' if c2_ok else '结果异常，请立即人工核对'}）。")
                 if c2_ok and float(close2.get("filled_sz") or 0) + 1e-12 >= remain:
                     px2 = float(close2.get("avg_px") or close_px2)
@@ -3037,7 +3047,7 @@ class Executor:
         if not self._dd_due(hl_dd.UNAVAIL_KEY, hl_dd.UNAVAIL_THROTTLE_S, now):
             return
         alerts.append((hl_dd.UNAVAIL_KEY,
-                       f"【HL执行】ℹ️ 回撤口径暂不可用（{reason}），本轮未做回撤判断；"
+                       f"【Kraken】ℹ️ 回撤口径暂不可用（{reason}），本轮未做回撤判断；"
                        f"当日亏损熔断同样未判（它也要本轮流水才算得准）。"
                        f"下一轮同步到流水后会立刻恢复。"))
 
@@ -3130,7 +3140,7 @@ class Executor:
     @staticmethod
     def _dd_warn_text(dd_pct: float, th: dict, equity: float, net_dep: float) -> str:
         """L2 文案：必须**说清当前动作**（L2 不停手），否则用户会以为已经停了。"""
-        return ("【HL执行】⚠️ 策略回撤 %.1f%%（≥ 告警线 %g%%）\n"
+        return ("【Kraken】⚠️ 策略回撤 %.1f%%（≥ 告警线 %g%%）\n"
                 "峰值以来最大回撤，当前权益 %s U，净入金 %s U。\n"
                 "已暂停开新仓吗？未暂停 —— 达 %g%% 会自动熔断（停开新仓，不平现有仓）。"
                 % (dd_pct * 100.0, th["warn"] * 100.0, f"{equity:,.2f}",
@@ -3140,7 +3150,7 @@ class Executor:
     def _dd_kill_text(dd_pct: float, th: dict, repeat: bool = False) -> str:
         head = ("🛑 回撤熔断仍在生效：策略回撤 %.1f%% ≥ 熔断线 %g%%" if repeat
                 else "🛑 回撤熔断：策略回撤 %.1f%% ≥ 熔断线 %g%%")
-        return ("【HL执行】" + (head % (dd_pct * 100.0, th["kill"] * 100.0)) +
+        return ("【Kraken】" + (head % (dd_pct * 100.0, th["kill"] * 100.0)) +
                 "\n已停止开新仓（持仓按既有规则离场，不强制平仓）。\n"
                 "请人工核对后到「开关」页解除。")
 
@@ -3306,7 +3316,7 @@ class Executor:
                     data={"neg_streak": streak, "rebuilt": bool(rebuilt),
                           "index": (rebuilt or {}).get("index")})
         alerts.append((hl_dd.STUCK_KEY,
-                       f"【HL执行】⚠️ 回撤口径卡死（连续 {streak} 轮算出负指数，"
+                       f"【Kraken】⚠️ 回撤口径卡死（连续 {streak} 轮算出负指数，"
                        f"通常是出入金流水缺了一笔或权益口径异常），"
                        f"{'已用锚点重放重建基线' if rebuilt else '锚点重放也失败（找不到正权益快照）'}，"
                        f"本轮未判回撤。请人工核对出入金流水与账户权益。"))
@@ -3530,7 +3540,7 @@ class Executor:
             # 「活着但读不到账户」会被误报成「执行器死了」。
             self._event(EV_HEARTBEAT, "executor 心跳（读不到账户快照，已降级）",
                         data={"kill": self.db.hl_kill(), "mode": self.p.mode, "degraded": True})
-            alerts.append("【HL执行】⚠️ 读不到 HL 账户快照（已连续重试），本轮跳过对账/熔断/成交同步。"
+            alerts.append("【Kraken】⚠️ 读不到 HL 账户快照（已连续重试），本轮跳过对账/熔断/成交同步。"
                           "若持续出现请检查网络或 HL 状态。")
             return alerts
 
@@ -3593,7 +3603,7 @@ class Executor:
                 # 现在把文案先放进 alerts（末尾统一 _alert，成功才落库记账），
                 # 节流键改为在 _alert 成功后由 pending_throttle 回写。
                 alerts.append(("hl_recon_alert_at",
-                               "【HL执行】⚠️ 对账异常（已暂停自动交易）：\n- " + "\n- ".join(problems)))
+                               "【Kraken】⚠️ 对账异常（已暂停自动交易）：\n- " + "\n- ".join(problems)))
             # 确认「有仓但没止损」→ 不允许无保护持仓存在：先补挂，补不上就市价平掉
             for row in rec.get("missing_stop") or []:
                 self._repair_missing_stop(row, snap, kill_before=kill_before)
@@ -3604,13 +3614,13 @@ class Executor:
                                  code_rev=self.p.code_rev)
             if str(self.db.get_config_str("hl_stop_unconfirmed") or "") != "1":
                 self.db.set_config("hl_stop_unconfirmed", "1")
-                alerts.append("【HL执行】⚠️ 无法确认止损（挂单接口临时回落）：\n- "
+                alerts.append("【Kraken】⚠️ 无法确认止损（挂单接口临时回落）：\n- "
                               + "\n- ".join(items)
                               + "\n未做任何动作。请看一眼面板/交易所；恢复后我会再报一次。")
         else:
             if str(self.db.get_config_str("hl_stop_unconfirmed") or "") == "1":
                 self.db.set_config("hl_stop_unconfirmed", "0")
-                alerts.append("【HL执行】✅ 挂单接口已恢复，止损状态可正常确认")
+                alerts.append("【Kraken】✅ 挂单接口已恢复，止损状态可正常确认")
             # 对账恢复正常：清掉告警节流标记（下次异常立即推送），并告知一次
             if float(self.db.get_config_str("hl_recon_alert_at") or 0) > 0:
                 self.db.set_config("hl_recon_alert_at", "0")
@@ -3618,7 +3628,7 @@ class Executor:
                 # 「对账已恢复正常」。problems 为空只说明「暂时没有矛盾」，不是「账已对上」：
                 # 对着一个还在等成交证据的仓说恢复，用户刚放心，下一刻就超时 kill。
                 if not rec.get("unconfirmed") and not rec.get("closing_pending"):
-                    alerts.append("【HL执行】✅ 对账已恢复正常")
+                    alerts.append("【Kraken】✅ 对账已恢复正常")
             # 数量对账处于「观察期」（首次超差、已回捞、未到两击）→ 不写「对账一致」：
             # 明明有未解释的数量差，日志说一致会误导事后复盘。
             # 宽限期（closing）同理：问题列表为空 ≠ 账已对上，它是「还在等证据」——
@@ -3698,7 +3708,7 @@ class Executor:
                     self._event(EV_KILL, f"当日亏损 {loss_rate * 100:.1f}% → kill",
                                 data={"start_equity": start_eq, "equity": now_eq,
                                       "flows": round(flow_today, 6), "base_ts": base_ts})
-                    alerts.append(f"【HL执行】⚠️ 当日亏损 {loss_rate * 100:.1f}%"
+                    alerts.append(f"【Kraken】⚠️ 当日亏损 {loss_rate * 100:.1f}%"
                                   f"（阈值 -{self.p.max_daily_loss_pct * 100:g}%）→ 已停止自动交易")
 
         # 3b) 回撤熔断（DD Guard，L2 告警 / L3 熔断）。判据 = **策略口径**峰谷回撤
@@ -3730,10 +3740,10 @@ class Executor:
             grace_note = ("（宽限期内已核对到成交，账已对上）" if fc.get("grace_ended") else "")
             if fc["reason"] == "stop":
                 r = self._r_multiple(pos_row, fc["px"]) if pos_row is not None else 0.0
-                alerts.append(f"【HL执行】🛑 止损已在交易所成交 · {fc['coin']} {_side_word(side)} "
+                alerts.append(f"【Kraken】🛑 止损已在交易所成交 · {fc['coin']} {_side_word(side)} "
                               f"@ {fc['px']:,.2f}，本地已按成交价关账（R {r:+.2f}），{tail}{grace_note}")
             else:
-                alerts.append(f"【HL执行】ℹ️ {fc['coin']} 已在交易所被平仓（人工/外部）"
+                alerts.append(f"【Kraken】ℹ️ {fc['coin']} 已在交易所被平仓（人工/外部）"
                               f"@ {fc['px']:,.2f}，本地已按成交价关账，{tail}{grace_note}")
 
         # 3d) 文案收尾（§4.5 中1）：本轮「待定文案」按**最终** kill 状态渲染。

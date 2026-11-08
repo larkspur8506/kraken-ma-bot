@@ -7,7 +7,7 @@
 (`app/symbol_registry.py`) 且**未配置即拦/报错**：
 
 - 行情层：env `HL_COIN_MAP` 覆盖 → 注册表 → 抛 `FeedError`（信息含
-  「未配置 HL coin 映射：{symbol}」），永不拼前缀。
+  「未配置 Kraken 合约映射：{symbol}」），永不拼前缀。
 - 执行层：executor coin_map（env/DB 覆盖）→ 注册表 → `SymbolNotConfigured`；
   入场路径有显性闸门（`_entry_gates`）拒绝开仓 + 落 skipped 意图 + 告警，
   且 dry 模式也不抛异常崩掉整轮 tick。
@@ -166,7 +166,7 @@ class TestMarketCoinFailClosed(unittest.TestCase):
     def test_unregistered_raises_instead_of_prefix(self):
         with self.assertRaises(FeedError) as ctx:
             market.hl_coin(FAKE)
-        self.assertIn("未配置 HL coin 映射", str(ctx.exception))
+        self.assertIn("未配置 Kraken 合约映射", str(ctx.exception))
         self.assertIn(FAKE, str(ctx.exception))
         # 旧行为是**无声返回** "1000PEPE"（split 兜底）；现在必须抛错而不是返回
         with self.assertRaises(FeedError):
@@ -190,7 +190,7 @@ class TestMarketCoinFailClosed(unittest.TestCase):
         try:
             with self.assertRaises(FeedError) as ctx:
                 market._hyperliquid(FAKE)
-            self.assertIn("未配置 HL coin 映射", str(ctx.exception))
+            self.assertIn("未配置 Kraken 合约映射", str(ctx.exception))
         finally:
             market._hl_post = saved
 
@@ -226,7 +226,7 @@ class TestExecutorCoinFailClosed(unittest.TestCase):
         ex = _executor()
         with self.assertRaises(SymbolNotConfigured) as ctx:
             ex.coin(FAKE)
-        self.assertIn("未配置 HL coin 映射", str(ctx.exception))
+        self.assertIn("未配置 Kraken 合约映射", str(ctx.exception))
         self.assertIn(FAKE, str(ctx.exception))
         # 旧行为会返回 "1000PEPE"（split 兜底）——现在必须是异常
         self.assertIn(FAKE, str(ctx.exception))
@@ -241,11 +241,11 @@ class TestExecutorCoinFailClosed(unittest.TestCase):
         ex = _executor()
         gates = ex._entry_gates(FAKE, _plan(), _FakeInfo().snapshot("0xabc"), equity=1000.0)
         self.assertTrue(gates, "未配置 coin 必须进闸门 bad 列表")
-        self.assertTrue(any("未配置 HL coin 映射" in g for g in gates), gates)
+        self.assertTrue(any("未配置 Kraken 合约映射" in g for g in gates), gates)
         self.assertTrue(any(FAKE in g for g in gates), gates)
         # 注册表内的标的照旧不报这条
         ok = ex._entry_gates("BTC_USDT", _plan(), _FakeInfo().snapshot("0xabc"), equity=1000.0)
-        self.assertEqual([g for g in ok if "未配置 HL coin 映射" in g], [])
+        self.assertEqual([g for g in ok if "未配置 Kraken 合约映射" in g], [])
 
     def _signal(self, db, symbol):
         return db.create_position(symbol=symbol, signal_bar_ms=1791912000000, side=1,
@@ -264,7 +264,7 @@ class TestExecutorCoinFailClosed(unittest.TestCase):
                 self.assertEqual(ex.ex.calls, [], "绝不能发出任何下单/杠杆请求")
                 msgs = ex.notifier.msgs
                 self.assertTrue(msgs, "必须告警")
-                self.assertIn("未配置 HL coin 映射", msgs[0])
+                self.assertIn("未配置 Kraken 合约映射", msgs[0])
                 self.assertIn(FAKE, msgs[0])
                 # 留痕：skipped 意图（不进入下单流程）
                 rows = [r for r in db.hl_recent_orders(20) if r["purpose"] == "entry"]
@@ -292,7 +292,7 @@ class TestExecutorCoinFailClosed(unittest.TestCase):
         ex = _executor(db=db)
         res = ex.reconcile()                               # 不抛
         self.assertFalse(res["ok"])
-        self.assertTrue(any("未配置 HL coin 映射" in p for p in res["problems"]), res["problems"])
+        self.assertTrue(any("未配置 Kraken 合约映射" in p for p in res["problems"]), res["problems"])
 
     def test_exit_does_not_take_over_when_coin_missing(self):
         db = _tmp_db()
@@ -304,7 +304,7 @@ class TestExecutorCoinFailClosed(unittest.TestCase):
         ex = _executor(db=db)
         self.assertFalse(ex.on_exit(1, "ma20", 81000.0), "解析不出 coin 就让出接管权（人工流）")
         self.assertEqual(ex.ex.calls, [], "绝不能拿猜的名字去平仓/撤单")
-        self.assertIn("未配置 HL coin 映射", ex.notifier.msgs[0])
+        self.assertIn("未配置 Kraken 合约映射", ex.notifier.msgs[0])
 
 
 if __name__ == "__main__":
