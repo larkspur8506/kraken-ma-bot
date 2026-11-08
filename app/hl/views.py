@@ -1007,19 +1007,25 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     # API 有效期（P3 R3）：状态条徽章的数据源。只读 hl_agent_state DB 缓存
     #（执行器每个整点刷新），面板渲染零网络调用；缺失/损坏一律空 dict → 徽章显「—」。
     agent_out: dict = {}
-    try:
-        from app.hl import agent as _agent_mod
-        st = _agent_mod.read_state(deps.db) if deps.db is not None else {}
-        st = st if isinstance(st, dict) else {}
-        lvl = str(st.get("level") or "")
-        if not lvl:
-            # 老 state 没有 level 字段时的兜底（有 until 就按毫秒重算），口径同 admin_ui.render_agent_card
-            lvl = (_agent_mod.level_ms(st.get("valid_until_ms"), st.get("checked_ms"))
-                   if st.get("valid_until_ms") else "unknown")
-        agent_out = {"days_left": _opt_int(st.get("days_left")), "level": lvl,
-                     "cleanup": str(st.get("cleanup") or "none")}
-    except Exception as e:                                            # noqa: BLE001
-        logger.warning("[hl-views] 读 API 有效期状态失败（徽章显 —）：%s", e)
+    if callable(getattr(getattr(deps, "info", None), "price_tick", None)):
+        # Kraken Derivatives API key 无到期概念，也没有代理钱包授权体系：
+        # 不读 HL 遗留的 hl_agent_state（那里的到期日会让徽章显示「169 天」）。
+        agent_out = {"days_left": None, "level": "no_expiry", "cleanup": "none",
+                     "source": "kraken-key-no-expiry"}
+    else:
+        try:
+            from app.hl import agent as _agent_mod
+            st = _agent_mod.read_state(deps.db) if deps.db is not None else {}
+            st = st if isinstance(st, dict) else {}
+            lvl = str(st.get("level") or "")
+            if not lvl:
+                # 老 state 没有 level 字段时的兜底（有 until 就按毫秒重算），口径同 admin_ui.render_agent_card
+                lvl = (_agent_mod.level_ms(st.get("valid_until_ms"), st.get("checked_ms"))
+                       if st.get("valid_until_ms") else "unknown")
+            agent_out = {"days_left": _opt_int(st.get("days_left")), "level": lvl,
+                         "cleanup": str(st.get("cleanup") or "none")}
+        except Exception as e:                                        # noqa: BLE001
+            logger.warning("[hl-views] 读 API 有效期状态失败（徽章显 —）：%s", e)
 
     # MR 腿状态块：JSON 与面板 HTML 共用（原来只挂在 /api/hl/status 里，面板看不到）
     mr_out: Optional[dict] = None
@@ -2265,7 +2271,7 @@ def _render_body(p: dict) -> str:
         # 只是载体不同 —— 窄屏隐藏列时由它补足，宽屏整个 <tr> 被 CSS 藏掉。
         o.append("<tr class='subm'><td colspan='13'>"
                  f"数量 {_fmt_sz(pos.get('size'))} · "
-                 f"杠杆 {_num(pos.get('leverage'), 1):.0f}x"
+                 f"{'全仓（Kraken 不做逐仓杠杆设置）' if not _opt_num(pos.get('leverage')) else '杠杆 %.0fx' % _num(pos.get('leverage'), 1)}"
                  f"{' 逐' if pos.get('isolated') else ''} · "
                  f"保证金 {_fmt(pos.get('margin_used'))} U · "
                  f"强平 {_fmt(pos.get('liq_px')) if _opt_num(pos.get('liq_px')) else '—'} · "
@@ -2326,14 +2332,14 @@ def _render_body(p: dict) -> str:
     if acc.get("unified") and wd <= 0:
         avail = max(_num(acc.get("spot_usdc")) - _num(acc.get("spot_hold")), 0.0)
         wd_html = f"{_fmt(avail)} U"
-        wd_title = "统一账户下的实际可提：现货余额扣除仓位/挂单占用的保证金"
+        wd_title = "可用保证金：扣掉持仓与挂单占用后还能用来开新仓的金额"
     else:
         wd_html = f"{_fmt(wd)} U"
         wd_title = ""
     wd_t = f" title='{_esc(wd_title)}'" if wd_title else ""
     o.append("<div class='acct-top'>"
-             f"<span>账户总值 <b>{_fmt(acc.get('equity'))} U</b></span>"
-             f"<span{wd_t}>可提余额 <b>{wd_html}</b></span></div>")
+             f"<span>账户权益 <b>{_fmt(acc.get('equity'))} U</b></span>"
+             f"<span{wd_t}>可用保证金 <b>{wd_html}</b></span></div>")
     o.append("<details class='acct-details'><summary>资金明细</summary>")
     o.append("<div class='acct-sub'>")
     o.append(_asub("钱包地址", _addr_text(acc.get("address"))))
@@ -2343,9 +2349,10 @@ def _render_body(p: dict) -> str:
     if acc.get("unified"):
         # 统一账户：资金分布在「现货」和「合约」两侧 —— 用人话一行说完。
         # 合约侧占用的就是已用保证金（同一个数），不再单列重复一列。
-        o.append(_asub("资金分布（统一账户）",
-                       f"现货 {_fmt(acc.get('spot_usdc'))} U · 合约占用 {_fmt(acc.get('margin_used'))} U",
-                       title="统一账户下资金分在现货与合约两侧；合约侧占用 = 已用保证金"))
+        # 衍生品钱包：不拆现货/合约两侧，只报「可用 / 已用保证金」。
+        o.append(_asub("保证金（独立衍生品）",
+                       f"可用 {_fmt(acc.get('spot_usdc'))} U · 已用 {_fmt(acc.get('margin_used'))} U",
+                       title="独立衍生品钱包：多币种抵押统一折算；已用 = 持仓与挂单占用的保证金"))
     if not acc.get("unified"):
         o.append(_asub("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
     o.append(_asub("持仓名义", f"{_fmt(acc.get('notional'))} U"))
@@ -2357,7 +2364,7 @@ def _render_body(p: dict) -> str:
     # 注脚（可见文字，iOS Safari 无 title 悬停）：账户相关数字的口径收口。
     # 「已实现」两行的 title 保留作桌面增强，这里给出手机唯一能看到的口径。
     o.append('<div class="legend">已实现为交易所口径，未扣手续费与资金费 · '
-             '可提 = 现货 − 仓位/挂单占用</div>')
+             '可用 = 权益 − 持仓/挂单占用</div>')
     o.append("</div>")
 
     # ---------------- 盈亏曲线（已剔除出入金）+ 收益指数 ----------------

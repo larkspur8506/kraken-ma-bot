@@ -2,7 +2,7 @@
 
 验收点逐条对应（2026-10-30 面板精简后：只剩 overview / records 两个页签）：
 - 未授权 401
-- 两个 Tab 各 200 且含关键区块串（账户总值 / 下单记录 …）
+- 两个 Tab 各 200 且含关键区块串（账户权益 / 下单记录 …）
 - 手机优先：无框架、无外部资源、零 JS、字号 ≥13px
 - 参数页/开关页及其 POST 端点已删除（一律 404/405，不设兼容层）
 - kill switch 往返（页面入口搬到总览页尾「管理」卡）
@@ -183,7 +183,7 @@ class TestAuth(BaseCase):
 
     def test_unknown_tab_falls_back_to_overview(self):
         html = self.body("/admin", tab="javascript:void(0)")
-        self.assertIn("账户总值", html)
+        self.assertIn("账户权益", html)
         self.assertIn("tab=overview", html)
 
     def test_admin_token_missing_is_500(self):
@@ -195,13 +195,13 @@ class TestAuth(BaseCase):
 class TestOverviewTab(BaseCase):
     def test_overview_200_with_key_blocks(self):
         html = self.body(tab="overview")
-        for s in ("账户总值", "盈亏曲线（已剔除出入金）", "仓位"):
+        for s in ("账户权益", "盈亏曲线（已剔除出入金）", "仓位"):
             self.assertIn(s, html)
         # 本 fixture 的快照没带 orders_trusted（挂单不可信）→ P3 R1 fail-open：
         # 判不清就照常渲染挂单表（正常态 0 处的两态断言在 tests/test_panel_p3.py）
         self.assertIn("交易所挂单", html)
         # 2026-10-19：状态卡在总览末尾；P3 R3 降级为 <details>（默认收起）
-        self.assertIn("<summary>API 有效期</summary>", html)
+        self.assertIn("<summary>API 状态</summary>", html)
         # 2026-10-15 用户反馈：总览与「记录」页的执行器事件表完全重复 → 总览移除
         self.assertNotIn("执行器事件", html)
         # 2026-10-18 同一类操作：下单记录 / 最近成交 / 信号 三张历史表迁到「记录」页
@@ -216,7 +216,7 @@ class TestOverviewTab(BaseCase):
                      "<h2>盈亏曲线（已剔除出入金）</h2>"):
             self.assertIn(keep, html, f"总览缺少当下块：{keep}")
         # P3 R2：对账/熔断两行从「系统」（现「执行器」）卡删除 —— 状态条徽章是唯一出处
-        self.assertIn("<summary>API 有效期</summary>", html)
+        self.assertIn("<summary>API 状态</summary>", html)
         # 三标的动态（用户钉死在 tabs 之后第一块）仍在
         self.assertIn("三标的动态", html)
 

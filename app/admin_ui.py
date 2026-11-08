@@ -604,7 +604,7 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
             f"<div class='hint'>{_esc(head)}</div>"
             + _table("<th>时间</th><th>类型</th><th class='num'>金额</th>"
                      "<th class='num'>余额</th><th class='num'>关联单</th><th>备注</th>",
-                     rows_html, "暂无流水（等首次同步，或执行器未配置 HL 账户）", 6)
+                     rows_html, "暂无流水（等首次同步，或执行器未配置 API key）", 6)
             + "<div class='legend'>余额 = 自账户 0 起累计（全量正序累加后再取当前页）· "
               "成交行金额 = 平仓盈亏 − 手续费 · 资金费正 = 收入 · 关联单 #N = 归集到的仓位 · "
               "同日多条资金费合并为一行（金额=全天合计），逐条明细见「全部」子页</div>"
@@ -1464,7 +1464,7 @@ _LEVEL_CLS = {"ok": "pos", "near": "warn", "urgent": "neg", "cleanup": "neg",
 
 
 def _agent_source_txt(src: str) -> str:
-    return {"api": "HL 授权接口", "manual": "手工兜底", "none": ""}.get(str(src or ""), "")
+    return {"api": "面板录入", "manual": "手工兜底", "none": ""}.get(str(src or ""), "")
 
 
 def render_agent_card(deps: AdminDeps) -> str:
@@ -1525,7 +1525,7 @@ def render_agent_card(deps: AdminDeps) -> str:
     addr = agent_mod.mask_addr(state.get("address"))
     src = _agent_source_txt(str(state.get("source") or ""))
     if level == "no_expiry":
-        until_txt = "不限期（HL 授权没设到期）"
+        until_txt = "不限期（Kraken API 无到期）"
         left_txt = "不会到期"
     elif until:
         until_txt = agent_mod.fmt_bj(until)
@@ -1550,7 +1550,7 @@ def render_agent_card(deps: AdminDeps) -> str:
     if ((days_i is not None and days_i <= agent_mod.THRESH_NEAR)
             or level in ("cleanup", "expired")):
         open_attr = " open"
-    o.append(f"<details class='card agent-card'{open_attr}><summary>API 有效期</summary>")
+    o.append(f"<details class='card agent-card'{open_attr}><summary>API 状态</summary>")
     o.append("<div class='grid'>")
     o.append(_kv("代理钱包地址", f"<span class='mono'>{_esc(addr)}</span>",
                  title="执行器用来签名的 API 钱包（不是主钱包地址）"))
@@ -1562,8 +1562,8 @@ def render_agent_card(deps: AdminDeps) -> str:
                  title="剩余 3 天以内自动撤单并平掉全部仓位，避免到期后想平也平不了"))
     o.append("</div>")
     if not src:
-        o.append("<div class='hint'>还没读到授信信息：系统每个整点检查一次。"
-                 "手工兜底有效期已不再提供页面入口（要设置走容器内 sqlite，见 docs/HL_RUNBOOK.md）。</div>")
+        o.append("<div class='hint'>API 状态：还没读到授信信息（系统每个整点检查一次）。"
+                 "Kraken API key 在「更新 API」卡维护，无到期概念。</div>")
     elif src == "manual":
         o.append("<div class='hint'>有效期来自 DB 里的手工兜底值（HL 授权接口没查到同名 Hermes）；"
                  "可在总览「管理」卡里清除。</div>")
@@ -1670,7 +1670,7 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
              "否则下一轮又立刻熔断；其它来源的停手只解锁、不动基线。</div>")
 
     # ---- MR 腿（QQQ 超跌反弹）：与拉闸同一张卡，不单独占一栏（2026-11-02 用户要求）----
-    # 它是**独立腿**（xyz dex 的 XYZ100，默认停用），但开关语义与拉闸一致：
+    # 它是**独立腿**（Kraken 的 PF_QQQXUSD，默认停用），但开关语义与拉闸一致：
     # 只挡新入场，已持仓照常按信号离场。所以放在这里而不是单开一张卡 ——
     # 页尾这张卡是面板唯一的写入口，MR 开关排在应急动作之后、续期之前。
     o.append("<div class='sec'>MR 腿（QQQ 超跌反弹）</div>")
@@ -1678,7 +1678,7 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
     o.append("<div class='hint'>当前：<b>" + ("已启用" if mr_on else "已停用（默认）") + "</b>"
              + (f" · {_esc(mr_bits)}" if mr_bits else "")
              + "&nbsp;｜ 只挡新入场，已持仓仍按信号离场（与拉闸同理）。"
-             + "&nbsp;xyz:XYZ100 · 名义 = 权益×0.5。</div>")
+             + "&nbsp;PF_QQQXUSD（Kraken QQQ 永续）· 名义 = 权益×0.5。</div>")
     o.append("<form method='post' action='/admin/hl/mr'>"
              f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
              f"<button class='{'red' if not mr_on else 'gray'}' type='submit' name='on' value='1'>"
@@ -1686,15 +1686,15 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
              f"<button class='{'gray' if mr_on else 'red'}' type='submit' name='on' value='0'>"
              "停用 MR 腿</button></form>")
 
-    # ---- 更新 API（续期）----
-    o.append("<div class='sec'>更新 API（续期）</div>")
+    # ---- 更新 API ----
+    o.append("<div class='sec'>更新 API</div>")
     o.append(render_agent_renew_block(deps))
 
     # ---- 清除手工兜底有效期（只有真有值时才渲染）----
     if cur_until:
         o.append("<div class='sec'>手工兜底有效期</div>")
         o.append(f"<div class='hint'>DB 里当前的手工兜底有效期：{_esc(cur_until)}（毫秒时间戳）。"
-                 "HL 授权接口查不到同名 Hermes 时才会用到它；值过期/填错会让执行器按错误的"
+                 "面板没读到 API 授信值时才会用到它；值过期/填错会让执行器按错误的"
                  "到期日行动，所以这里只提供「清除」。</div>")
         o.append("<form method='post' action='/admin/hl/agent/fallback/clear' class='inline'>"
                  f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"

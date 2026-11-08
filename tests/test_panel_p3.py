@@ -275,15 +275,15 @@ class TestAgentBadgeAndDetails(BaseCase):
     def test_details_card_collapsed_by_default_open_when_near(self):
         self._write_state(169)
         admin_html = self.admin()
-        self.assertIn("<details class='card agent-card'><summary>API 有效期</summary>",
+        self.assertIn("<details class='card agent-card'><summary>API 状态</summary>",
                       admin_html, "默认收起")
         # 四行信息 + 自动清仓开关状态一项不丢（逐项对照）
         for w in ("代理钱包地址", "到期日", "剩余", "状态", "到期前自动清仓", "已开启"):
             self.assertIn(w, admin_html)
         # /hl 端本来就没有这张卡，徽章已覆盖常驻出处
-        self.assertNotIn("API 有效期</summary>", self.hl())
+        self.assertNotIn("API 状态</summary>", self.hl())
         self._write_state(10, level="near")
-        self.assertIn("<details class='card agent-card' open><summary>API 有效期</summary>",
+        self.assertIn("<details class='card agent-card' open><summary>API 状态</summary>",
                       self.admin(), "剩余 ≤14 天服务端渲染 open（零 JS 自动展开）")
 
 
@@ -297,8 +297,8 @@ class TestAccountFold(BaseCase):
             self.assertIn("acct-sub", seg)
             self.assertLess(seg.index("资金明细"), seg.index("acct-sub"),
                             "次级小字行收进 details 内")
-            self.assertIn("账户总值", seg.split("<details", 1)[0], "顶层关键数常驻")
-            self.assertIn("可提余额", seg.split("<details", 1)[0])
+            self.assertIn("账户权益", seg.split("<details", 1)[0], "顶层关键数常驻")
+            self.assertIn("可用保证金", seg.split("<details", 1)[0])
 
 
 # ---------------------------------------------------------------- 功能五：收益主从
@@ -347,7 +347,7 @@ class TestOverviewOrderSmoke(BaseCase):
         html = self.admin()
         order = ["<h2>仓位</h2>", "<div class='sec'>账户</div>",
                  "<h2>盈亏曲线（已剔除出入金）</h2>", "三标的动态", "<h2>执行器</h2>",
-                 "<summary>API 有效期</summary>"]
+                 "<summary>API 状态</summary>"]
         idx = [html.index(m) for m in order]
         self.assertEqual(idx, sorted(idx), f"总览块序错乱：{order}")
 
@@ -357,7 +357,7 @@ class TestOverviewOrderSmoke(BaseCase):
                  "<h2>盈亏曲线（已剔除出入金）</h2>", "三标的动态", "<h2>执行器</h2>"]
         idx = [html.index(m) for m in order]
         self.assertEqual(idx, sorted(idx), f"/hl 块序错乱：{order}")
-        self.assertNotIn("<summary>API 有效期</summary>", html)
+        self.assertNotIn("<summary>API 状态</summary>", html)
 
 
 if __name__ == "__main__":       # pragma: no cover
