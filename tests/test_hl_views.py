@@ -808,7 +808,7 @@ class TestDisplayNames(BaseCase):
 
 
 class TestWithdrawableDisplay(BaseCase):
-    """统一账户下面板的「可提余额」不能直接显示永续口径的 0 —— 会被读成「没钱」。
+    """统一账户下面板的「可用保证金」不能直接显示永续口径的 0 —— 会被读成「没钱」。
 
     实测（2026-10-14）：统一账户的钱在现货状态里，clearinghouseState.withdrawable 恒为 0，
     而现货 USDC 才是真实可提（HL 提现固定扣 1U 手续费）。
@@ -824,14 +824,14 @@ class TestWithdrawableDisplay(BaseCase):
         self.info._snap = snap
         html = self._html()
         # 口径：标签短（P2 后顶层三数之一）；2026-10-29 起手续费后缀已删
-        self.assertIn("可提余额", html)
+        self.assertIn("可用保证金", html)
         self.assertIn("100.47 U", html)
         self.assertNotIn("提现收 1U 手续费", html)
-        self.assertIn("统一账户下的实际可提", html)
-        # 2026-10-15：一行说清「资金分布（统一账户）」，去掉看不懂的「永续口径」，
+        self.assertIn("可用保证金：扣掉", html)
+        # 2026-10-15：一行说清「保证金（独立衍生品）」，去掉看不懂的「永续口径」，
         # 且合约侧占用与「已用保证金」合并（不再重复一列）
-        self.assertIn("资金分布（统一账户）", html)
-        self.assertIn("合约占用", html)
+        self.assertIn("保证金（独立衍生品）", html)
+        self.assertIn("已用 ", html)   # 可用 X · 已用 Y（Kraken 独立衍生品钱包）
         self.assertNotIn("永续口径", html)
         # 「已用保证金」那一列在统一账户下不再单列（数字已并入上一行）；
         # title 提示里仍会提到这个名字，所以只断言**不再有该行**
@@ -842,7 +842,7 @@ class TestWithdrawableDisplay(BaseCase):
         snap.update({"unified": False, "withdrawable": 88.5})
         self.info._snap = snap
         html = self._html()
-        self.assertIn("可提余额", html)
+        self.assertIn("可用保证金", html)
         self.assertIn("88.50", html)
 
 

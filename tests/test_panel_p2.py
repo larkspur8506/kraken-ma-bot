@@ -123,8 +123,8 @@ class BaseCase(unittest.TestCase):
 
 # ---------------------------------------------------------------- 功能一：账户卡
 class TestAccountLayer(BaseCase):
-    TOP = ("账户总值", "可提余额")   # P3 R5：「累计已实现」从顶层删除（并入绩效卡 U 对照行）
-    SUB = ("钱包地址", "资金分布（统一账户）", "持仓名义", "今日已实现", "净手续费（付出）")
+    TOP = ("账户权益", "可用保证金")   # P3 R5：「累计已实现」从顶层删除（并入绩效卡 U 对照行）
+    SUB = ("钱包地址", "保证金（独立衍生品）", "持仓名义", "今日已实现", "净手续费（付出）")
 
     def test_top3_and_secondary_items_all_present(self):
         for html in self.both():
@@ -148,7 +148,7 @@ class TestAccountLayer(BaseCase):
                                reduce_only=True, ts=int(NOW * 1000), created_at=NOW)
         for html in self.both():
             seg = self.account_seg(html)
-            self.assertIn("账户总值 <b>995.06 U</b>", seg)
+            self.assertIn("账户权益 <b>995.06 U</b>", seg)
             self.assertNotIn("累计已实现", seg, "P3 R5：账户卡顶层不再有「累计已实现」")
             self.assertIn("-14.38 U", seg, "今日已实现为交易所 closedPnl 口径（负数如实）")
             self.assertIn("824.34 U", seg, "统一账户可提 = 现货 − 仓位/挂单占用")
@@ -188,7 +188,7 @@ class TestAccountLayer(BaseCase):
         for html in self.both():
             seg = self.account_seg(html)
             self.assertIn("已用保证金", seg)
-            self.assertNotIn("资金分布（统一账户）", seg)
+            self.assertNotIn("保证金（独立衍生品）", seg)
 
 
 # ---------------------------------------------------------------- 功能二：仓位表

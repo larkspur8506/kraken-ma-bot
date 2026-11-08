@@ -38,7 +38,7 @@ if HAVE_FASTAPI:
 NOW = 1_760_000_000.0
 
 # 三条注脚的原文（与源码逐字一致；用常量便于「渲染原文」断言）
-LEGEND_ACCOUNT = ("已实现为交易所口径，未扣手续费与资金费 · 可提 = 现货 − 仓位/挂单占用")
+LEGEND_ACCOUNT = ("已实现为交易所口径，未扣手续费与资金费 · 可用 = 权益 − 持仓/挂单占用")
 LEGEND_SYSTEM = ("卡单 = 持续 3 分钟未推进才计入 · "
                  "Kraken 延迟 = 容器请求 /derivatives 耗时（含失败重试），与本机网速无关")
 LEGEND_FEED = "信号源固定 kr-chart（fail-closed：源失败即跳过本轮，不换源）"
@@ -110,10 +110,10 @@ class TestOverviewLegends(unittest.TestCase):
         self.assertNotIn(LEGEND_FEED, self.html)
 
     def test_margin_legacy_term_not_in_visible_text(self):
-        """豁免：剥掉所有 title 后，「已用保证金」不得出现在可见文本里。"""
-        self.assertNotIn("已用保证金", visible_text(self.html))
+        """豁免：剥掉所有 title 后，「现货 / 合约占用」旧口径不得出现在可见文本里。"""
+        self.assertNotIn("现货", visible_text(self.html).replace("现货总额", ""))
         # 但桌面端 title 保留（增强，不删）
-        self.assertIn("合约侧占用 = 已用保证金", self.html)
+        self.assertIn("已用 = 持仓与挂单占用的保证金", self.html)
 
     def test_legend_css_shipped(self):
         self.assertIn(".sym-legend,.legend{", self.html)
