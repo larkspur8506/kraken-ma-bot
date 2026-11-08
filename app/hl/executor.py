@@ -33,10 +33,10 @@ from app.hl import pnl as hl_pnl
 from app.hl import flows as hl_flows
 from app.hl import funding as hl_funding
 from app.hl import dd as hl_dd
-from app.hl.exchange import (STATUS_DRY, STATUS_FILLED, STATUS_RESTING, _clean_alert_text,
+from app.kr.exchange import (STATUS_DRY, STATUS_FILLED, STATUS_RESTING, _clean_alert_text,
                              make_cloid)
 from app.engine import DISPLAY_TZ, TZ_LABEL
-from app.hl.info import HlInfoError
+from app.kr.info import KrInfoError as HlInfoError
 from app.sizing import effective_risk_pct
 from app import symbol_registry as registry
 
@@ -2174,7 +2174,7 @@ class Executor:
             return self._entry_failed(symbol, bar_ms, f"入场失败：{res['error']}")
         if res["status"] == STATUS_RESTING:
             # IOC 不该挂着；挂上了说明限价不够激进 → 撤掉并放弃（不追价）
-            self.ex.cancel(coin, int(res["oid"] or 0))
+            self.ex.cancel(coin, res["oid"])
             self._churn_note(coin, side)          # 撤单也是 churn（PR-4 口径）
             return self._entry_failed(symbol, bar_ms, "IOC 未成交（限价不够激进），已撤单放弃")
         filled_sz = float(res["filled_sz"] or plan.sz)
