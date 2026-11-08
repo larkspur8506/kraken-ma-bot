@@ -325,15 +325,21 @@ class TestFullAppPanelSpeed(unittest.TestCase):
         for k, v in self.ENV.items():
             os.environ[k] = v
         import app.hl.info as hl_info
+        import app.kr.info as kr_info
         self._real_cls = hl_info.HlInfo
+        self._real_kr_cls = kr_info.KrInfo
+        # PR-1：main.get_hl_info 走 KrInfo，替身两个类都要换
         hl_info.HlInfo = CountingHlInfo
+        kr_info.KrInfo = CountingHlInfo
         CountingHlInfo.instances = []
         self.mod = self._reload()
         self.info = CountingHlInfo.instances[-1]
 
     def tearDown(self):
         import app.hl.info as hl_info
+        import app.kr.info as kr_info
         hl_info.HlInfo = self._real_cls
+        kr_info.KrInfo = self._real_kr_cls
         shutil.rmtree(self.tmp, ignore_errors=True)
         for key, val in self._env_backup.items():
             if val is None:

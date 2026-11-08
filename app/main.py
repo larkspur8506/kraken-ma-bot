@@ -220,22 +220,39 @@ def _dd_pct(cfg, key: str) -> float:
 
 def hl_info_base() -> str:
     """只读客户端的 base_url。独立成函数：hl_params() 装配执行器时也要用它，
-    但私钥/模式的变动不该触发只读客户端重建。"""
+    但私钥/模式的变动不该触发只读客户端重建。
+
+    Kraken 版（PR-1）：默认生产 futures.kraken.com，HL_TESTNET 开关复用为沙盒。
+    """
     if _env("HL_TESTNET", "0") in ("1", "true"):
-        return "https://api.hyperliquid-testnet.xyz"
-    return _env("HL_BASE_URL", "https://api.hyperliquid.xyz")
+        return "https://demo-futures.kraken.com"
+    return _env("KR_BASE_URL", "https://futures.kraken.com")
+
+
+def kr_api_key() -> str:
+    """Kraken API key：DB（面板可写，键 kr_api_key）优先，其次 env。"""
+    try:
+        db_key = str(db.get_config_str("kr_api_key", "") or "").strip()
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("读 DB api key 失败（回落 env）：%s", type(e).__name__)
+        db_key = ""
+    return db_key or _env("KRAKEN_API_KEY")
 
 
 def get_hl_info():
-    """只读客户端（面板/看护/执行器共用；无凭据也能用）。
+    """只读客户端（面板/看护/执行器共用）。
+
+    Kraken 版（PR-1）：KrInfo 带凭据（fills/持仓等私有端点需要）；
+    无凭据时也能构造（公开端点可用，私有读取会 fail-closed）。
 
     **不带缓存**：执行器、tick、对账、看护消费的必须是实时读数（fail-closed 的前提）。
     面板要省请求请用 `panel_hl_info()` —— 它是本函数返回值的一层 TTL 包装，只存在于面板依赖里。
     """
     global _hl_info
     if _hl_info is None:
-        from app.hl.info import HlInfo
-        _hl_info = HlInfo(base_url=hl_info_base())
+        from app.kr.info import KrInfo
+        _hl_info = KrInfo(api_key=kr_api_key(), secret_b64=hl_private_key(),
+                          base_url=hl_info_base())
     return _hl_info
 
 
@@ -374,15 +391,15 @@ def build_executor():
         return None
     p.mr_margin_fn = _mr_margin_used          # 定仓基数剔除 MR 占用
     try:
-        from app.hl.exchange import HlExchange
+        from app.kr.exchange import KrExchange
         from app.hl.executor import Executor
         info = get_hl_info()
-        ex = HlExchange(account_address=p.account_address, private_key=p.private_key,
+        ex = KrExchange(api_key=kr_api_key(), secret_b64=p.private_key,
                         base_url=p.base_url, dry_run=(p.mode == "dry"),
                         max_slippage_pct=p.max_slippage_pct, info=info)
         return Executor(db, p, info, ex, notifier=notifier)
     except Exception as e:                                           # noqa: BLE001
-        logger.exception("装配 HL 执行器失败，退回纯提醒模式: %s", e)
+        logger.exception("装配 Kraken 执行器失败，退回纯提醒模式: %s", e)
         return None
 
 
@@ -491,20 +508,14 @@ def _run_agent_cleanup(reason: str = "") -> dict:
 
 
 def _agent_check(now_ms=None) -> dict:
-    """跑一轮到期检查（拆出来便于 /admin 触发与单测直接调）。"""
-    from app.hl import agent as agent_mod
-    cfg = current_config()
-    state = agent_mod.check_once(
-        db, cfg, notifier, get_hl_info(),
-        address=_env("HL_ACCOUNT_ADDRESS"),
-        now_ms=now_ms,
-        cleanup=_run_agent_cleanup,
-        prefix=cfg.alert_prefix,
-        log_event=lambda kind, msg, **kw: db.hl_log_event(kind, msg),
-        mode=hl_mode(),
-    )
-    logger.info("[agent] 到期检查：level=%s source=%s 剩余 %s 天",
-                state.get("level"), state.get("source"), state.get("days_left"))
+    """跑一轮到期检查（拆出来便于 /admin 触发与单测直接调）。
+
+    Kraken 版（PR-1）：Derivatives API key 无有效期、也没有代理钱包授权，
+    到期保护整体不存在——固定返回 ok，仅保留失败告警重试。"""
+    state = {"level": "ok", "source": "kraken-key-no-expiry", "days_left": None}
+    logger.info("[agent] 到期检查：level=%s source=%s（Kraken key 无有效期）",
+                state.get("level"), state.get("source"))
+    _retry_failed_alerts()
     return state
 
 
@@ -561,13 +572,13 @@ def _mr_identity() -> tuple:
 def _build_mr_leg() -> Optional[Any]:
     """装配 HL MR 腿。mode=off / 无地址 / 装配失败 → None（纯提醒模式不跑 MR）。"""
     p = hl_params()
-    if p.mode == "off" or not p.account_address:
+    if p.mode == "off":
         return None
     try:
-        from app.hl.exchange import HlExchange
+        from app.kr.exchange import KrExchange
         from app.hl.mr import HlMrLeg
         info = get_hl_info()
-        ex = HlExchange(account_address=p.account_address, private_key=p.private_key,
+        ex = KrExchange(api_key=kr_api_key(), secret_b64=p.private_key,
                         base_url=p.base_url, dry_run=(p.mode == "dry"),
                         max_slippage_pct=p.max_slippage_pct, info=info)
         return HlMrLeg(db=db, info=info, exchange=ex,

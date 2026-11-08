@@ -83,16 +83,30 @@ def hl_coin(symbol: str) -> str:
 
 
 def mexc_spec(symbol: str) -> Optional[MexcSpec]:
-    """取 MEXC 规格。
-
-    - 已注册且有 MEXC 段 → 返回 `MexcSpec`；
-    - 已注册但无 MEXC 段 → 返回 `None`；
-    - 未注册 → 返回 `None`（不抛）。
-
-    返回 `None` 的语义是「该场所规格缺失，跳过该场所的量建议」，调用方
-    （`sizing.size_order`）据此**优雅降级**而不是抛异常 —— 这也是本次改造的
-    核心：规格缺失不再把整个标的的信号吞成「处理异常」。
-    需要 fail-loud 判断「是否登记过这个标的」请用 `get()` / `hl_coin()`。
-    """
     entry = _REGISTRY.get(symbol)
     return entry.mexc if entry is not None else None
+
+
+# ---------------------------------------------------------------- Kraken 映射
+# display coin（BTC/ETH/SOL/QQQ）→ Kraken flex 永续合约名。
+# 信号层 symbol（BTC_USDT 等）→ coin 沿用 hl_coin；场所换名只发生在 Kr 客户端层。
+_KR_SYMBOLS: Dict[str, str] = {
+    "BTC": "PF_XBTUSD",
+    "ETH": "PF_ETHUSD",
+    "SOL": "PF_SOLUSD",
+    "QQQ": "PF_QQQXUSD",
+}
+
+
+def kr_symbol(coin: str) -> Optional[str]:
+    """display coin → Kraken 合约名；未登记返回 None（调用方 fail-closed）。"""
+    return _KR_SYMBOLS.get(str(coin or "").strip().upper())
+
+
+def kr_coin(trade_symbol: str) -> Optional[str]:
+    """Kraken 合约名 → display coin（PF_XBTUSD → BTC）；未登记返回 None。"""
+    s = str(trade_symbol or "").strip().upper()
+    for coin, sym in _KR_SYMBOLS.items():
+        if sym == s:
+            return coin
+    return None

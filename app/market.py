@@ -188,9 +188,30 @@ def _okx(symbol: str) -> List[Bar]:
     return bars
 
 
+def _kraken_charts(symbol: str) -> List[Bar]:
+    """Kraken charts v1 的 4h K 线（公开、无鉴权）。
+
+    实测（2026-11-08）：path 形式 /api/charts/v1/trade/{sym}/4h，from/to **秒**；
+    单页 2000 根、PF_XBTUSD 2022-03-23 起连续。取 180 天（1080 根，1 页内），
+    远超 MIN_BARS_REQUIRED，与 _mexc_contract 同量级。
+    """
+    from app import symbol_registry as registry
+    from app.kr.client import KrClient, KrEndpoints
+    sym = registry.kr_symbol(hl_coin(symbol, strict=True))
+    if not sym:
+        raise FeedError(f"未配置 Kraken 合约映射：{symbol}")
+    to_s = int(time.time())
+    rows = KrEndpoints(KrClient()).charts_history(sym, "4h", to_s - 180 * 86400, to_s)
+    bars = [Bar(open_ms=int(c["time"]), open=float(c["open"]), high=float(c["high"]),
+                low=float(c["low"]), close=float(c["close"]), volume=float(c["volume"]))
+            for c in rows]
+    bars.sort(key=lambda b: b.open_ms)
+    return bars
+
+
 # 实盘信号源：**只有交易场所自己的数据**（失败即 fail-closed，不换源下单）
 SOURCES: List[Tuple[str, Callable[[str], List[Bar]]]] = [
-    ("hl-candle", _hyperliquid),
+    ("kr-chart", _kraken_charts),
 ]
 
 # 仅诊断/展示用（allow_fallback=True 时才参与），绝不用于下单决策

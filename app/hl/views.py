@@ -282,6 +282,9 @@ def _agent_badge_html(agent: Any) -> str:
     days = _opt_int(a.get("days_left"))
     if cleanup == "done":
         return _strip_badge("neg", "API", "已清仓", "API 授权已到期并触发自动清仓")
+    if str(a.get("source") or "") == "kraken-key-no-expiry":
+        # Kraken Derivatives key 无有效期（PR-1），也无代理钱包授权体系
+        return _strip_badge("pos", "API", "不限期", "Kraken API key 无有效期")
     if level == "no_expiry":
         return _strip_badge("pos", "API", "不限期", "API 授权未设到期时间")
     if days is None:
@@ -1764,7 +1767,7 @@ def _feed_line(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]],
         return _whyline(f"数据源 无记录 · 已处理到 {bar_txt}", "muted")
     # 失败行的 source 可能为空（引擎 mark_feed 失败路径不写源名）；本系统信号源
     # 固定 hl-candle（fail-closed、不换源），空缺时兜底写实名，不算编造。
-    src = str(fd.get("source") or "hl-candle")
+    src = str(fd.get("source") or "kr-chart")
     if fd.get("ok"):
         return ""
     err_at = _fmt_dt(fd.get("error_at"), "%H:%M") if fd.get("error_at") else "—"
@@ -2194,7 +2197,7 @@ def _render_body(p: dict) -> str:
                      "与你的浏览器到本站的延迟无关")
     o.append(f"<span class='badge' title='{_esc(lat_title)}'>"
              f"<span class='{('pos' if latency is not None else 'muted')}'>&#9679;</span>"
-             f" HL 延迟 <b>{lat_txt}</b></span>")
+             f" Kraken 延迟 <b>{lat_txt}</b></span>")
     # API 有效期徽章（P3 R3）：唯一常驻出处（原「API 有效期」卡降级为总览末尾的 details）。
     o.append(_agent_badge_html(p.get("agent")))
     o.append(f"<span class='badge'><span class='muted'>&#9679;</span> 更新 "

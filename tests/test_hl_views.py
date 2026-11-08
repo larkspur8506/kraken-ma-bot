@@ -803,7 +803,7 @@ class TestDisplayNames(BaseCase):
 
     def test_latency_badge_labels_scope(self):
         html = render_dashboard(self.payload())
-        self.assertIn("HL 延迟", html)          # 说清是服务器→HL 的延迟
+        self.assertIn("Kraken 延迟", html)          # 说清是服务器→HL 的延迟
         self.assertIn("与你的浏览器到本站的延迟无关", html)
 
 
@@ -847,7 +847,7 @@ class TestWithdrawableDisplay(BaseCase):
 
 
 class TestLatencyFromSnapshot(BaseCase):
-    """HL 延迟的两条来源必须分得清（阶段 B 之后面板渲染不访问交易所）。
+    """Kraken 延迟的两条来源必须分得清（阶段 B 之后面板渲染不访问交易所）。
 
     - 实时读数（/api/hl/status、无快照回落）：延迟 = 本次请求实测，`latency_from_snapshot=False`；
     - 调度器快照：延迟 = 写入快照时那一轮的实测（`panel_net`），带采样距今多久，
@@ -888,13 +888,13 @@ class TestLatencyFromSnapshot(BaseCase):
     def test_page_renders_snapshot_latency_and_scope(self):
         self._with_panel_net({"latency_ms": 456.7, "ts": FIXED_NOW - 300.0})
         html = render_dashboard(self.payload())
-        self.assertIn("HL 延迟 <b>457 ms</b>", html)
+        self.assertIn("Kraken 延迟 <b>457 ms</b>", html)
         self.assertIn("调度器上一轮读 Hyperliquid 的耗时", html)
         self.assertIn("本次渲染没有访问交易所", html)
 
     def test_page_without_measurement_shows_dash_not_fake_ms(self):
         self._with_panel_net({"latency_ms": 0.0, "ts": FIXED_NOW})
         html = render_dashboard(self.payload())
-        self.assertIn("HL 延迟 <b>—</b>", html)
-        self.assertNotIn("HL 延迟 <b>0 ms</b>", html)
+        self.assertIn("Kraken 延迟 <b>—</b>", html)
+        self.assertNotIn("Kraken 延迟 <b>0 ms</b>", html)
 

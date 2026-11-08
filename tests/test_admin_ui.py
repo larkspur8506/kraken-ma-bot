@@ -233,7 +233,7 @@ class TestOverviewTab(BaseCase):
     def test_status_strip_is_always_present(self):
         for tab in ("overview", "records"):
             html = self.body(tab=tab)
-            for s in ("模式", "熔断", "对账", "HL 延迟", "更新"):
+            for s in ("模式", "熔断", "对账", "Kraken 延迟", "更新"):
                 self.assertIn(s, html, f"{tab} 缺状态条：{s}")
 
     def test_tabs_switch_via_querystring(self):
@@ -469,7 +469,7 @@ class TestMobileNoJs(BaseCase):
     def test_no_emoji_spray_in_status_strip(self):
         html = self.body(tab="overview")
         strip = html.split("<div class='bar'>")[1].split("</div>")[0]
-        # P3 R2/R3 后常驻徽标：模式/熔断/对账/HL 延迟/API 有效期/更新（卡单 >0 才加一个点）
+        # P3 R2/R3 后常驻徽标：模式/熔断/对账/Kraken 延迟/API 有效期/更新（卡单 >0 才加一个点）
         self.assertEqual(strip.count("&#9679;"), 6)
 
 

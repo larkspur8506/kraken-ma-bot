@@ -270,10 +270,10 @@ class TestSymbolCardMerge(BaseCase):
         #（沿用旧口径），所以要看到失败态必须从零开始。
         self.db.conn.execute("DELETE FROM feed_health")
         self.db.conn.commit()
-        self.db.mark_feed("BTC_USDT", "hl-candle", False, error="HTTP 503")
+        self.db.mark_feed("BTC_USDT", "kr-chart", False, error="HTTP 503")
         for html in self.both():
-            self.assertIn("数据源 hl-candle 失败（最后错误 ", html)
-            self.assertRegex(html, r'whyline neg">数据源 hl-candle 失败（最后错误 \d{2}:\d{2}）',
+            self.assertIn("数据源 kr-chart 失败（最后错误 ", html)
+            self.assertRegex(html, r'whyline neg">数据源 kr-chart 失败（最后错误 \d{2}:\d{2}）',
                              "失败态用 neg 样式醒目（fail-closed 是最该看见的异常）")
 
     def test_missing_feed_shown_truthfully(self):
