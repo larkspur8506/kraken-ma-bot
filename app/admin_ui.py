@@ -107,7 +107,7 @@ def rows_switch_html(tab: str, current: int, k: str = "") -> str:
         cls = "btn" if n == cur else "btn gray"
         links.append(f"<a class='{cls}' href='/admin/rows?n={n}&tab={_esc(tab)}&k={q}'>{n}</a>")
     return ("<div class='foot'><span class='muted'>每页行数：</span>" + " ".join(links)
-            + "<span class='muted'>&nbsp;（历史类长表；盈亏曲线不受影响）</span></div>")
+            + "<span class='muted'>&nbsp;（历史类长表；不影响图表）</span></div>")
 
 
 # 2026-10-30（feat/panel-slim）：只剩两个页签。参数/开关两页连同它们的 POST 端点整体
@@ -435,6 +435,30 @@ def _reset_dd_peak(deps: Any, now: Optional[float] = None) -> tuple:
 
 
 # ---------------------------------------------------------------- 记录 Tab
+def _flows_unsupported(deps: Any) -> bool:
+    """该交易所有没有出入金 / 资金费流水端点（Kraken 期货没有）。
+
+    判据与 views 层同一处：`deps.hl_deps.info.flows_supported is False`。
+    为 True 时记录页的记账类行（出入金、资金费汇总）整类不渲染 —— 库里可能还留着
+    迁移前 HL 的旧行，不按 venue 能力拦就会把旧数据当现行账目显示。
+    """
+    info = getattr(getattr(deps, "hl_deps", None), "info", None)
+    return getattr(info, "flows_supported", True) is False
+
+
+# 账本里「依赖流水端点」的 kind：全部出入金类 + 资金费。成交类（fill/fill_open/
+# fill_close）来自 hl_fills，与流水无关，照常显示。
+_LEDGER_FLOW_KINDS = frozenset({
+    "funding", "deposit", "send_in", "sub_in", "vault_in",
+    "withdraw", "send_out", "sub_out", "vault_out", "other",
+})
+
+
+def _ledger_trade_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """只留成交行（Kraken：没有流水端点时的账本口径）。"""
+    return [r for r in rows if str(r.get("kind") or "") not in _LEDGER_FLOW_KINDS]
+
+
 def _all_link(slug: str, token: str) -> str:
     """记录页各块的「全部 ›」入口（feat/list-subpages）：跳到该表的独立子页。
 
@@ -445,8 +469,13 @@ def _all_link(slug: str, token: str) -> str:
             f"title='查看该表全部记录（可筛选、可导出 CSV）'>全部 ›</a>")
 
 
-def _ledger_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
-    """资金流水一行（主记录页与 /admin/list/ledger 子页共用同一份渲染，口径不二份）。"""
+def _ledger_row_html(r: Dict[str, Any], bal: Optional[float],
+                     with_bal: bool = True) -> str:
+    """资金流水一行（主记录页与 /admin/list/ledger 子页共用同一份渲染，口径不二份）。
+
+    ``with_bal=False``：该 venue 没有出入金流水（Kraken）时余额列整列不渲染 ——
+    余额是「自 0 起累计全部流水」，缺了流入流出就不是账户余额，留着这一列等于编数。
+    """
     amt = _opt_num(r.get("amount_usd"))
     amt_cls = "pos" if (amt or 0) > 0 else ("neg" if (amt or 0) < 0 else "")
     kind = hl_funding.kind_text(r.get("kind"))
@@ -485,10 +514,11 @@ def _ledger_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
     # 金额：|x|<0.01 的非零流水（如 +0.0008 的资金费）用 2 位小数会显示成 ±0.00，
     # 看起来像没发生 —— 这类小额改显 4 位小数（更小的量级自动退到 6 位，见 _signed_small）。
     amt_txt = _signed_small(amt)
+    bal_cell = (f"<td class='num'>{_fmt(bal)}</td>" if with_bal else "")
     return (f"<tr><td class='num'>{_ts(r.get('ts'))}</td>"
             f"<td>{_esc(kind)}</td>"
             f"<td class='num {amt_cls}'>{amt_txt}</td>"
-            f"<td class='num'>{_fmt(bal)}</td>"
+            f"{bal_cell}"
             f"<td class='num'>{_esc(link)}</td>"
             f"<td>{' · '.join(notes) or '—'}</td></tr>")
 
@@ -578,6 +608,27 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
                 "<div class='sec'>资金流水</div>"
                 f"<div class='hint bad'>读取失败：{_esc(type(e).__name__)}"
                 "（v_ledger 视图异常，请查日志）</div></div>")
+    # Kraken 期货没有出入金 / 资金费流水端点：这两类行整类不渲染（库里可能还留着
+    # 迁移前 HL 的旧行）；余额列与「Σ流水 vs 权益」对账行同样是流水口径 → 一并去掉。
+    # 只剩成交行；成交也没有 → 本块整个不渲染（不留一个恒空/误导的卡片）。
+    if _flows_unsupported(deps):
+        rows = _ledger_trade_rows(rows)
+        if not rows:
+            return ""
+        page = list(rows[-n:] if n else [])
+        page.reverse()                  # 最新在前
+        rows_html = "".join(_ledger_row_html(r, None, with_bal=False) for r in page)
+        return (f"<h2>资金流水</h2>"
+                f"<div class='card'><div class='sec'>成交流水（最近 {n} 条 · 最新在前）"
+                f"{_all_link('ledger', _token_of(deps))}</div>"
+                "<div class='hint'>本交易所只提供成交流水：余额列与其余记账类目没有数据源，"
+                "不在面板列出</div>"
+                + _table("<th>时间</th><th>类型</th><th class='num'>金额</th>"
+                         "<th class='num'>关联单</th><th>备注</th>",
+                         rows_html, "暂无成交流水", 5)
+                + "<div class='legend'>成交行金额 = 平仓盈亏 − 手续费 · "
+                  "关联单 #N = 归集到的仓位</div>"
+                "</div>")
     # 对账行：Σ全部流水 vs 最新快照权益，残差如实显示（不凑平）。
     snap_d = dict(snap) if snap is not None else None
     equity = _num(snap_d.get("equity")) if snap_d else 0.0
@@ -951,12 +1002,13 @@ def _subpage_url(slug: str, k: str, qs: str, cursor: str = "") -> str:
 
 
 def _subpage_rows_html(slug: str, rows: List[Dict[str, Any]],
-                       balances: Optional[List[float]] = None) -> str:
+                       balances: Optional[List[float]] = None,
+                       with_bal: bool = True) -> str:
     """子页表体：行渲染与主记录页同口径（资金流水直接复用 _ledger_row_html）。"""
     out = ""
     if slug == "ledger":
         for r, bal in zip(rows, balances or []):
-            out += _ledger_row_html(r, bal)
+            out += _ledger_row_html(r, bal, with_bal=with_bal)
         return out
     if slug == "orders":
         for r in rows:
@@ -1043,6 +1095,10 @@ _SUBPAGE_EMPTIES: Dict[str, str] = {
     "events": "暂无执行器事件", "alerts": "暂无提醒日志", "positions": "暂无信号",
 }
 
+# 无出入金流水端点的 venue（Kraken）：账本页只剩成交，余额列整列不渲染。
+_LEDGER_HEAD_NO_BAL = ("<th>时间</th><th>类型</th><th class='num'>金额</th>"
+                       "<th class='num'>关联单</th><th>备注</th>")
+
 
 def _ledger_cursor(r: Dict[str, Any]) -> str:
     """资金流水的游标：排序键 (ts, ref) 序列化成「ts|ref」。
@@ -1070,11 +1126,15 @@ def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) ->
 
     # ---- 取数（fail-soft：DB 层坏掉时显示错误行，页面不 500） ----
     err_html = ""
+    # Kraken 期货没有出入金 / 资金费流水端点 → 子页也只列成交（与主记录页同一口径）。
+    no_flows = _flows_unsupported(deps) and slug == "ledger"
     try:
         if slug == "ledger":
             all_rows = [_rowd(r) for r in
                         (deps.db.list_subpage_rows("ledger", filters=f, time_from=tf, time_to=tt)
                          or [])]
+            if no_flows:
+                all_rows = _ledger_trade_rows(all_rows)
             # 余额列：全量正序预计算后再切片（复用 PR #53 口径，页间连续）。
             balances = hl_funding.running_balances(all_rows)
             z = len(all_rows)
@@ -1131,7 +1191,8 @@ def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) ->
                              f"href='{_subpage_url(slug, token, nav_qs, 'before=' + cur_q)}'>"
                              "下一页（更旧）›</a>")
         page_rows = [r for r, _b in disp]
-        rows_html = _subpage_rows_html(slug, [r for r, _b in disp], [b for _r, b in disp])
+        rows_html = _subpage_rows_html(slug, [r for r, _b in disp], [b for _r, b in disp],
+                                       with_bal=not no_flows)
     else:
         rows_html = _subpage_rows_html(slug, page_rows)
         if page_rows:
@@ -1169,6 +1230,9 @@ def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) ->
             opts = list(deps.db.list_subpage_options(slug, key) or [])
         except Exception:                                             # noqa: BLE001
             opts = []
+        if no_flows and key == "kind":
+            # 无流水端点时不给「入金 / 出金 / 资金费」这些筛选项 —— 选中只会得到空表。
+            opts = [o for o in opts if str(o) not in _LEDGER_FLOW_KINDS]
 
         def _opt_pair(v: str) -> Tuple[str, str]:
             """(option value, 显示文案)。callable kind（symbol 展示名映射）：
@@ -1208,11 +1272,14 @@ def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) ->
     # 是「期初 0 + 筛选后全集」累计，不是账户余额，不注明会被误读。
     ledger_note = ""
     if slug == "ledger":
-        if parsed["filters"] or tf is not None or tt is not None:
+        if no_flows:
+            ledger_note = ("<div class='hint'>本交易所只提供成交流水：本页只列成交，"
+                           "余额列与其余记账类目没有数据源（已移除）。</div>")
+        elif parsed["filters"] or tf is not None or tt is not None:
             ledger_note = ("<div class='hint'>⚠️ 已筛选：<b>余额按当前筛选范围累计</b>"
                            "（期初 0 起算），不是账户余额；清空筛选后恢复全量口径。</div>")
 
-    thead = _SUBPAGE_HEADS[slug]
+    thead = _LEDGER_HEAD_NO_BAL if no_flows else _SUBPAGE_HEADS[slug]
     body = (head_html
             + f"<div class='card'><div class='sec'>"
               f"{_esc(cfg['title'])}（{_esc(count_txt)}）{export_link}</div>"
@@ -1222,9 +1289,12 @@ def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) ->
             + (f"<div class='foot'>{(' '.join(nav_links))}</div>" if nav_links else "")
             + f"<div class='foot'><span class='muted'>每页行数：</span>{row_links}</div>"
             + "</div>")
-    if slug == "ledger":
+    if slug == "ledger" and not no_flows:
         body += ("<div class='legend'>余额 = 自期初 0 起累计（全量正序累加后再切当前页）· "
                  "成交行金额 = 平仓盈亏 − 手续费 · 资金费正 = 收入</div>")
+    elif slug == "ledger":
+        body += ("<div class='legend'>成交行金额 = 平仓盈亏 − 手续费 · "
+                 "关联单 #N = 归集到的仓位</div>")
     return body
 
 
@@ -1262,9 +1332,13 @@ def _csv_stream(deps: AdminDeps, slug: str, f: Dict[str, Any],
         rows = [_rowd(r) for r in
                 (deps.db.list_subpage_rows("ledger", filters=f, time_from=tf, time_to=tt)
                  or [])]
+        no_flows = _flows_unsupported(deps)
+        if no_flows:
+            # 与页面同一口径：Kraken 只导成交行，余额列（全量流水累计）不适用 → 留空。
+            rows = _ledger_trade_rows(rows)
         # 余额列口径与子页/主记录页一致：全量正序预计算（复用 PR #53 实现）
         for r, bal in zip(rows, hl_funding.running_balances(rows)):
-            r["_bal"] = bal
+            r["_bal"] = None if no_flows else bal
             buf = io.StringIO()
             csv.writer(buf, lineterminator="\n").writerow(
                 [str(_csv_safe(fn(r))) for _h, fn in _CSV_COLS[slug]])

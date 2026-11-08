@@ -125,6 +125,8 @@ class Config:
     # 出入金流水同步间隔（秒）。面板的盈亏曲线要剔除出入金，数据源是交易所账本；
     # 流水是**低频**事件（本账户至今 2 笔），没必要每轮都拉，默认 30 分钟。
     # 只有参数、**没有面板开关**（用户明确要求）：正常情况不需要人管它。
+    # ⚠️ Kraken 下不生效：期货没有出入金流水端点，`KrInfo.flows_supported=False`，
+    #    executor 在读到间隔之前就已整段跳过 —— 这个值只对 HL 有意义。
     hl_flow_sync_s: int = _env_i("HL_FLOW_SYNC_S", 1800)
 
     # 回撤熔断（DD Guard，规格见分支 feat/dd-guard）：判据是**策略口径**峰谷回撤
@@ -134,6 +136,8 @@ class Config:
     hl_dd_guard: bool = _env("HL_DD_GUARD", "1").lower() in ("1", "true", "yes", "on")
     # 阈值覆盖：0 = 按当前 risk_pct 档位自动（§3.4：1.5% 档 25/30、2.5% 档 30/40、
     # 3% 档 40/50）。留 0 而不是把默认值抄进来，是为了「改 risk_pct 线自动跟着走」。
+    # ⚠️ Kraken 下不生效：DD Guard 与 L1 都要求「本轮真的同步到出入金流水」，
+    #    Kraken 无流水源 → `_flows_fresh` 恒 False → 不判线、不 kill、不推告警。
     hl_dd_warn_pct: float = _env_f("HL_DD_WARN_PCT", 0.0)
     hl_dd_kill_pct: float = _env_f("HL_DD_KILL_PCT", 0.0)
 
