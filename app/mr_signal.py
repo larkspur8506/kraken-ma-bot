@@ -12,11 +12,12 @@
   会话。**交易日历 = 周末 + NYSE 规则假日**（`market_holidays`，规则生成）：
   入场日必须是真的交易日，否则「信号日次日是假日」时整条信号会被丢掉。
   **缺数判据**：一个会话至少要 5 根 bar（正常 6 根，允许缺 1 小时），且**末根必须
-  不早于 15:00 ET**，否则整日弃用。2026-11-02 第四轮复核发现：只要求「≥5 根」
-  时，10:00–14:00 的 5 根（缺 15:00 那根）仍会通过，把 **14:00 价当全天收盘**喂给
-  RSI/离场 —— 与 3 根时把 12:00 当收盘是同一个错误，只是晚了两小时。24/7 永续
-  每个工作日都该有 6 根（半日市午后也有成交），所以常规日/半日市统一要求末根
-  ≥15:00；真缺数就 fail-closed 弃用该会话。
+  不早于 15:00 ET**（半日市为 12:00 ET，窗口 [09:30,13:00)），否则整日弃用。
+  2026-11-02 第四轮复核发现：只要求「≥5 根」时，10:00–14:00 的 5 根（缺 15:00 那根）
+  仍会通过，把 **14:00 价当全天收盘**喂给 RSI/离场 —— 与 3 根时把 12:00 当收盘是同一个
+  错误，只是晚了两小时。24/7 永续在工作日每天都有 6 根，所以常规日要求末根 ≥15:00；
+  真缺数就 fail-closed 弃用该会话。半日市（``EARLY_CLOSE_DATES``，13:00 收盘）窗口
+  截止 13:00、末根门槛 12:00 —— 盘后 bar 不得充当日收盘。
 - 指标：RSI2（Wilder 平滑，alpha=1/2）与 SMA5，都基于会话收盘价。
 - 入场：会话收盘 RSI2 < 10 → 次一会话开盘市价买入；开盘后 ``ENTRY_WINDOW_H``
   小时内未成交则放弃该信号（fail-closed，宁可错过）。单槽：持仓中忽略新信号。
@@ -38,7 +39,8 @@ from zoneinfo import ZoneInfo
 
 __all__ = [
     "SESSION_TZ", "SESSION_START", "SESSION_END", "RSI_PERIOD", "RSI_THRESHOLD",
-    "SMA_WINDOW", "ENTRY_WINDOW_H", "MIN_SESSION_BARS", "SessionBar",
+    "SMA_WINDOW", "ENTRY_WINDOW_H", "MIN_SESSION_BARS",
+    "SessionBar", "EARLY_CLOSE_DATES", "EARLY_CLOSE_END", "EARLY_CLOSE_MIN_LAST",
     "aggregate_sessions", "aggregate_sessions_ex", "rsi2_wilder", "sma",
     "session_signals", "entry_decision", "exit_decision", "next_business_day",
     "market_holidays", "is_market_holiday",
@@ -55,6 +57,21 @@ MIN_SESSION_BARS = 5             # 少于这个数的会话不可用（数据缺
 #: 会话末根 bar 的最早允许开盘 ET 时刻：15:00（其收盘 = 16:00 ET，与日线收盘对齐）。
 #: 14:00 及更早的末根意味着午后缺数，该会话的「收盘」是假的 —— 整日弃用。
 MIN_LAST_BAR_ET = (15, 0)
+
+#: NYSE **提前收盘**（13:00 ET，半日市）的日期，只列官方日历已公布的确定值。
+#: 半日市的会话窗口是 [09:30, 13:00)，末根门槛 12:00（其收盘 = 13:00，与半日市
+#: 收盘对齐）。**不要把 13:00 及以后的盘后 bar 当会话末根** —— 那会把 13:00 的
+#: 盘后成交当成「全天收盘价」喂给 RSI2/SMA5。
+#: 未列出的年份按常规交易处理（宁可多算一根，也不凭规则猜哪天提前收盘）。
+EARLY_CLOSE_DATES = frozenset({
+    "2025-07-03",                      # 独立日前的周五
+    "2025-11-28",                      # 感恩节后
+    "2025-12-24",                      # 平安夜
+    "2026-11-27", "2026-12-24",
+    "2027-11-26",
+})
+EARLY_CLOSE_END = (13, 0)              # 窗口右端点（不含）
+EARLY_CLOSE_MIN_LAST = (12, 0)         # 半日市末根 bar 的最早允许开盘时刻
 
 
 @dataclass(frozen=True)
@@ -100,11 +117,13 @@ def aggregate_sessions_ex(hourly_rows: Sequence[Mapping[str, Any]]
                           ) -> Tuple[List[SessionBar], List[dict]]:
     """1h K 线（升序）→（可用会话 OHLC 升序, 被丢弃的会话明细）。
 
-    归属规则：bar 的 **开盘时刻**（ET）落在 [09:30, 16:00) 内且为周一至周五。
+    归属规则：bar 的 **开盘时刻**（ET）落在 [09:30, 16:00) 内（半日市为
+    [09:30, 13:00)，见 ``EARLY_CLOSE_DATES``），且该日不是周末、也不是 NYSE
+    全日休市日（``is_market_holiday``）。
     每个会话取首根 bar 的 open、末根 bar 的 close、全体 high/low。
     少于 ``MIN_SESSION_BARS`` 根、或末根 bar 早于 ``MIN_LAST_BAR_ET``
-    （盘中数据缺失）的会话直接丢弃，**并返回原因**（`too_few_bars` /
-    `missing_close_bar`）—— 2026-11-02 第五轮复核：只丢弃不报告，等于
+    （半日市为 ``EARLY_CLOSE_MIN_LAST``；盘中数据缺失）的会话直接丢弃，**并返回原因**
+    （`too_few_bars` / `missing_close_bar`）—— 2026-11-02 第五轮复核：只丢弃不报告，等于
     「数据源抖动 → 一整天静默没信号」，调用方至少要把这件事落一条审计事件。
     """
     buckets: "dict[str, list]" = {}
@@ -113,25 +132,34 @@ def aggregate_sessions_ex(hourly_rows: Sequence[Mapping[str, Any]]
         if parsed is None:
             continue
         et, o, h, low, c = parsed
-        start = datetime.combine(et.date(), _time(*SESSION_START),
-                                 tzinfo=ZoneInfo(SESSION_TZ))
-        end = datetime.combine(et.date(), _time(*SESSION_END),
-                               tzinfo=ZoneInfo(SESSION_TZ))
-        if et.weekday() >= 5 or not (start <= et < end):
+        day = et.date()
+        # 交易日历：周末 + NYSE 规则假日（`market_holidays`，同模块下方定义，运行时可用）。
+        # 24/7 永续在假日仍有 6 根「09:30–16:00」的合法 bar，旧版不过滤 → 假日也会产出
+        # 一个完整会话，假信号在下一个真交易日开盘成交。假日直接不入桶（不是丢弃会话）。
+        if day.weekday() >= 5 or is_market_holiday(day):
             continue
-        buckets.setdefault(et.strftime("%Y-%m-%d"), []).append((et, o, h, low, c))
+        key = day.strftime("%Y-%m-%d")
+        early = key in EARLY_CLOSE_DATES
+        start = datetime.combine(day, _time(*SESSION_START),
+                                 tzinfo=ZoneInfo(SESSION_TZ))
+        end = datetime.combine(day, _time(*(EARLY_CLOSE_END if early else SESSION_END)),
+                               tzinfo=ZoneInfo(SESSION_TZ))
+        if not (start <= et < end):
+            continue
+        buckets.setdefault(key, []).append((et, o, h, low, c))
 
     out: List[SessionBar] = []
     dropped: List[dict] = []
     for date in sorted(buckets):
         rows = buckets[date]
         last_et = rows[-1][0]
+        min_last = EARLY_CLOSE_MIN_LAST if date in EARLY_CLOSE_DATES else MIN_LAST_BAR_ET
         if len(rows) < MIN_SESSION_BARS:
             dropped.append({"date": date, "bars": len(rows),
                             "last_bar_et": last_et.strftime("%H:%M"),
                             "reason": "too_few_bars"})
             continue
-        if (last_et.hour, last_et.minute) < MIN_LAST_BAR_ET:
+        if (last_et.hour, last_et.minute) < min_last:
             dropped.append({"date": date, "bars": len(rows),
                             "last_bar_et": last_et.strftime("%H:%M"),
                             "reason": "missing_close_bar"})

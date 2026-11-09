@@ -182,6 +182,11 @@ KILL_CLEAN_ROUNDS = 2
 KILL_CLEAN_TS_KEY = "hl_kill_clean_last_ts"
 KILL_CLEAN_MIN_GAP_S = 60.0
 
+# 已实现亏损熔断的告警节流键（24h 一条 warn）：键名同时是 alerts 里 tuple 的「成功才
+# 写」键（见 _run_locked 末尾的推送循环）—— 推不出去就不记账，下一轮会再试。
+REALIZED_DD_WARN_KEY = "hl_realized_dd_warn_at"
+REALIZED_DD_WARN_GAP_S = 24 * 3600.0
+
 # 定点回捞成交（证据不足那一轮才发，最多 2 次、间隔 1s）：
 #   窗口起点 = opened_at − 120s（与本地 _fill_close_proof 的下界同一口径），
 #   只用开始时间而不是「开始+结束」—— 平仓成交一定在 opened_at 之后，
@@ -482,6 +487,19 @@ class ExecParams:
     dd_warn_pct: float = 0.0
     dd_kill_pct: float = 0.0
     code_rev: str = ""
+    # 已实现亏损熔断（审计三轮）：替代 Kraken 上永远不可判的流水口径 DD/L1。
+    #   rate = （近 window_days 天 Σ(closed_pnl − fee)）/ 当前 equity_total
+    #   rate <= −kill_pct → kill（origin='realized_dd'）；rate <= −warn_pct → 24h 一条提醒。
+    # 口径与局限（务必与文档/面板一致）：
+    #   - **只含已实现**：closed_pnl 取交易所成交真值（缺失按 0），不含浮亏 —— 一个正在
+    #     大幅浮亏的账户这条线看不到，浮亏由止损/DD 线负责；
+    #   - 手续费是**估算**（fee_quote 优先、否则 fee 原值），币种无法折算时按原值累加；
+    #   - 提现/入金**不影响**这条线（只看到盈亏，不看到本金流动），所以不会像旧 L1 那样
+    #     把提现当亏损误杀；
+    #   - kill **只停新开仓，不平仓**：现有仓位仍按止损/SMA20 离场走完。
+    realized_dd_warn_pct: float = 0.10
+    realized_dd_kill_pct: float = 0.20
+    realized_dd_window_days: int = 30
 
     @property
     def follow(self) -> bool:
@@ -739,6 +757,63 @@ class Executor:
         closing_pending: List[dict] = []
         # 本轮已被某个仓消耗掉的成交 tid（M5）：一笔成交只能关一个仓，见 _fill_close_proof。
         consumed_tids: set = set()
+        # 【审计三轮 P1】pending 行升级 open：on_entry 在「交易所成交 → confirm_position」
+        # 之间崩溃时本地行还是 pending，交易所里却是真实仓位。旧逻辑只把它当「有仓」对账，
+        # 状态永远停在 pending → 面板/看护/开仓槽位都按「未确认信号」处理，真实仓位
+        # 既不会被判 mismatch 也永远不会变成 open。
+        # 只在证据齐全时升级（fail-closed）：① 真的发过入场单（_entry_issued）；
+        # ② 交易所侧确有该 coin 的仓、且方向与本地一致；③ 已有方向正确、数量足够的止损。
+        # 没有止损的**不**在这里升级：塞进 missing_stop 走既有的 _repair_missing_stop
+        # （补挂成功路径自己会 set_pos_hl(hl_status='open')）。
+        # 位置在 local_open 之前：本轮升级过的行下一段读出来就是 open，不会同一轮
+        # 既 pending 又 open 再被判一次「有仓没止损」。
+        pending_nostop: set = set()
+        for r in self.db.recent_positions(50):
+            if r["status"] != "pending" or not self._entry_issued(r):
+                continue
+            coin_p = self._coin_or_none(r["symbol"])
+            if coin_p is None:
+                continue                       # 未注册标的：主循环会报 problem
+            pos = ex_pos.get(coin_p)
+            if not pos:
+                continue                       # 交易所无仓/读不到 → 交给现有逻辑
+            try:
+                ex_side = int(pos.get("side") or 0)
+                ex_sz = abs(float(pos.get("size") or 0.0))
+            except (TypeError, ValueError):
+                continue
+            loc_side = int(r["side"] or 0)
+            if loc_side and ex_side and ex_side != loc_side:
+                continue                       # 方向不一致：不猜，留给现有逻辑
+            if ex_sz <= 0:
+                continue
+            if not trusted:
+                continue                       # 挂单表不可信 → 判不了止损，不升级也不补挂
+            if self._has_stop(snap, coin_p, side=(loc_side or None), sz=ex_sz):
+                # 成交价优先取入场单回执（avg_px，其次意图价 px），都没有才用信号价；
+                # 这只是补账口径的近似值，下一轮数量对账/流水口径会继续校正。
+                entry_px = float(r["entry_price"] or 0.0)
+                try:
+                    o = self.db.hl_order(r["symbol"], int(r["signal_bar_ms"] or 0), PURPOSE_ENTRY)
+                    if o is not None:
+                        entry_px = float(o["avg_px"] or o["px"] or entry_px)
+                except Exception as ex:                              # noqa: BLE001
+                    logger.warning("[hl-exec] pending 补账读入场单失败（用信号价）：%s", ex)
+                stop_px = float(r["actual_stop"] or r["stop_price"] or 0.0)
+                # 只标 hl_status 不够：引擎按 positions.status=='pending' 判断「还没确认」，
+                # 3 根 bar 后会 ignore_position —— 真仓会从账本里消失。必须一起翻成 open。
+                self.db.promote_position(int(r["id"]), entry_px, ex_sz, stop_px,
+                                         opened_at=float(r["created_at"] or 0) or None)
+                self.db.set_pos_hl(int(r["id"]), hl_sz=ex_sz, hl_status="open")
+                self._event(EV_RECONCILE,
+                            f"{r['symbol']} pending 行补齐：交易所已有 {ex_sz} "
+                            f"{'多' if loc_side >= 0 else '空'}仓且止损在场 → 标记 open",
+                            symbol=r["symbol"],
+                            data={"pid": int(r["id"]), "coin": coin_p, "hl_sz": ex_sz,
+                                  "entry_px": entry_px, "stop_px": stop_px})
+            else:
+                pending_nostop.add(int(r["id"]))
+                missing_stop.append(dict(r))
         local_open = [r for r in self.db.recent_positions(50)
                       if r["status"] in ("open", "pending")
                       # hl_status 为 NULL 也算：on_entry 在「入场成交→落库」之间崩溃时
@@ -822,7 +897,13 @@ class Executor:
             # 传 dict(r)：_size_* 里用 .get()，而 sqlite3.Row 没有 get（会 AttributeError）。
             if tx := self._size_check(dict(r), ex_pos[coin], kill_before=kill_before):
                 (size_problems if tx["kill"] else size_warn).append(tx["message"])
-            if not self._has_stop(snap, coin):
+            # 止损判定（审计三轮）：除了「有没有触发单」，还要求方向相反、数量够。
+            # 传入本地 side 与 hl_sz（hl_sz<=0 表示本地不知量 → 不传 sz，只判方向）。
+            loc_sz = float(r["hl_sz"] or 0.0)
+            if (int(r["id"]) not in pending_nostop
+                    and not self._has_stop(snap, coin,
+                                           side=(int(r["side"] or 0) or None),
+                                           sz=(loc_sz if loc_sz > 0 else None))):
                 if trusted:
                     problems.append(f"{r['symbol']} 有仓但**没有止损挂单**")
                     missing_stop.append(dict(r))
@@ -1398,6 +1479,87 @@ class Executor:
             self._alert(f"【Kraken】⚠️ {symbol} 已按成交价关账，但挂单表读取失败"
                         f"（{scan_failed[:120]}），无法确认是否还残留 reduce-only 止损单 —— "
                         f"请到 Kraken 看一眼挂单。", symbol=symbol)
+
+    def _verify_no_residual_stops(self, row, coin: str) -> None:
+        """平仓关账后复核：交易所侧是否还留着该 coin 的 reduce-only 触发单（残留止损）。
+
+        为什么必须复核（审计三轮）：离场第 1 步撤止损的结果可能失败（接口抖动/单已不在/
+        被拒），也可能「撤掉的是本地记的那一张、场上还有另一张」（stop:fix 与 exit:rehang
+        并存）。仓位已经没了、触发单还在，对**下一笔**开仓是致命的 —— 同一 coin 再开仓时
+        它会被触发，把新仓直接平掉（而本地账本以为新仓有保护）。
+
+        口径与 `_cancel_residual_stops` 一致，但数据源换成交易所实时挂单表
+        （``self.ex._open_orders_checked()``）：关账那一刻的快照已经过期了。
+        - 读不到/不可信（trusted=False）→ **一条告警**喊人看，绝不凭猜撤单；
+        - 可信 → 只针对**这个 coin** 的 is_trigger + reduce_only 逐个撤，按 oid 回写对应
+          DB 行为 cancelled；撤不掉的收成**一条**告警（列出 oid + 错误）。
+        不认识的 coin 一律不做 cancel_all：那会把别的仓的保护单一起撤掉。
+
+        适配器没有这个能力（老 MEXC 适配器 / 测试桩）时只记 debug：它同样没有「按 coin
+        读挂单」的语义，硬造一次调用等于拿错误数据做撤单决定。
+        """
+        symbol = str(row["symbol"])
+        fn = getattr(self.ex, "_open_orders_checked", None)
+        if not callable(fn):
+            logger.debug("[hl-exec] %s 平仓后复核跳过：交易所适配器无 _open_orders_checked", symbol)
+            return
+        try:
+            orders, trusted = fn()
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] %s 平仓后读挂单表异常（按不可信处理）：%s", symbol, e)
+            orders, trusted = [], False
+        if not trusted:
+            self._alert(f"【Kraken】⚠️ {coin} 平仓后挂单表读取失败，无法确认是否残留 "
+                        f"reduce-only 止损，请到 Kraken 看一眼", symbol=symbol)
+            return
+        residual: List[dict] = []
+        for o in orders or []:
+            if o.get("coin") != coin:
+                continue
+            if not (o.get("is_trigger") and o.get("reduce_only")):
+                continue
+            residual.append(dict(o))
+        if not residual:
+            return
+        failed: List[str] = []
+        for o in residual:
+            oid = o.get("oid")
+            if not oid:
+                # 没有 oid 不知道撤哪张（也不许 cancel_all）：只留痕，交给告警文案。
+                failed.append("（交易所返回的挂单缺 oid，无法撤）")
+                continue
+            try:
+                res = self.ex.cancel(coin, oid)
+            except Exception as e:                                   # noqa: BLE001
+                res = {"ok": False, "error": f"撤单异常：{e}"}
+            if not bool(res.get("ok")):
+                err = str(res.get("error") or "未知错误")[:300]
+                failed.append(f"{oid}（{err}）")
+                self._event(EV_ERROR,
+                            f"{symbol} 平仓后残留止损单 {oid} 撤销失败（{err}）→ 需人工撤单",
+                            symbol=symbol, data={"oid": oid, "error": err})
+                continue
+            # 按 oid 把对应 DB 行落到终态（三处 purpose 都可能，跨 bar 扫描）
+            hit = None
+            try:
+                for r in self.db.hl_recent_orders(200):
+                    if (r["symbol"] == symbol
+                            and r["purpose"] in (PURPOSE_STOP, PURPOSE_STOP + ":fix",
+                                                 PURPOSE_EXIT_REHANG)
+                            and r["oid"] is not None and str(r["oid"]) == str(oid)):
+                        self.db.hl_update_order(symbol, int(r["bar_ms"]), r["purpose"],
+                                                status=ST_CANCELLED, error=None)
+                        hit = r["purpose"]
+            except Exception as e:                                   # noqa: BLE001
+                logger.warning("[hl-exec] %s 残留止损 %s 撤后回写失败（忽略）：%s", symbol, oid, e)
+            self._event(EV_ORDER,
+                        f"{symbol} 平仓后撤掉残留止损单 {oid}"
+                        + (f"（{hit}）" if hit else "（DB 无对应行）"),
+                        symbol=symbol, data={"oid": oid, "purpose": hit})
+        if failed:
+            self._alert(f"【Kraken】🛑 {coin} 已平仓，但交易所侧仍有撤不掉的 reduce-only "
+                        f"止损单：{'；'.join(failed)}。该单若被触发会平掉**下一笔**新仓 —— "
+                        f"请立即到 Kraken 手工撤单并核对。", symbol=symbol)
 
     # ------------------------------------------------------------ 数量对账（PR-3）
     def _tick_bucket(self) -> Optional[Dict[str, Tuple[float, float]]]:
@@ -2057,11 +2219,55 @@ class Executor:
             return px if px > 0 else None
         return None
 
-    @staticmethod
-    def _has_stop(snap: dict, coin: str) -> bool:
+    def _has_stop(self, snap: dict, coin: str, side: Optional[int] = None,
+                  sz: Optional[float] = None) -> bool:
+        """该 coin 在快照里是否有**真正能保护当前仓位**的止损单。
+
+        旧实现只看 coin + reduce_only + is_trigger → fail-open：方向反了（多仓挂 buy 触发
+        只会加仓不会止损）、数量不够（部分成交后只剩 1/3 的量）、trigger_px 为 0/空
+        （等于市价单）都算「有止损」。对账据此不再补挂 → 裸仓被记成有保护。
+
+        现在（审计三轮）：
+        - 基础三条件不变（coin / reduce_only / is_trigger）；
+        - ``trigger_px`` 必须 > 0（0/NULL 的触发单不是有效保护）；
+        - 给了 ``side`` → 方向必须相反：多仓（side=1）要卖单（is_buy=False），
+          空仓（side=-1）要买单（is_buy=True）；
+        - 给了 ``sz``（>0）→ 张数必须 ≥ sz − 1 tick（拿不到 tick 时退化成 sz*1e-6 的
+          相对噪声容差：浮点往返本来就会差几十个末位）。
+
+        默认参数保留，旧调用（只判「有没有」）行为不变。
+        """
+        try:
+            need_sz = float(sz) if sz is not None else 0.0
+        except (TypeError, ValueError):
+            need_sz = 0.0
+        tol = 0.0
+        if need_sz > 0:
+            tick = self._size_tick(coin) if hasattr(self, "info") else None
+            tol = float(tick) if tick and tick > 0 else need_sz * 1e-6
         for o in snap.get("open_orders") or []:
-            if o.get("coin") == coin and o.get("reduce_only") and o.get("is_trigger"):
-                return True
+            if o.get("coin") != coin or not o.get("reduce_only") or not o.get("is_trigger"):
+                continue
+            try:
+                if float(o.get("trigger_px") or 0.0) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if side is not None:
+                try:
+                    is_buy = bool(o.get("is_buy"))
+                except Exception:                                    # noqa: BLE001
+                    continue
+                if is_buy != (int(side) < 0):
+                    continue
+            if need_sz > 0:
+                try:
+                    osz = float(o.get("sz") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if osz < need_sz - tol:
+                    continue
+            return True
         return False
 
     # ------------------------------------------------------------ 闸门
@@ -2555,6 +2761,9 @@ class Executor:
                             f"（宽限内自动重试），无需人工操作")
                 return True
             self._close_local(position_id, px or ref_price, "stop", sz)
+            # 关账后复核残留止损（审计三轮）：成交的是**那张**触发单，但同一 coin 上
+            # 可能还挂着 stop:fix / exit:rehang 的另一张，仓位没了它们会咬下一笔新仓。
+            self._verify_no_residual_stops(row, coin)
             r = self._r_multiple(row, px or ref_price)
             self._alert(f"【Kraken】🛑 止损离场 · {coin} {'做多' if side == 1 else '做空'}\n"
                         f"止损单已由交易所触发 @ {px or ref_price:,.2f}，本地已关账（R {r:+.2f}）")
@@ -2599,6 +2808,7 @@ class Executor:
         #    但它照样**计入 churn**：真正的「撤-挂-撤-挂」风暴往往就是从这里开始的，
         #    计数不能因为动作被豁免而漏掉。
         cancelled_purposes = []
+        cancel_failed: List[str] = []
         for purpose in (PURPOSE_STOP, PURPOSE_STOP + ":fix", PURPOSE_EXIT_REHANG):
             so = self.db.hl_order(symbol, bar_ms, purpose)
             if purpose == PURPOSE_EXIT_REHANG:
@@ -2608,18 +2818,55 @@ class Executor:
                     if (r["symbol"] == symbol and r["purpose"] == purpose
                             and r["status"] in (ST_RESTING, ST_SENT) and r["oid"]):
                         # oid 原样传（Kraken 单号是 UUID 字符串，不能 int()）
-                        self.ex.cancel(coin, r["oid"])
+                        try:
+                            res = self.ex.cancel(coin, r["oid"])
+                        except Exception as ex:                      # noqa: BLE001
+                            res = {"ok": False, "error": f"撤单异常：{ex}"}
                         self._churn_note(coin, side)
-                        self.db.hl_update_order(symbol, int(r["bar_ms"]), purpose,
-                                                status="cancelled")
-                        cancelled_purposes.append(purpose)
+                        # 撤单结果必须检查（审计三轮）：以前丢掉返回值就无条件把行写成
+                        # cancelled —— 撤单被拒/超时后那张 reduce-only 触发单**还在场上**，
+                        # 本地却记成「已撤」，面板/看护不再提，它将咬下一笔开仓。
+                        if bool(res.get("ok")):
+                            self.db.hl_update_order(symbol, int(r["bar_ms"]), purpose,
+                                                    status="cancelled", error=None)
+                            cancelled_purposes.append(purpose)
+                        else:
+                            err = str(res.get("error") or "未知错误")[:300]
+                            # 行保持 resting/sent（本地仍认为它可能在场上）+ 记错误
+                            self.db.hl_update_order(symbol, int(r["bar_ms"]), purpose, error=err)
+                            self._event(EV_ERROR,
+                                        f"{symbol} 离场前撤止损失败（{purpose} {r['oid']}）：{err}"
+                                        f"→ 行保持 {r['status']}，需人工撤单",
+                                        symbol=symbol,
+                                        data={"oid": r["oid"], "purpose": purpose, "error": err})
+                            cancel_failed.append(f"{r['oid']}（{err}）")
                 continue
             if so is not None and so["oid"] and so["status"] in (ST_RESTING, ST_SENT, ST_FILLED):
                 # oid 原样传（Kraken 单号是 UUID 字符串，不能 int()）
-                self.ex.cancel(coin, so["oid"])
+                try:
+                    res = self.ex.cancel(coin, so["oid"])
+                except Exception as ex:                              # noqa: BLE001
+                    res = {"ok": False, "error": f"撤单异常：{ex}"}
                 self._churn_note(coin, side)
-                self.db.hl_update_order(symbol, bar_ms, purpose, status="cancelled")
-                cancelled_purposes.append(purpose)
+                if bool(res.get("ok")):
+                    self.db.hl_update_order(symbol, bar_ms, purpose, status="cancelled",
+                                            error=None)
+                    cancelled_purposes.append(purpose)
+                else:
+                    err = str(res.get("error") or "未知错误")[:300]
+                    self.db.hl_update_order(symbol, bar_ms, purpose, error=err)
+                    self._event(EV_ERROR,
+                                f"{symbol} 离场前撤止损失败（{purpose} {so['oid']}）：{err}"
+                                f"→ 行保持 {so['status']}，需人工撤单",
+                                symbol=symbol,
+                                data={"oid": so["oid"], "purpose": purpose, "error": err})
+                    cancel_failed.append(f"{so['oid']}（{err}）")
+        # 同一轮只发一条汇总（逐个 oid 列出来，别让人翻半小时日志）
+        if cancel_failed:
+            self._alert(f"【Kraken】🛑 {coin} 离场前撤止损单失败：{'；'.join(cancel_failed)}。"
+                        f"这些 reduce-only 触发单可能**仍在交易所**（本地未标 cancelled），"
+                        f"平仓后若残留会咬下一笔开仓 —— 请立即到 Kraken 手工撤单并核对。",
+                        symbol=symbol)
         # 2) 平仓（reduce-only IOC）。限价必须按**平仓方向**算滑点
         #    （买入平空 = mid×(1+s)，卖出平多 = mid×(1−s)；用开仓方向的限价会让
         #     卖单拿到比 mid 高的最低可接受价 → 滑点保护完全失效）。
@@ -2698,11 +2945,26 @@ class Executor:
                            "error": "churn 熔断：停止重挂止损，改为市价平仓"}
             # 重挂成功的判据同样排除 not_executed（委托簿里没有这张单 = 仍然裸仓）。
             re_ok = _order_live(re_stop)
-            self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side, sz,
-                                     px=re_stop_px, reduce_only=True,
-                                     status=(re_stop.get("status") if re_ok else ST_FAILED),
-                                     cloid=rehang_cloid,
-                                     error=None if re_ok else str(re_stop.get("error"))[:300])
+            re_status = re_stop.get("status") if re_ok else ST_FAILED
+            re_err = None if re_ok else str(re_stop.get("error"))[:300]
+            try:
+                self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side, sz,
+                                         px=re_stop_px, reduce_only=True, status=re_status,
+                                         cloid=rehang_cloid, error=re_err,
+                                         oid=re_stop.get("oid"))
+            except Exception as ex:                                   # noqa: BLE001
+                logger.warning("[hl-exec] 重挂意图落库失败（忽略）：%s", ex)
+            # 审计三轮：record_intent 是 INSERT OR IGNORE —— 同一 (symbol, 离场 bar,
+            # purpose) 第二次重挂不会写入新的 oid，于是「同 bar 多次重挂」时 DB 里留的
+            # 是第一张单的 oid（甚至 NULL），下次离场撤残留止损按 `and r['oid']` 撤不到
+            # 真正在场的那张。这里必须显式 update 到**最新**一次的结果。
+            try:
+                self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG,
+                                        oid=re_stop.get("oid"), status=re_status,
+                                        cloid=rehang_cloid, error=re_err,
+                                        px=re_stop_px, sz=sz)
+            except Exception as ex:                                   # noqa: BLE001
+                logger.warning("[hl-exec] 重挂结果回写失败（忽略）：%s", ex)
             if re_ok:
                 self._event(EV_ERROR, f"{symbol} 平仓未成交（resting），已撤单并重挂止损"
                                       f"（{re_stop.get('status')} @ {re_stop_px:,.2f}）", symbol=symbol)
@@ -2724,6 +2986,7 @@ class Executor:
                                         oid=close.get("oid"), filled_sz=close.get("filled_sz"),
                                         avg_px=px, raw=str(close.get("raw"))[:2000])
                 self._close_local(position_id, px, reason, sz)
+                self._verify_no_residual_stops(row, coin)     # 审计三轮：残留止损复核
                 r = self._r_multiple(row, px)
                 self._alert(f"【Kraken】⚠️ {coin} 平仓未成交、止损重挂失败，已市价平仓"
                             f" @ {px:,.2f}（R {r:+.2f}）。请人工核对。")
@@ -2739,6 +3002,14 @@ class Executor:
             # 留 open 让下一轮 on_exit / 对账继续跟进。
             filled = float(res["filled_sz"] or 0)
             remain = sz - filled
+            # 审计三轮：部分成交后本地 hl_sz 必须立刻减到剩余量。不减的话：
+            # ① 下一轮离场仍按原量下 IOC（超出持仓 → 交易所拒单/只成剩余）；
+            # ② 数量对账把「本地 sz > 交易所 sz」判成账实不符 → 误 kill。
+            # 放在重挂止损**之前**：后续任何一步抛错/返回，本地量都已经是对的。
+            try:
+                self.db.set_pos_hl(position_id, hl_sz=remain)
+            except Exception as ex:                                  # noqa: BLE001
+                logger.warning("[hl-exec] 部分成交后回写 hl_sz 失败（忽略）：%s", ex)
             # 审计四轮 P2：这张 IOC 已经结束了（成交一半），必须把 exit 行改成 filled。
             # 旧代码不更新它 → hl_orders 里永久停在 sent，看护把它当「卡住的意图单」
             # 每轮告警、面板对账判 mismatch（复现见 tests/test_audit4_p1.py）。
@@ -2774,14 +3045,24 @@ class Executor:
                            "error": "churn 熔断：停止重挂剩余量止损，改为市价平仓"}
             # 重挂成功的判据同样排除 not_executed（委托簿里没有这张单 = 仍然裸仓）。
             re_ok = _order_live(re_stop)
+            re2_status = re_stop.get("status") if re_ok else ST_FAILED
+            re2_err = None if re_ok else str(re_stop.get("error"))[:300]
             try:
                 self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side,
                                          remain, px=re_px, reduce_only=True,
-                                         status=(re_stop.get("status") if re_ok else ST_FAILED),
-                                         cloid=rehang_cloid,
-                                         error=None if re_ok else str(re_stop.get("error"))[:300])
+                                         status=re2_status, cloid=rehang_cloid,
+                                         error=re2_err, oid=re_stop.get("oid"))
             except Exception as ex:                                   # noqa: BLE001
                 logger.warning("[hl-exec] 部分成交重挂记录失败（忽略）：%s", ex)
+            # 同第一节：INSERT OR IGNORE 不会更新已存在的行 → 显式回写**最新**一次重挂
+            # 的 oid/状态/数量（同一离场 bar 上可能重挂过多次，旧 oid 是幽灵单）。
+            try:
+                self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG,
+                                        oid=re_stop.get("oid"), status=re2_status,
+                                        cloid=rehang_cloid, error=re2_err,
+                                        px=re_px, sz=remain)
+            except Exception as ex:                                   # noqa: BLE001
+                logger.warning("[hl-exec] 部分成交重挂回写失败（忽略）：%s", ex)
             if re_ok:
                 self._event(EV_ERROR, f"{symbol} 部分成交后止损已按剩余量 {remain} 重挂",
                             symbol=symbol)
@@ -2806,6 +3087,7 @@ class Executor:
                 if c2_ok and float(close2.get("filled_sz") or 0) + 1e-12 >= remain:
                     px2 = float(close2.get("avg_px") or close_px2)
                     self._close_local(position_id, px2, reason, sz)
+                    self._verify_no_residual_stops(row, coin)     # 审计三轮：残留止损复核
                     r = self._r_multiple(row, px2)
                     self._event(EV_ORDER, f"{symbol} 剩余量已平 @ {px2:,.2f}（{reason}）",
                                 symbol=symbol, data={"r": r})
@@ -2816,6 +3098,8 @@ class Executor:
                                 oid=res.get("oid"), filled_sz=res.get("filled_sz"), avg_px=px,
                                 raw=str(res.get("raw"))[:2000])
         self._close_local(position_id, px, reason, sz)
+        # 审计三轮：全量平仓成功后复核交易所侧是否还给这个 coin 留着触发单
+        self._verify_no_residual_stops(row, coin)
         r = self._r_multiple(row, px)
         gross = (px - float(row["actual_entry"] or row["entry_price"])) * sz * (1 if side == 1 else -1)
         # 平仓手续费在下一轮 _sync_fills 才会进库 —— 先同步一次再算，否则净利少算平仓费
@@ -3398,6 +3682,79 @@ class Executor:
                 "\n已停止开新仓（持仓按既有规则离场，不强制平仓）。\n"
                 "请人工核对后到「开关」页解除。")
 
+    def _realized_dd_guard(self, snap: dict, alerts: List[str]) -> Optional[Dict[str, Any]]:
+        """已实现亏损熔断（审计三轮）：Kraken 上没有流水源 → 用「已实现净额」代替 DD/L1。
+
+        为什么要替代：L1（当日亏损）和 DD Guard 的判据都要「本轮真的同步到出入金流水」
+        （否则提现会被当成亏损误杀）；Kraken 期货**没有出入金端点**，这两条线在 Kraken
+        上永远是「未判」= 等于没有累计亏损保护。
+
+        口径：
+            net  = Σ(closed_pnl − fee) over hl_fills where ts >= now − window_days 天
+            rate = net / equity_total（当前账户总值）
+        - 只含**已实现**：closed_pnl 是交易所成交真值（缺失按 0）。浮亏看不见 ——
+          止损/DD 线负责那一段；
+        - 手续费是估算（fee_quote 折算优先，老行回退 fee 原值），币种无法折算时会把
+          「币的数量」当 U 累加，误差在少数几笔上可忽略但在极端情况下不为零；
+        - 提现/入金**不影响**：本口径只读盈亏，不读本金流动；反过来说，大额提现会让
+          分母（equity）变小、比率变敏感，这是刻意的（剩余资金承受的累计亏损更重）；
+        - kill **只停新开仓，不平仓**：已有仓位按止损/SMA20 离场走完。
+
+        返回 {"net","rate","base","window_days","action"} 或 None（不判）。
+        """
+        win_days = int(getattr(self.p, "realized_dd_window_days", 30) or 0)
+        if win_days <= 0:
+            return None
+        try:
+            base = float(snap.get("equity_total", snap.get("equity")) or 0.0)
+        except (TypeError, ValueError):
+            base = 0.0
+        if base <= 0:
+            # 权益读不到/为 0：比率没有意义（除以 0 或放大），跳过而不是瞎判。
+            logger.debug("[hl-exec] 权益不可用（%s），本轮跳过已实现亏损熔断", base)
+            return None
+        since = time.time() - win_days * 86400.0
+        net = float(self.db.hl_realized_net_since(since) or 0.0)
+        rate = net / base
+        warn = float(getattr(self.p, "realized_dd_warn_pct", 0.10) or 0.0)
+        kill = float(getattr(self.p, "realized_dd_kill_pct", 0.20) or 0.0)
+        res = {"net": net, "rate": rate, "base": base, "window_days": win_days,
+               "warn": warn, "kill": kill, "action": "none", "ts": time.time()}
+        if kill > 0 and rate <= -kill:
+            if bool(self.db.hl_kill()):
+                # 已经有 kill（可能是人工/对账/别处）：不重复写、不刷事件。
+                res["action"] = "already_killed"
+                return res
+            self.db.hl_set_kill(True, "已实现亏损熔断", origin="realized_dd")
+            self._event(EV_KILL,
+                        f"近 {win_days} 天已实现净额 {net:+,.2f}U（{rate * 100:+.1f}%）"
+                        f"≤ -{kill * 100:g}% → 停止自动开仓",
+                        data={"net": round(net, 6), "rate": round(rate, 6),
+                              "base": base, "window_days": win_days, "origin": "realized_dd"})
+            alerts.append(f"【Kraken】🛑 已实现亏损熔断：近 {win_days} 天净亏 "
+                          f"{-net:,.2f}U（{rate * 100:+.1f}%，阈值 -{kill * 100:g}%）"
+                          f"→ 已停止自动**开仓**（不自动平仓，持仓按止损/均线离场走完）。"
+                          f"核对后可在面板恢复。")
+            res["action"] = "kill"
+            return res
+        if warn > 0 and rate <= -warn:
+            res["action"] = "warn"
+            if bool(self.db.hl_kill()):
+                # 已 kill（且不是这条线造成的）就没必要再提醒「接近阈值」。
+                res["action"] = "already_killed"
+                return res
+            last = float(self.db.get_config_str(REALIZED_DD_WARN_KEY) or 0)
+            if (time.time() - last) < REALIZED_DD_WARN_GAP_S:
+                res["action"] = "warn_throttled"
+                return res
+            # 用 tuple（key, text）：推送成功才写节流键（见 _run_locked 末尾循环）。
+            alerts.append((REALIZED_DD_WARN_KEY,
+                           f"【Kraken】⚠️ 已实现亏损提醒：近 {win_days} 天净亏 "
+                           f"{-net:,.2f}U（{rate * 100:+.1f}%，熔断线 -{kill * 100:g}%）。"
+                           f"未触发熔断，继续按策略执行。"))
+            return res
+        return res
+
     def _dd_guard(self, snap: dict, alerts: List[str]) -> Optional[Dict[str, Any]]:
         """算一轮策略口径回撤并判线（L2 告警 / L3 熔断）。返回本轮结果，未判 → None。
 
@@ -3816,8 +4173,13 @@ class Executor:
             # 「活着但读不到账户」会被误报成「执行器死了」。
             self._event(EV_HEARTBEAT, "executor 心跳（读不到账户快照，已降级）",
                         data={"kill": self.db.hl_kill(), "mode": self.p.mode, "degraded": True})
-            alerts.append("【Kraken】⚠️ 读不到 Kraken 账户快照（已连续重试），本轮跳过对账/熔断/成交同步。"
-                          "若持续出现请检查网络或 Kraken 状态。")
+            text = ("【Kraken】⚠️ 读不到 Kraken 账户快照（已连续重试），本轮跳过对账/熔断/成交同步。"
+                    "若持续出现请检查网络或 Kraken 状态。")
+            alerts.append(text)
+            # 审计三轮：这一支以前只是 append 后 return —— 推送循环在函数**末尾**，
+            # 所以这条最常见的降级告警从来没被真正推出去（只有返回给调用方，取决于
+            # 调用方是否转发）。这是「执行器活着但看不见账户」的唯一信号，必须直推。
+            self._alert(text)
             return alerts
 
         # 1) 同步成交到本地（面板的「最近成交/手续费累计/今日与累计已实现」全靠 hl_fills；
@@ -3987,6 +4349,17 @@ class Executor:
                                       "flows": round(flow_today, 6), "base_ts": base_ts})
                     alerts.append(f"【Kraken】⚠️ 当日亏损 {loss_rate * 100:.1f}%"
                                   f"（阈值 -{self.p.max_daily_loss_pct * 100:g}%）→ 已停止自动交易")
+
+        # 3a-bis) 已实现亏损熔断（审计三轮）：Kraken 期货没有出入金流水端点 → L1（当日
+        #     亏损）与 DD Guard（策略回撤）在上面/下面**永远走「未判」分支**，等于累计
+        #     亏损没有任何保护。这里用「近 N 天已实现净额 / 当前权益」补上这一层：
+        #     只读 hl_fills（closed_pnl 真值 + 手续费估算），不含浮亏、不受提现入金影响，
+        #     kill 只停新开仓、不平仓。判错口径绝不能连累主流程 → 整段 try/except。
+        try:
+            self._realized_dd_guard(snap, alerts)
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 已实现亏损熔断计算失败（本轮不判）：%s", e)
+            self._event(EV_ERROR, f"已实现亏损熔断计算失败（本轮不判）：{e}"[:300])
 
         # 3b) 回撤熔断（DD Guard，L2 告警 / L3 熔断）。判据 = **策略口径**峰谷回撤
         #     （TWR 链、剔除出入金），看的是「温水煮青蛙」型累计回撤 —— 日内 5% 那条线

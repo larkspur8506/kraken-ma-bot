@@ -734,13 +734,22 @@ class DB:
     def hl_record_intent(self, symbol: str, coin: str, bar_ms: int, purpose: str, side: int,
                          sz: float, px: Optional[float] = None, reduce_only: bool = False,
                          cloid: Optional[str] = None, status: str = "intent",
-                         error: Optional[str] = None) -> int:
-        """登记一次下单意图（幂等键 symbol+bar_ms+purpose）。已存在则返回原 id（不覆盖）。"""
+                         error: Optional[str] = None, oid: Optional[str] = None) -> int:
+        """登记一次下单意图（幂等键 symbol+bar_ms+purpose）。已存在则返回原 id（不覆盖）。
+
+        ``oid`` 加在参数表**末尾**（旧调用不传、语义不变）。它的用途是「落一条已经知道
+        成交/挂单号的意图」（如 exit:rehang 重挂止损）：没有它就只剩 cloid，下次离场
+        撤残留止损时 `and r['oid']` 永远为假 → 幽灵触发单撤不掉。oid 原样存（Kraken 是
+        UUID 字符串），绝不 int() 转换。
+        注意这是 INSERT OR IGNORE：同一 (symbol,bar,purpose) 第二次不会写入，所以
+        「同 bar 多次重挂要更新到最新 oid」必须由调用方再走一次 ``hl_update_order``。
+        """
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO hl_orders(symbol, coin, bar_ms, purpose, side, sz, px, reduce_only,"
-            " status, cloid, error, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " status, cloid, error, oid, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, coin, bar_ms, purpose, side, float(sz), px, 1 if reduce_only else 0,
-             status, cloid, error, now(), now()))
+             status, cloid, error, oid, now(), now()))
         self.conn.commit()
         if cur.rowcount:
             return int(cur.lastrowid or 0)
@@ -832,6 +841,23 @@ class DB:
     def hl_fills_since(self, since_ts: float) -> List[sqlite3.Row]:
         return list(self.conn.execute(
             "SELECT * FROM hl_fills WHERE created_at >= ? ORDER BY id", (since_ts,)))
+
+    @_locked
+    def hl_realized_net_since(self, ts: float) -> float:
+        """某时间点（**成交时间 ts**，秒）以来的**已实现净额**：Σ(closed_pnl − 手续费)。
+
+        只读聚合，口径与面板「累计已实现」严格一致（``fills_totals``）：
+        - ``closed_pnl`` 为交易所真值（没有就是 NULL，按 0 —— 代表「这笔没有平仓盈亏」）；
+        - 手续费 ``fee_quote``（已折算成 U）优先，老行回退 ``fee``。
+        这是「已实现亏损熔断」（``Executor._realized_dd_guard``）的唯一数据源：Kraken
+        期货没有出入金流水端点，流水口径的 DD/L1 在那边永远不可判，只能用这条替代口径。
+        """
+        r = self.conn.execute(
+            "SELECT COALESCE(SUM(COALESCE(closed_pnl, 0) - COALESCE(fee_quote, fee, 0)), 0)"
+            " AS net FROM hl_fills WHERE ts >= ?", (float(ts),)).fetchone()
+        if r is None:
+            return 0.0
+        return float(r["net"] or 0.0)
 
     @_locked
     def hl_fills_window(self, coin: str, lo: Optional[float] = None,
@@ -1362,6 +1388,24 @@ class DB:
         self.conn.execute(
             "DELETE FROM hl_snapshots WHERE id < (SELECT MIN(id) FROM "
             "(SELECT id FROM hl_snapshots ORDER BY id DESC LIMIT ?))", (keep_snapshots,))
+        self.conn.commit()
+
+    @_locked
+    def promote_position(self, pid: int, actual_entry: float, actual_contracts: float,
+                         actual_stop: float, opened_at: Optional[float] = None) -> None:
+        """把 pending 行提升为 open（崩溃恢复用；不覆盖已确认的 open 行）。
+
+        与 ``confirm_position`` 的差别只在 ``opened_at``：那条路径是「刚刚成交」，用 now()
+        正确；本条是「事后按交易所持仓补账」，成交发生在过去 —— 用 now() 会让
+        ``_fill_close_proof`` 的时间下界（opened_at − 120s）落到真实成交之后，平仓证据
+        永远找不到。缺省回落到 ``created_at``（信号行的创建时刻，早于成交，窗口更宽）。
+        """
+        self.conn.execute(
+            "UPDATE positions SET status='open', actual_entry=?, actual_contracts=?, "
+            "actual_stop=?, stop_placed=1, opened_at=COALESCE(?, created_at) "
+            "WHERE id=? AND status='pending'",
+            (float(actual_entry), float(actual_contracts), float(actual_stop),
+             opened_at, int(pid)))
         self.conn.commit()
 
     @_locked

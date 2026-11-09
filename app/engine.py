@@ -31,6 +31,13 @@ INTERVAL_MS = market.INTERVAL_MS
 # 用户漏看一次提醒不该永久堵死该标的的后续信号（历史 bug：pending 永久占槽）。
 PENDING_BARS_MAX = 3
 
+# 这两类 `hl_status` 表示「交易所侧的仓位/账本还没与本地对上」：`closing` = 宽限期
+# 收尾中（对账会继续重试/回捞），`mismatch` = 对账判定本地有仓、交易所无仓。
+# 执行器对它们的 `on_exit` 故意 `return False`（让出接管权），引擎**不能**因此回落到
+# 「按参考价本地关账 + 发人工离场卡」：用户照卡下单时，交易所侧可能已无仓 → 反手开出
+# 新仓。正确动作是只告警「账本待核对」、不动本地账，等对账收敛。
+LEDGER_SUSPECT_HL_STATUSES = ("closing", "mismatch")
+
 # 提醒里的时间一律按**北京时间**显示（用户在国内看）：bar 用 UTC 开盘时间做键，
 # 但给人看的时间要换成 +08，否则对不上自己的下单/平仓时刻。
 # 需要换回 UTC 显示：env DISPLAY_TZ_OFFSET=0（导入时读取，改完要重启容器）。
@@ -76,6 +83,10 @@ class PositionState:
     actual_entry: Optional[float] = None
     actual_stop: Optional[float] = None
     side: int = 1
+    #: 「账本待核对」标记（closing/mismatch）：这类行的离场事件只告警、不关账，
+    #: 且**槽位不释放** —— 交易所侧可能还有这个仓，同根再开一笔就是双仓。
+    #: 由 `_tick_symbol` 从仓位行的 `hl_status` 派生，`walk` 只读。
+    ledger_suspect: bool = False
 
     @property
     def eff_entry(self) -> float:
@@ -325,23 +336,29 @@ def walk(cfg, symbol: str, bars: Sequence[strategy.Bar],
          ) -> Tuple[List[Event], Optional[PositionState]]:
     """走 from_i..to_i（含），返回 (事件列表, 结束时的仓位)。不做任何 I/O。"""
     events: List[Event] = []
+    # 本轮槽位是否仍被占（不再评估新入场）。只有「账本待核对」的离场会置位：
+    # 引擎不关账，仓位行仍在，交易所侧可能也还有仓 —— 同根再开一笔就是双仓。
+    slot_blocked = False
     for i in range(max(from_i, 1), min(to_i, len(bars) - 2) + 1):
         is_latest = (i == latest_closed_i)
         if position is not None:
             bar = bars[i]
             hit_stop = (bar.low <= position.eff_stop) if position.side == 1 \
                 else (bar.high >= position.eff_stop)
-            # 入场当根（信号 bar 的下一根）只允许止损离场，MA20 离场从再下一根起
-            # —— 与回测引擎的 `u > ei` 守卫一致
-            is_entry_bar = (bar.open_ms - position.signal_bar_ms) == INTERVAL_MS
-            hit_ma20 = (not is_entry_bar) and strategy.exit_triggered(bars, ind, i, position.side)
+            # **与回测一致：入场根（信号 bar 的下一根）收盘即可触发 MA20 离场。**
+            # 回测 harness 在每个 t 用 `exit_signal_at(t-1)` 判离场，t-1 就是入场根，
+            # 那边没有任何「u > ei」守卫；旧版这里用 is_entry_bar 压掉 MA20 离场，
+            # 结果是亏损单多拿一根 4h（与回测口径差 6% 量级的交易）。止损不受影响：
+            # 任意根（含入场根）都可以触发。
+            hit_ma20 = strategy.exit_triggered(bars, ind, i, position.side)
             if hit_stop or hit_ma20:
                 events.append(Event(kind="exit", symbol=symbol, bar_ms=bar.open_ms, is_latest=is_latest,
                                     exit_price=(position.eff_stop if hit_stop else bar.close),
                                     reason=("stop" if hit_stop else "ma20"),
                                     bars_held=int((bar.open_ms - position.signal_bar_ms) / INTERVAL_MS)))
+                slot_blocked = bool(position.ledger_suspect)
                 position = None
-        if position is None:
+        if position is None and not slot_blocked:
             sig = strategy.evaluate_entry(symbol, bars, ind, squeeze, i,
                                           entry_price=bars[i + 1].open,
                                           stop_min=cfg.stop_min, stop_max=cfg.stop_max,
@@ -376,6 +393,18 @@ def _row_to_state(row) -> PositionState:
                          signal_bar_ms=row["signal_bar_ms"], position_id=row["id"],
                          status=row["status"], actual_entry=row["actual_entry"],
                          actual_stop=row["actual_stop"], side=row["side"] or 1)
+
+
+def _hl_status_of(row) -> str:
+    """仓位行的 `hl_status`（执行器托管标记）；列缺失/空 → ``""``（纯人工提醒流）。
+
+    索引读 + 异常兜底：sqlite3.Row 有该列，测试里的 dict 替身也照此读；老库
+    （未跑 ALTER TABLE）或替身对象没有该键时返回空串，不抛 IndexError 打断 tick。
+    """
+    try:
+        return str(row["hl_status"] or "")
+    except (IndexError, KeyError, TypeError):
+        return ""
 
 
 def _index_of_bar(bars: Sequence[strategy.Bar], bar_ms: int) -> Optional[int]:
@@ -586,8 +615,14 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                 _record_symbol_state(db, cfg, symbol, bars, ind, latest_closed_i, False)
                 return
         position = _row_to_state(row) if row is not None and row["status"] != "pending" else None
+        row_suspect = row is not None and _hl_status_of(row) in LEDGER_SUSPECT_HL_STATUSES
+        if position is not None:
+            # 账本待核对的行走 walk 的「不释放槽位」分支：离场事件照发（下面只告警），
+            # 但本根不得再评估新入场（旧仓在交易所侧可能还在 → 双仓）。
+            position.ledger_suspect = row_suspect
         events, new_pos = walk(cfg, symbol, bars, ind, sq, position, from_i, latest_closed_i,
                                latest_closed_i)
+        suspect_held = False          # 账本待核对：行没关，槽位仍算「有仓」
 
         for ev in events:
             if ev.kind == "exit":
@@ -610,6 +645,21 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                 if handled or exec_exc:
                     # 执行器已经平仓并推送了成交回报 —— 不再发人工操作卡。
                     # exec_exc 同样跳过本地关账（见上），避免重复关账/误导卡。
+                    row = None
+                    position = None
+                    continue
+                # 账本待核对的行（closing/mismatch）**不得**按参考价本地关账、更不得发
+                # 可执行离场卡：执行器正是因为「交易所侧状态未知」才让出接管权，人工卡
+                # 会诱导用户去平一个可能已不存在的仓（反手开新仓）。只发一条提示，
+                # 本地账原样留着，等对账收敛（幂等由 alert_logs 的 (symbol,bar,kind) 去重）。
+                if row is not None and row_suspect:
+                    _emit(db, notifier, cfg, Alert(
+                        "data_error", symbol, int(ev.bar_ms),
+                        f"{cfg.alert_prefix}⚠️ {symbol} 出现离场信号（{ev.reason}），但账本待核对"
+                        f"（hl_status={_hl_status_of(row)}）：本轮**不关账、不发操作卡**，"
+                        f"等对账收敛后自动处理。若你已在交易所手工平仓，无需再按卡片操作。"),
+                        sent)
+                    suspect_held = True
                     row = None
                     position = None
                     continue
@@ -637,11 +687,27 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                     risk_u=(o.risk_u if o is not None else 0.0),
                     equity_at_entry=cfg.equity)
                 handled = False
+                entry_exc = None
                 if executor is not None:
                     try:
                         handled = executor.on_entry(pid)
                     except Exception as e:                       # noqa: BLE001
                         logger.exception("执行器 on_entry 异常: %s", e)
+                        entry_exc = e
+                if entry_exc is not None:
+                    # 审计三轮 R3-3：on_entry 可能**已经在交易所成交**、只是落库/回报
+                    # 那一步抛了异常。旧代码异常后照常走 format_entry 发「手工开仓卡」
+                    # → 用户照卡再开一次 = 双开（两倍风险，且第二笔没有策略止损）。
+                    # 现在只发告警、不发操作卡；仓位行保持原状（不忽略、不关账），
+                    # 交给执行器对账/下一轮重新评估。
+                    _emit(db, notifier, cfg, Alert(
+                        "data_error", symbol, int(ev.bar_ms),
+                        f"{cfg.alert_prefix}⚠️ {symbol} 执行器开仓时异常"
+                        f"（{type(entry_exc).__name__}）：本轮**不发开仓卡**（避免重复开仓），"
+                        f"仓位记录已留给对账接手，下一轮重新评估。请先核对交易所再决定是否手工下单。"),
+                        sent)
+                    position = new_pos
+                    continue
                 if handled:
                     position = new_pos
                     continue
@@ -657,7 +723,7 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
         # 面板状态（排在 set_last_bar 之后：写失败不影响 bar 进度与信号推送）。
         # has_position 取 walk 走完之后的真实状态：本轮刚离场 → False（照常给两条入场线）。
         _record_symbol_state(db, cfg, symbol, bars, ind, latest_closed_i,
-                             has_position=(new_pos is not None))
+                             has_position=(new_pos is not None or suspect_held))
 
 
 def _emit(db, notifier, cfg, alert: Alert, sent: List[str]) -> None:
