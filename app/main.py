@@ -580,6 +580,8 @@ def _job_hl_monitor() -> None:
 
 
 #: MR 腿（feat/mr-leg）：最近一次 tick 的状态块（/api/hl/status 的 `mr` 字段来源）。
+#: **只整体重新绑定、永不原地 clear/update**（P2-1）：读方不持 `_tick_lock`，原地清空
+#: 会让它们在两步之间看到空 dict；重新绑定在 CPython 里是单条 STORE_GLOBAL，原子。
 _MR_STATUS: Dict[str, Any] = {}
 _mr_leg: Optional[Any] = None
 #: 装配 MR 腿时的身份（模式/地址/密钥指纹/端点）；任一项变了就重建 —— 否则轮换
@@ -593,6 +595,17 @@ def _mr_margin_used() -> float:
         return max(float(_MR_STATUS.get("margin_used") or 0.0), 0.0)
     except Exception:                                                 # noqa: BLE001
         return 0.0
+
+
+def _mr_status_snapshot() -> Optional[Dict[str, Any]]:
+    """`_MR_STATUS` 的快照（`/api/hl/status` 的 `mr` 字段 / 面板 `mr_fn` 的唯一入口）。
+
+    **先取一次模块全局再复制**：`dict(_MR_STATUS) if _MR_STATUS else None` 会连读两次
+    全局名，理论上两次之间可能被换掉（虽然换后的值也都非空）。这里改成单次取值 ——
+    读方拿到的永远是某一个完整版本的拷贝，不会是半截。
+    """
+    snap = _MR_STATUS
+    return dict(snap) if snap else None
 
 
 def _mr_identity() -> tuple:
@@ -642,8 +655,17 @@ def _build_mr_leg() -> Optional[Any]:
 
 
 def _job_mr_tick() -> None:
-    """每 5 分钟：MR 腿 tick（挂 _tick_lock 与主策略串行；异常只记状态不外抛）。"""
-    global _mr_leg, _MR_IDENTITY
+    """每 5 分钟：MR 腿 tick（挂 _tick_lock 与主策略串行；异常只记状态不外抛）。
+
+    **状态块整体重新绑定，不原地 clear/update**（P2-1，2026-11-09）：读方
+    （`/api/hl/status`、面板 `mr_fn`、定仓用的 `_mr_margin_used`）不持 `_tick_lock`，
+    旧的 `clear()` + `update(...)` 在两步之间露出空 dict —— `_mr_leg.tick()` 实测
+    0.7~0.9s，窗口就有这么长，于是 `mr: null` → 探针 `off:?` → 值班模型无效唤醒。
+    现在先把结果算完（`payload`），再一次性赋值给模块全局：CPython 的 STORE_GLOBAL
+    对读方是原子的，读方要么看到旧的完整状态、要么看到新的完整状态，绝不为空
+    （除非从未 tick 过）。三条路径（mode_off / 正常 tick / 异常）同此口径。
+    """
+    global _mr_leg, _MR_IDENTITY, _MR_STATUS
     with _tick_lock:
         try:
             ident = _mr_identity()
@@ -651,17 +673,19 @@ def _job_mr_tick() -> None:
                 _mr_leg = _build_mr_leg()
                 _MR_IDENTITY = ident
             if _mr_leg is None:
-                _MR_STATUS.clear()
-                _MR_STATUS.update({"enabled": False, "state": "mode_off",
-                                   "recon": "unknown", "error": ""})
+                _MR_STATUS = {"enabled": False, "state": "mode_off",
+                              "recon": "unknown", "error": ""}
                 return
-            _MR_STATUS.clear()
-            _MR_STATUS.update(_mr_leg.tick())
+            payload = dict(_mr_leg.tick() or {})
+            if not payload:
+                # tick 返回空块时不能把状态块置空（读方又会看到 mr:null），按异常态落。
+                payload = {"state": "error", "recon": "unknown",
+                           "error": "mr tick 返回空状态"}
+            _MR_STATUS = payload
         except Exception as e:                                        # noqa: BLE001
             logger.exception("MR 腿 tick 异常: %s", e)
-            _MR_STATUS.clear()
-            _MR_STATUS.update({"state": "error", "recon": "unknown",
-                               "error": f"{type(e).__name__}: {e}"})
+            _MR_STATUS = {"state": "error", "recon": "unknown",
+                          "error": f"{type(e).__name__}: {e}"}
 
 
 def _job_heartbeat() -> None:
@@ -902,7 +926,7 @@ def _hl_deps():
         address_fn=lambda: hl_params().account_address,
         mode_fn=hl_mode,
         base_url_fn=lambda: hl_params().base_url,
-        mr_fn=lambda: dict(_MR_STATUS) if _MR_STATUS else None,
+        mr_fn=_mr_status_snapshot,
         snapshot_info_fn=lambda: panel_snapshot_info() if panel_snapshot_on() else None,
     )
 
@@ -984,7 +1008,7 @@ def _admin_deps():
         # /why 诊断（只读）：阶段 B 起优先读快照里的六步结论，缺失才现取
         why_rows_fn=lambda: _why_rows(),
         # MR 腿运行态（开关本身由面板读 DB `mr_enabled`；这里只给「状态/对账/持仓」一行）
-        mr_fn=lambda: dict(_MR_STATUS) if _MR_STATUS else None,
+        mr_fn=_mr_status_snapshot,
         # 取不到现价时预览降级成「无法取价」，不硬编一个假价格
         price_fallback=0.0,
     )
