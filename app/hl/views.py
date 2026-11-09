@@ -767,8 +767,10 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     snap_orders: List[dict] = snap.get("open_orders") or []
     # 挂单列表可信度：**唯一来源**是快照的 orders_trusted（挂单接口回落/非 list 时 False）。
     # 顶层也发给 /api/hl/status（监控契约）：snap 读不到 = {} → 一律 False（宁缺勿信）。
+    # 严格布尔：只有 JSON 布尔 true 可信（`bool("false")` == True，会把脏值翻成可信，
+    # 方向正好反了）。与监控端 fail-closed 同口径。
     # 下面「止损列」与 system.mismatch 对账都用这同一个布尔，不许各算一份。
-    orders_trusted = bool(snap.get("orders_trusted", False))
+    orders_trusted = snap.get("orders_trusted") is True
 
     # ---------------- DB 侧 ----------------
     db_rows = _db_call(deps.db, "recent_positions", 50) or []

@@ -2712,16 +2712,16 @@ class Executor:
           已经空仓，被拒后还喊「止损单已撤！请立即人工平仓」，可能诱导反手开新仓；
         - 平仓 IOC 未成交分支还会在零仓上重挂 exit:rehang → 孤儿止损咬下一笔新仓。
 
-        分流口径（一格都不能省）：
+        分流口径（一格都不能省，**顺序也是口径**）：
+        - 行已是 `filled` → 立刻落 `filled` 并返回 "filled"，**优先于**下面所有分支：
+          本轮撤单超时/异常/状态不可识别（ok=False）只记 error 留痕，绝不返回 failed、
+          绝不降级、也绝不进 failed 汇总（单已成交，不存在「需人工撤单」的动作）；
+          调用方必须停止平仓/重挂；
         - `status == filled` → 行落 `filled`，返回 "filled"，**调用方必须停止平仓/重挂**；
         - `ok` 且非 filled（适配层把 cancelled / notFound 都映射成 ok+resting，dry 亦然）
           → 行落 `cancelled`（幂等：单确实不在场）；
         - `ok=False`（被拒/超时/状态不可识别）→ 行**保持原状态** + 记错误，本地仍认为
-          它可能在场上（下一轮/人工再撤）；
-        - 已经落成 `filled` 的行**永不降级**：下一轮离场再去撤同一张单会拿到 notFound，
-          照旧写 cancelled 就等于把成交证据抹掉。这种行返回 `"filled"`（对调用方与撤单当场
-          返回 filled 同义：已成交、交易所侧不在场），走同一套「刷新快照 + 成交证据」收尾，
-          **绝不**让调用方继续平仓/重挂。
+          它可能在场上（下一轮/人工再撤）。
         """
         cur = None
         try:
@@ -2730,9 +2730,34 @@ class Executor:
             logger.warning("[hl-exec] 撤单结果回写前读行失败（忽略）：%s", e)
         cur_status = str(cur["status"] or "") if cur is not None else ""
 
+        # 已成交的行**永不降级**，且这一支必须排在 `ok` 判断**之前**（审计四轮 P1-B）。
+        # 本轮撤单超时/异常/状态不可识别（ok=False）只说明「撤单没拿到回执」，并不能推翻
+        # 「这张止损已经成交」这个本地证据 —— 交易所那一侧它早已不在场，账户可能已空仓。
+        # 若先按 ok=False 返回 failed，调用方会顺理成章继续发 reduce-only 平仓单，并在
+        # IOC 未成时于零仓上重挂 exit:rehang（孤儿单咬下一笔新仓），同时喊人「手工撤单」
+        # 去撤一张根本不存在的单。这里只把本轮错误记到行上（留痕，便于查超时/异常），
+        # 状态与返回值一律按 filled。
+        if cur_status == ST_FILLED:
+            if not bool(res.get("ok")):
+                err = str(res.get("error") or "未知错误")[:300]
+                self.db.hl_update_order(symbol, int(bar_ms), purpose, error=err)
+                self._event(EV_ERROR,
+                            f"{symbol} 离场前撤止损无回执（{purpose} {oid}）：{err}"
+                            f"→ 本地已记为 filled，保持 filled，按已成交收尾"
+                            f"（不再平仓/重挂，无需撤单）",
+                            symbol=symbol,
+                            data={"oid": oid, "purpose": purpose, "error": err})
+            else:
+                self._event(EV_ORDER,
+                            f"{symbol} 撤单返回 {res.get('status')}（{purpose} {oid}），"
+                            f"但本地已记为 filled → 保持 filled，按已成交收尾",
+                            symbol=symbol, data={"oid": oid, "purpose": purpose,
+                                                 "cancel_status": res.get("status")})
+            return "filled"
+
         if not bool(res.get("ok")):
             err = str(res.get("error") or "未知错误")[:300]
-            # 行保持 resting/sent/filled（本地仍认为它可能在场上）+ 记错误
+            # 行保持 resting/sent（本地仍认为它可能在场上）+ 记错误
             self.db.hl_update_order(symbol, int(bar_ms), purpose, error=err)
             self._event(EV_ERROR,
                         f"{symbol} 离场前撤止损失败（{purpose} {oid}）：{err}"
@@ -2747,19 +2772,6 @@ class Executor:
             self._event(EV_ORDER,
                         f"{symbol} 离场前撤单返回 filled（{purpose} {oid}）："
                         f"这张止损已成交，不再平仓/重挂",
-                        symbol=symbol, data={"oid": oid, "purpose": purpose,
-                                             "cancel_status": res.get("status")})
-            return "filled"
-
-        if cur_status == ST_FILLED:
-            # 已成交的行不许被「撤不到 / 查无此单」改写成 cancelled（要求 (2) 的持续性）。
-            # 返回 filled 而不是 cancelled：对调用方来说「这张止损已经成交、交易所侧不在场」
-            # 与撤单当场返回 filled 是**同一件事**，必须走同一条收尾（刷新快照 + 成交证据，
-            # 且绝不再发平仓/重挂单）。返回 cancelled 会让调用方对着（可能已空的）仓位继续
-            # 平仓、甚至重挂孤儿止损 —— 就是本轮要修的那个事故。
-            self._event(EV_ORDER,
-                        f"{symbol} 撤单返回 {res.get('status')}（{purpose} {oid}），"
-                        f"但本地已记为 filled → 保持 filled，按已成交收尾",
                         symbol=symbol, data={"oid": oid, "purpose": purpose,
                                              "cancel_status": res.get("status")})
             return "filled"

@@ -39,12 +39,22 @@ NOW = 1_760_000_000.0
 ADDR = "0xTESTADDRESS123456"
 
 
-def fake_snapshot(*, orders_trusted="missing", equity=100.68):
-    """固定快照。``orders_trusted="missing"`` 时不写该键（模拟老快照/字段缺失）。"""
+_RAW = object()          # 哨兵：区分「没传」与「显式传 None/False/0」
+
+
+def fake_snapshot(*, orders_trusted="missing", equity=100.68, raw_orders_trusted=_RAW):
+    """固定快照。``orders_trusted="missing"`` 时不写该键（模拟老快照/字段缺失）。
+
+    ``raw_orders_trusted`` 按原值写入**不做任何转换**——用于验证「只有 JSON 布尔
+    true 可信」：字符串 ``"false"``、数字 ``1`` 这类脏值必须原样进快照，
+    否则 ``bool()`` 一转换就把被测行为洗掉了。
+    """
     snap = {"ts": NOW, "address": ADDR, "equity_total": equity, "equity": equity,
             "spot_usdc": equity, "unified": True, "withdrawable": 90.0,
             "margin_used": 10.0, "notional": 500.0, "positions": [], "open_orders": []}
-    if orders_trusted != "missing":
+    if raw_orders_trusted is not _RAW:
+        snap["orders_trusted"] = raw_orders_trusted
+    elif orders_trusted != "missing":
         snap["orders_trusted"] = bool(orders_trusted)
     return snap
 
@@ -258,6 +268,33 @@ class TestOrdersTrustedPayload(BaseCase):
         self.assertIsInstance(p["orders_trusted"], bool)
 
 
+class TestOrdersTrustedStrictBool(BaseCase):
+    """严格布尔判定：**只有 JSON 布尔 true 可信**（与监控端 fail-closed 同口径）。
+
+    快照可能被旧版本/手改 DB/调试脚本写入脏值。``bool()`` 口径下 ``"false"`` 与
+    ``1`` 都会被判成可信 —— 那是把「明确不可信」翻成「可信」，方向正好反了：
+    面板会显示「止损 ✔️」、对账会认定挂单干净。宁可多报不可漏报，所以只认 ``is True``。
+    """
+
+    def _payload(self, raw):
+        self.hl_deps.info = FakeInfo(fake_snapshot(raw_orders_trusted=raw))
+        return status_payload(self.hl_deps)
+
+    def test_string_false_is_not_trusted(self):
+        self.assertIs(self._payload("false")["orders_trusted"], False)
+
+    def test_number_one_is_not_trusted(self):
+        self.assertIs(self._payload(1)["orders_trusted"], False)
+
+    def test_string_true_is_not_trusted(self):
+        self.assertIs(self._payload("true")["orders_trusted"], False)
+
+    def test_strict_result_is_always_real_bool(self):
+        for raw in ("false", 1, "true", 0, "", None, [], {}):
+            self.assertIs(self._payload(raw)["orders_trusted"], False, repr(raw))
+        self.assertIs(self._payload(True)["orders_trusted"], True)
+
+
 class TestOrdersTrustedOverHttp(BaseCase):
     """契约：监控从 /api/hl/status **顶层**读布尔 orders_trusted。"""
 
@@ -272,6 +309,12 @@ class TestOrdersTrustedOverHttp(BaseCase):
             j = self._status()
             self.assertIs(j["orders_trusted"], want, f"snap.orders_trusted={given!r}")
             self.assertIn("orders_trusted", j)
+
+    def test_dirty_non_bool_values_not_trusted_over_http(self):
+        """JSON 里 ``false``/``1`` 这类脏值经路由也不能变成 ``true``。"""
+        for raw in ("false", 1, "true"):
+            self.hl_deps.info = FakeInfo(fake_snapshot(raw_orders_trusted=raw))
+            self.assertIs(self._status()["orders_trusted"], False, repr(raw))
 
 
 # ---------------------------------------------------------------- 3. HTML 不含 token

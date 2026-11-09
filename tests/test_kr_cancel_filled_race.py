@@ -511,5 +511,72 @@ class TestFilledRowLaterCancelNotFound(Base):
         self.assertEqual(self.stop_row()["status"], "filled")
 
 
+class TestFilledRowWithFailedCancel(Base):
+    """B（持续性 × 撤单失败）：行已 filled，本轮撤单 ok=False（超时/异常/不可识别）。
+
+    撤单拿不到回执，**不能**推翻「这张止损已经成交」这个本地证据 —— 账户那一刻可能
+    已经空仓。若按 ok=False 返回 `failed`，调用方会顺着「撤单失败」继续发 reduce-only
+    平仓单，并在 IOC 未成时于零仓上重挂 `exit:rehang`（孤儿单咬下一笔新仓），同时
+    告警喊人「手工撤单」—— 撤一张已经成交、根本不在场的单。
+
+    验收：DB 仍 filled（不降级）、零新平仓/零重挂、走已成交收尾（刷新快照 + 成交证据
+    关账），且告警不得要求人工撤单。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.pid = self.open_pos()
+        self.db.hl_record_intent("BTC_USDT", "BTC", BAR, PURPOSE_STOP, 1, QTY, px=STOP,
+                                 reduce_only=True, status="resting", oid=STOP_OID)
+        # 上一轮已确认这张止损成交过（filled），仓因部分成交/回流延迟仍是 open
+        self.db.hl_update_order("BTC_USDT", BAR, PURPOSE_STOP, status="filled")
+        self.assertEqual(self.stop_row()["status"], "filled")
+        # 本轮：交易所已无仓，真实平仓成交已回流
+        self.info._snap = _snap(positions=[])
+        self.info._fills = _closing_fills()
+
+    def _assert_filled_wrapup(self, label: str):
+        self.assertEqual(self.ex.orders(), [],
+                         f"{label}：已 filled 的行撤单失败也不得发任何新单（平仓/重挂）")
+        self.assertEqual(self.ex.closes(), [], f"{label}：不得继续平仓")
+        self.assertEqual(self.ex.triggers(), [], f"{label}：不得重挂止损")
+        self.assertEqual(self.stop_row()["status"], "filled",
+                         f"{label}：撤单失败不得把已成交的行降级")
+        text = "\n".join(self.notifier.messages)
+        self.assertNotIn("人工撤单", text,
+                         f"{label}：单已成交，喊人手工撤单会把人引到不存在的动作上")
+        self.assertNotIn("手工撤单", text, label)
+        # 走的是「已成交」收尾：刷新快照 + 成交证据 → 按真实成交价关账
+        self.assertGreaterEqual(self.info.snap_calls, 2,
+                                f"{label}：必须走 filled 收尾（重刷新快照）")
+        row = self.db.position_by_id(self.pid)
+        self.assertEqual(row["status"], "closed", f"{label}：证据齐全时应按 filled 路径关账")
+        self.assertAlmostEqual(float(row["exit_price"]), FILL_PX, places=6,
+                               msg=f"{label}：必须用成交价关账，不能用信号参考价")
+        self.assertEqual(row["exit_reason"], "stop", label)
+
+    def test_cancel_timeout_after_filled(self):
+        self.ex.cancel_result = {"ok": False, "error": "撤单超时（10s 无回执）"}
+        ex = self.executor()
+        self.assertTrue(ex.on_exit(self.pid, "ma20", REF_PRICE))
+        self._assert_filled_wrapup("撤单超时")
+
+    def test_cancel_exception_after_filled(self):
+        def _boom(coin, oid):
+            raise TimeoutError("撤单请求超时")
+
+        self.ex.cancel = _boom
+        ex = self.executor()
+        self.assertTrue(ex.on_exit(self.pid, "ma20", REF_PRICE))
+        self._assert_filled_wrapup("撤单异常")
+
+    def test_cancel_status_unrecognized_after_filled(self):
+        self.ex.cancel_result = {"ok": False, "status": "error",
+                                 "error": "撤单状态不可识别（status=缺失）"}
+        ex = self.executor()
+        self.assertTrue(ex.on_exit(self.pid, "ma20", REF_PRICE))
+        self._assert_filled_wrapup("撤单状态不可识别")
+
+
 if __name__ == "__main__":
     unittest.main()
