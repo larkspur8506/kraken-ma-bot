@@ -40,6 +40,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from urllib.parse import quote
 
+from app import auth as authn
 from app import posfields
 from app.hl import flows as hl_flows
 from app.hl import dd as hl_dd
@@ -764,6 +765,10 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         latency_ms = None
     snap_positions: List[dict] = snap.get("positions") or []
     snap_orders: List[dict] = snap.get("open_orders") or []
+    # 挂单列表可信度：**唯一来源**是快照的 orders_trusted（挂单接口回落/非 list 时 False）。
+    # 顶层也发给 /api/hl/status（监控契约）：snap 读不到 = {} → 一律 False（宁缺勿信）。
+    # 下面「止损列」与 system.mismatch 对账都用这同一个布尔，不许各算一份。
+    orders_trusted = bool(snap.get("orders_trusted", False))
 
     # ---------------- DB 侧 ----------------
     db_rows = _db_call(deps.db, "recent_positions", 50) or []
@@ -787,7 +792,7 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
 
         stop_px: Optional[float] = None
         has_stop = False
-        trusted = bool(snap.get("orders_trusted", False))
+        trusted = orders_trusted
         if trusted:
             for o in snap_orders:
                 od = _rowd(o)
@@ -1170,6 +1175,9 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         "positions": positions_out,
         "orders_open": orders_open,
         "orders_recent": orders_recent,
+        # 挂单列表可信度（监控契约 2026-11-09）：顶层布尔，与上面止损列/下面对账
+        # 同一来源（快照 orders_trusted）；读不到快照时为 False。
+        "orders_trusted": orders_trusted,
         "fills": fills_out[:100],   # JSON 也截断（看守/巡检只看头部；全量会让响应无限膨胀）
         "signals": signals,
         "symbol_state": symbol_state_out,
@@ -1180,8 +1188,7 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             "stuck_orders": len(stuck),
             "mismatch": _reconcile(reachable, snap_positions, snap_orders,
                                    open_by_coin, stuck,
-                                   orders_trusted=bool(snap.get("orders_trusted", False))
-                                   if snap else False,
+                                   orders_trusted=orders_trusted,
                                    own_coins=own_coins),
         },
         # 盈亏曲线（已剔除出入金）+ TWR 指数。旧键 equity_curve（原始权益曲线）已按
@@ -2678,8 +2685,8 @@ def _admin_required(deps: DashboardDeps, k: str, request: "Request" = None) -> b
     """可选鉴权：仅 HL_DASH_REQUIRE_ADMIN=1 时生效（默认关闭，便于内网直连）。
 
     返回 True = 应拒绝（401）。未开启或未配 ADMIN_TOKEN 一律放行。
-    与 main.hl_guard 同口径：?k= 命中或 cma_admin cookie 命中任一即放行
-    （审计三轮 L：以前只认 k，开 REQUIRE_ADMIN 后带 cookie 的浏览器会话也被 401）。
+    与 main.hl_guard 同口径（app/auth.py）：Bearer 头 / ?k= / cma_admin Cookie
+    任一命中即放行 —— 监控统一用 Authorization 头，浏览器会话用 Cookie。
     """
     if os.environ.get("HL_DASH_REQUIRE_ADMIN", "").strip().lower() not in ("1", "true", "yes", "on"):
         return False
@@ -2691,15 +2698,7 @@ def _admin_required(deps: DashboardDeps, k: str, request: "Request" = None) -> b
         return False
     if not token:
         return False
-    if str(k or "") == token:
-        return False
-    if request is not None:
-        try:
-            if str(request.cookies.get("cma_admin") or "") == token:
-                return False
-        except Exception:                                        # noqa: BLE001
-            pass
-    return True
+    return not authn.is_admin(request, token, k)
 
 
 def build_router(deps: DashboardDeps) -> Any:
@@ -2715,7 +2714,10 @@ def build_router(deps: DashboardDeps) -> Any:
         # 盈亏曲线时间窗（P1）：白名单外（含缺参）回落 7，见 normalize_span。
         payload["curve_span"] = normalize_span(span)
         payload["theme"] = normalize_theme(request.cookies.get("cma_theme"))
-        payload["admin_k"] = str(k or "")
+        # 已用 Cookie/Bearer 认证时不把 token 塞进链接（HTML 里不该有真值）
+        payload["admin_k"] = ("" if authn.keeps_credential_in_url(
+            request, str(getattr(_call(deps.config_fn), "admin_token", "") or ""))
+            else str(k or ""))
         return HTMLResponse(render_dashboard(payload))
 
     @router.get("/api/hl/status")

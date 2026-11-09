@@ -58,7 +58,8 @@ def theme_attr(theme: str) -> str:
 
 
 def theme_switch_html(tab: str, current: str, k: str = "") -> str:
-    """页脚的主题切换行。current 已 normalize；k 为面板 token（保持链接可点击）。"""
+    """页脚的主题切换行。current 已 normalize；k 只在「凭据得靠 URL 带」时才拼
+    （Cookie/Bearer 会话不拼 —— 页面 HTML 里不该出现 token 真值）。"""
     from urllib.parse import quote
     cur = normalize_theme(current)
     q = quote(str(k or ""), safe="")
@@ -66,7 +67,8 @@ def theme_switch_html(tab: str, current: str, k: str = "") -> str:
     for t in THEMES:
         label = _THEME_LABELS[t]
         cls = "btn" if t == cur else "btn gray"
-        links.append(f"<a class='{cls}' href='/admin/theme?t={t}&tab={_esc_attr(tab)}&k={q}'>{label}</a>")
+        tail = f"&k={q}" if q else ""
+        links.append(f"<a class='{cls}' href='/admin/theme?t={t}&tab={_esc_attr(tab)}{tail}'>{label}</a>")
     return ("<div class='foot'><span class='muted'>主题：</span>" + " ".join(links) + "</div>")
 
 

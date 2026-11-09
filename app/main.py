@@ -32,6 +32,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from starlette.middleware.gzip import GZipMiddleware
 
+from app import auth as authn
 from app import engine
 from app.config import Config
 from app.db import DB
@@ -781,25 +782,47 @@ app.add_middleware(GZipMiddleware, minimum_size=GZIP_MIN_SIZE)
 
 
 # ---------------------------------------------------------------- 鉴权
+# 统一口径：Authorization Bearer 认证；旧的 ?k= 与 cma_admin Cookie 保留
+# （旧书签 / runbook 的 curl / 面板零 JS 链接都还在用，见 app/auth.py）。
+
+_AUTH_HINT = "需要 ADMIN_TOKEN：?k= 参数，或 Authorization: Bearer 请求头"
+
 
 def _require_admin(request: Request, k: Optional[str] = None) -> None:
     token = config.admin_token
     if not token:
         raise HTTPException(500, "ADMIN_TOKEN 未配置")
-    supplied = k or request.query_params.get("k") or request.cookies.get("cma_admin")
-    if supplied != token:
-        raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
+    if not authn.is_admin(request, token, k):
+        raise HTTPException(401, _AUTH_HINT)
+
+
+def _admin_url(tab: str, k: str = "") -> str:
+    """回面板的跳转地址：k 为空就不带 ``&k=``（Bearer/Cookie 会话不需要它）。"""
+    url = f"/admin?tab={tab}"
+    if k:
+        url += f"&k={_urlquote(str(k))}"
+    return url
+
+
+def _k_out(request: Request, k: Optional[str]) -> str:
+    """跳转里还要不要回显 k：Cookie/Bearer 会话不需要（token 不该进 Location）。"""
+    token = config.admin_token
+    if token and authn.keeps_credential_in_url(request, token):
+        return ""
+    return str(k or "")
 
 
 @app.get("/health")
-def health(k: Optional[str] = None):
-    # 基本字段公开（看守/巡检脚本只读 status+scheduler）；带 ?k= 才给 hl_mode/hl_kill
+def health(request: Request = None, k: Optional[str] = None):
+    # 基本字段公开（看守/巡检脚本只读 status+scheduler）；带有效凭据才给 hl_mode/hl_kill
     # （站点是公网的，无 token 不该暴露执行模式与熔断状态）。
+    # request 的默认值只为兼容 `health()` 直接调用（测试/脚本），FastAPI 照常注入。
     payload: Dict[str, Any] = {"status": "ok", "symbols": config.symbols,
                                "scheduler": bool(scheduler), "dry_run": config.dry_run}
-    if k and config.admin_token and k == config.admin_token:
-        payload["hl_mode"] = hl_mode()
-        payload["hl_kill"] = db.hl_kill()
+    if k or authn.bearer_token(request):
+        if authn.is_admin(request, config.admin_token, k):
+            payload["hl_mode"] = hl_mode()
+            payload["hl_kill"] = db.hl_kill()
     return payload
 
 
@@ -853,14 +876,15 @@ def site_webmanifest():
 # ---------------------------------------------------------------- HL 面板与控制
 
 def hl_guard(request: Request, response: Response, k: Optional[str] = None) -> None:
-    """面板与 JSON API 的鉴权：?k=<ADMIN_TOKEN> 或 cma_admin Cookie；带 k 时写 Cookie。"""
+    """面板与 JSON API 的鉴权：Bearer 头 / ?k= 查询参数 / cma_admin Cookie；带 k 时写 Cookie。"""
     token = config.admin_token
     if not token:
         raise HTTPException(500, "ADMIN_TOKEN 未配置")
-    supplied = k or request.query_params.get("k") or request.cookies.get("cma_admin")
-    if supplied != token:
-        raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
-    if k:
+    src = authn.auth_source(request, token, k)
+    if src is None:
+        raise HTTPException(401, _AUTH_HINT)
+    if src == authn.SRC_QUERY and k:
+        # 只有「凭据来自 URL」时才回写 Cookie（Bearer 会话每次自带凭据，不需要）。
         # Secure 只在 https（含反代 X-Forwarded-Proto）时加：本地 http 调试不受影响
         https_ = request.url.scheme == "https" or \
             str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
@@ -1085,7 +1109,7 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
             db.hl_log_event("kill", f"解除回撤熔断时重置基线失败：{type(e).__name__}: {e}")
     db.hl_set_kill(want, "人工" if want else "", origin="manual")
     db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
-    return RedirectResponse(f"/admin?tab=overview&k={_urlquote(str(k))}", status_code=303)
+    return RedirectResponse(_admin_url("overview", _k_out(request, k)), status_code=303)
 
 
 @app.post("/admin/hl/mr")
@@ -1100,4 +1124,4 @@ def admin_hl_mr(request: Request, on: str = Form("0"), k: str = Form("")):
     want = on in ("1", "true", "on")
     db.set_config("mr_enabled", "1" if want else "0")
     db.hl_log_event("mr_admin", f"MR 腿人工{'启用' if want else '停用'}")
-    return RedirectResponse(f"/admin?tab=overview&k={_urlquote(str(k))}", status_code=303)
+    return RedirectResponse(_admin_url("overview", _k_out(request, k)), status_code=303)
