@@ -437,31 +437,43 @@ class KrInfo:
         return out
 
     def open_orders(self, address: str) -> List[dict]:
-        return self._orders()
+        return self._orders()[0]
 
     def open_orders_checked(self, address: str) -> tuple:
+        """(挂单列表, 是否可信)。读失败或出现未注册合约 → trusted=False。
+
+        fail-closed（审计四轮 P3 外围）：旧实现跳过未注册合约的挂单只 `warning`
+        却仍判 trusted=True —— 挂单表其实不完整，消费方（对账/探针/面板）却拿它当
+        「这就是全部挂单」，会据此判「没有止损」并补挂/平仓。现在整张表判不可信。
+        """
         try:
-            return self._orders(), True
+            return self._orders()
         except KrInfoError:
             return [], False
 
-    def _orders(self) -> List[dict]:
-        """OpenOrderJson：order_id / side / unfilledSize / limitPrice / stopPrice /
-        reduceOnly / orderType / receivedTime(ISO)。**没有** orderId/qty/size（对抗审查
-        P0：旧代码 oid 恒空、挂单量恒 0 —— 止损单对账与撤单全部失效）。
+    def _orders(self) -> tuple:
+        """(挂单列表, 是否可信)。OpenOrderJson：order_id / side / unfilledSize /
+        limitPrice / stopPrice / reduceOnly / orderType / receivedTime(ISO)。
+        **没有** orderId/qty/size（对抗审查 P0：旧代码 oid 恒空、挂单量恒 0 ——
+        止损单对账与撤单全部失效）。
+
+        未注册合约的挂单**不是**「与本系统无关就可以丢掉」：挂单表是「有没有止损」
+        的唯一证据源，缺一条就可能把「有保护」判成「没保护」（或反过来）。所以这里
+        照常跳过那条无法归一的行，但把整张表标成**不可信**，让调用方走
+        「无法确认」而不是「确认没有」。
         """
         try:
             rows = self._ep.openorders()
         except KrApiErrorWrapper as e:
             raise KrInfoError(f"openorders 读取失败：{e}") from e
         out: List[dict] = []
+        unknown: List[str] = []
         for o in rows:
             sym = str(o.get("symbol") or "")
             coin = registry.kr_coin(sym)
             if not coin:
-                # 挂单里出现未知合约：不影响本系统仓位/止损判定（挂单不是敞口），
-                # 但必须留痕——静默跳过会让「有单撤不掉」变成无感故障。
-                logger.warning("[kr-info] openorders 含未识别合约，已跳过：%s", sym or "<空 symbol>")
+                # 挂单里出现未知合约：留痕 + 整表判不可信（fail-closed）。
+                unknown.append(sym or "<空 symbol>")
                 continue
             stop = _num(o.get("stopPrice"))
             otype = str(o.get("orderType") or "").strip().lower()
@@ -480,7 +492,11 @@ class KrInfo:
                 "order_type": otype,
                 "timestamp": _iso_ms(o.get("receivedTime")) or _num(o.get("timestamp")),
             })
-        return out
+        if unknown:
+            logger.warning("[kr-info] openorders 含未识别合约 %s → 挂单表判不可信（fail-closed）",
+                           ",".join(unknown[:5]))
+            return out, False
+        return out, True
 
     # ---------------------------------------------------------------- 成交
     def user_fills(self, address: str) -> List[dict]:
@@ -604,6 +620,10 @@ class KrInfo:
                 # 每笔平仓刷「手续费以 未知币种 计价」并把 fee_quote 记成 NULL。
                 "fee": fee_usd, "feeToken": "USD",
                 "fee_estimated": 1, "tid": tid, "oid": oid,
+                # cliOrdId（官方 FillJson 字段）：执行器用它证明「这笔成交就是本系统
+                # 那张入场单打出的」（崩溃在「成交→DB 更新」之间时，oid 可能还没落库，
+                # 而 cloid 是确定性推导的、一定对得上）。老响应没有该字段时给空串。
+                "cloid": str(f.get("cliOrdId") or ""),
                 "reduce_only": 1 if close_qty > 0 else 0,
             })
         return out
@@ -660,8 +680,7 @@ class KrInfo:
         positions = self._positions(mids)
         notional = sum(p["position_value"] for p in positions)
         try:
-            orders = self._orders()
-            orders_trusted = True
+            orders, orders_trusted = self._orders()
         except KrInfoError:
             orders, orders_trusted = [], False
         # 统一账户兼容键：Kraken 期货钱包本身就是「唯一余额」，现货口径 = 期货钱包现金。
