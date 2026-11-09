@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import re
@@ -22,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from app import market, posfields, strategy
+from app.hl import PURPOSE_EXIT, ST_FILLED, ST_INTENT, ST_RESTING, ST_SENT
 from app.sizing import effective_risk_pct
 from app.sizing import size_order
 
@@ -343,14 +345,27 @@ def walk(cfg, symbol: str, bars: Sequence[strategy.Bar],
         is_latest = (i == latest_closed_i)
         if position is not None:
             bar = bars[i]
-            hit_stop = (bar.low <= position.eff_stop) if position.side == 1 \
-                else (bar.high >= position.eff_stop)
+            # **离场判定只能从入场根开始**（审计四轮 P2-A）。崩溃重放时 `bar_state` 可能
+            # 落后到信号 bar 或更早（进程死在入场 tick 里、`set_last_bar` 失败、其后二次
+            # 异常），旧代码会拿**入场前**那几根的 low/high 判止损 → 假 `stop` →
+            # `on_exit('stop')` 撤单 + 市价平掉一个健康仓。父代理全历史实测：3386 个信号
+            # 里 62 个（1.831%，是「已发生重放」后的条件比例）信号 bar 自身 wick 就穿过
+            # 自己的止损。仓位在 signal_bar_ms 那根**收盘之后**才存在，所以这根及更早的
+            # 根一律不判 —— 止损与 MA20 同一口径（那根里的 MA20 离场同样不可能成立，
+            # 且用入场前的收盘价离场比假止损更离谱）。
+            # 入场根 = signal_bar_ms + 1 个周期，`>` 仍然放行它：PR-14 的「入场根允许
+            # MA20 离场」对齐不能因为这条守卫回退。
+            # signal_bar_ms <= 0（老库脏行）→ 守卫恒真，行为与改动前一致（不 fail-open 到
+            # 「永不判止损」，那会让仓位彻底失去本地保护）。
+            after_entry = bar.open_ms > int(position.signal_bar_ms)
+            hit_stop = after_entry and ((bar.low <= position.eff_stop) if position.side == 1
+                                        else (bar.high >= position.eff_stop))
             # **与回测一致：入场根（信号 bar 的下一根）收盘即可触发 MA20 离场。**
             # 回测 harness 在每个 t 用 `exit_signal_at(t-1)` 判离场，t-1 就是入场根，
             # 那边没有任何「u > ei」守卫；旧版这里用 is_entry_bar 压掉 MA20 离场，
             # 结果是亏损单多拿一根 4h（与回测口径差 6% 量级的交易）。止损不受影响：
             # 任意根（含入场根）都可以触发。
-            hit_ma20 = strategy.exit_triggered(bars, ind, i, position.side)
+            hit_ma20 = after_entry and strategy.exit_triggered(bars, ind, i, position.side)
             if hit_stop or hit_ma20:
                 events.append(Event(kind="exit", symbol=symbol, bar_ms=bar.open_ms, is_latest=is_latest,
                                     exit_price=(position.eff_stop if hit_stop else bar.close),
@@ -414,6 +429,176 @@ def _index_of_bar(bars: Sequence[strategy.Bar], bar_ms: int) -> Optional[int]:
         if bars[k].open_ms < bar_ms:
             return None
     return None
+
+
+# --------------------------------------------- 离场重试恢复态（审计四轮 P2-D）
+# `executor.on_exit` 抛异常时本地仓位行仍是 open，但「这一根该离场」这个结论只存在于
+# `walk` 的那一次遍历里。旧实现随后照样 `set_last_bar`（tick 尾部）→ 下一轮从下一根
+# 开始，这个离场信号**永久不再评估**：仓位可能规则外延续，而止损已被撤单步骤撤掉。
+#
+# 现在把「哪一笔离场还没收口」持久化进 configuration（引擎与执行器同库，进程重启也
+# 还在），并且这一轮**不推进 bar 进度**；下一轮先按它重评，再决定能否往前走。
+#
+# 重评必须防重复下单。`_on_exit_locked` 的顺序是「撤止损 → 记 exit 意图 → 发平仓单」，
+# 而平仓单发出之后仍有**未包裹**的落库步骤（app/hl/executor.py:3306 的 hl_update_order、
+# :3309 的 _close_local→db.close_position、:3194 部分成交回写）：这些一旦抛异常，
+# 平仓单已经在交易所了。判据用执行器自己的意图行 —— PURPOSE_EXIT 行在 place_order 的
+# 上一行落库（executor.py:3116），它存在且状态仍是 intent/sent/resting/filled ⇒
+# 平仓单可能已经在路上 ⇒ **绝不重发**，只告警并等对账/宽限期收敛（fail-closed：
+# 读不到台账也按「可能已发」处理）。
+EXIT_RETRY_KEY = "exit_retry:"
+# 恢复态最长自动重试时长：超过就升级成「请人工核对」，不再自动重发。
+EXIT_RETRY_DOUBT_MAX_S = 1800.0
+# 这些状态的 exit 意图行 = 平仓单可能已发出（结果未知 / 已成交）。
+_EXIT_INFLIGHT = (ST_INTENT, ST_SENT, ST_RESTING, ST_FILLED)
+
+EXIT_RETRY_NONE = "none"      # 没有恢复态（或已交回普通流程）→ 按原逻辑 walk
+EXIT_RETRY_HOLD = "hold"      # 恢复态未解决：本轮不 walk、也不推进 bar_state
+EXIT_RETRY_DONE = "done"      # 恢复态已收口：这一根消费掉，bar 进度推到最新已收盘 bar
+
+
+def _exit_retry_load(db, symbol: str) -> Optional[dict]:
+    """读恢复态。键不存在 / 脏数据 → None（脏数据顺手清掉，不带着它做判断）。"""
+    try:
+        raw = db.get_config().get(EXIT_RETRY_KEY + symbol)
+    except Exception as e:                                       # noqa: BLE001
+        logger.error("[exit-retry] 读恢复态失败（按无恢复态处理）: %s", e)
+        return None
+    if not raw:
+        return None
+    try:
+        mk = json.loads(raw)
+    except (TypeError, ValueError):
+        mk = None
+    if not isinstance(mk, dict) or not mk.get("pid"):
+        _exit_retry_clear(db, symbol)
+        return None
+    return mk
+
+
+def _exit_retry_save(db, symbol: str, pid: int, ev: "Event",
+                     error: Optional[str] = None) -> None:
+    """落恢复态（write-ahead：调用 on_exit 之前就落，进程重启后仍能重评）。"""
+    prev = _exit_retry_load(db, symbol) or {}
+    mk = {"pid": int(pid), "bar_ms": int(ev.bar_ms), "reason": str(ev.reason),
+          "ref_price": float(ev.exit_price), "at": time.time(),
+          "tries": int(prev.get("tries") or 0) + 1,
+          "last_error": str(error or prev.get("last_error") or "")}
+    try:
+        db.set_config(EXIT_RETRY_KEY + symbol, mk)
+    except Exception as e:                                       # noqa: BLE001
+        # 恢复态没落成也不推进 bar 进度（调用方照样跳过 set_last_bar）—— 最坏是下一轮
+        # 重放同一根；重放前的「平仓单是否已发出」判据仍能挡住重复下单。
+        logger.error("[exit-retry] 写恢复态失败（bar 进度仍不推进）: %s", e)
+
+
+def _exit_retry_clear(db, symbol: str, pid: Optional[int] = None) -> None:
+    """清恢复态。给了 pid 就只在它匹配时清 —— 别把同一 tick 里新仓的恢复态误删。"""
+    if pid is not None:
+        mk = _exit_retry_load(db, symbol)
+        if mk is not None and int(mk.get("pid") or 0) != int(pid):
+            return
+    try:
+        db.del_config(EXIT_RETRY_KEY + symbol)
+    except Exception as e:                                       # noqa: BLE001
+        logger.error("[exit-retry] 清恢复态失败（下一轮会再试一次）: %s", e)
+
+
+def _exit_order_maybe_sent(db, symbol: str, mk: dict) -> bool:
+    """上一轮 on_exit 是否**可能已经发出平仓单**（只看执行器自己的 exit 意图行）。
+
+    读不到台账 = 证明不了「没发过」→ 按可能已发处理（宁可等对账，也不在已发出的
+    平仓单之外再补一张 reduce-only IOC；后者在交易所已空仓时就是一次多余的反手风险）。
+    """
+    try:
+        rows = db.hl_recent_orders(400) or []
+    except Exception as e:                                       # noqa: BLE001
+        logger.error("[exit-retry] 读订单台账失败（按可能已发处理）: %s", e)
+        return True
+    lo_bar = int(mk.get("bar_ms") or 0)
+    # 意图行在异常前几秒/十几秒落库；误差窗口给足，宁可多等一轮也不重发。
+    lo_at = float(mk.get("at") or 0.0) - 900.0
+    for r in rows:
+        try:
+            if r["symbol"] != symbol or str(r["purpose"] or "") != PURPOSE_EXIT:
+                continue
+            if str(r["status"] or "") not in _EXIT_INFLIGHT:
+                continue
+            if int(r["bar_ms"] or 0) < lo_bar:
+                continue
+            if float(r["created_at"] or 0) < lo_at:
+                continue
+        except (KeyError, IndexError, TypeError, ValueError):
+            # 替身/老库读不全的行：不能当作「没发过」的证据 → 一起按可能已发处理。
+            return True
+        return True
+    return False
+
+
+def _exit_retry_step(db, cfg, notifier, symbol: str, executor, sent: List[str]) -> str:
+    """把上一轮异常的离场重评一次。返回 NONE / HOLD / DONE（见上方常量）。"""
+    mk = _exit_retry_load(db, symbol)
+    if mk is None:
+        return EXIT_RETRY_NONE
+    pid = int(mk.get("pid") or 0)
+    bar_ms = int(mk.get("bar_ms") or 0)
+    try:
+        row = db.position_by_id(pid) if pid else None
+    except Exception as e:                                       # noqa: BLE001
+        logger.error("[exit-retry] 读仓位行失败（保持恢复态）: %s", e)
+        return EXIT_RETRY_HOLD
+    if row is None or str(row["status"]) != "open":
+        # 执行器/对账在异常之后自己收口了（或行被作废）→ 恢复态结束。
+        _exit_retry_clear(db, symbol, pid)
+        return EXIT_RETRY_DONE
+    if executor is None:
+        # 没有执行器（纯提醒模式）：重评没有意义，交回普通流程 —— 下一轮 walk 会重新
+        # 产出同一个 exit 事件，引擎照旧按人工流关账/发卡。
+        _exit_retry_clear(db, symbol, pid)
+        return EXIT_RETRY_NONE
+    if _exit_order_maybe_sent(db, symbol, mk):
+        age = time.time() - float(mk.get("at") or 0.0)
+        if age > EXIT_RETRY_DOUBT_MAX_S:
+            # 长时间证不出「没发过」：不再自动重发，喊人核对，这根信号视为已消费。
+            _exit_retry_clear(db, symbol, pid)
+            _emit(db, notifier, cfg, Alert(
+                "data_error", symbol, bar_ms,
+                f"{cfg.alert_prefix}🛑 {symbol} 离场重试超时：上一轮异常时平仓单可能已发出，"
+                f"{int(age // 60)} 分钟内一直无法确认。已**停止自动重发**，请人工核对交易所"
+                f"持仓、挂单与成交。"), sent)
+            return EXIT_RETRY_DONE
+        _emit(db, notifier, cfg, Alert(
+            "data_error", symbol, bar_ms,
+            f"{cfg.alert_prefix}{symbol} 离场重试暂停：上一轮异常时平仓单可能已经发出"
+            f"（exit 意图行在 {fmt_ms(bar_ms)}），本轮**不重发平仓单**，等对账/宽限期收敛。"),
+            sent)
+        return EXIT_RETRY_HOLD
+    try:
+        handled = executor.on_exit(pid, str(mk.get("reason") or ""),
+                                   float(mk.get("ref_price") or 0.0))
+    except Exception as e:                                       # noqa: BLE001
+        logger.exception("[exit-retry] 重评 on_exit 仍异常: %s", e)
+        mk["tries"] = int(mk.get("tries") or 0) + 1
+        mk["last_error"] = f"{type(e).__name__}: {_brief(e)}"
+        try:
+            db.set_config(EXIT_RETRY_KEY + symbol, mk)
+        except Exception as e2:                                  # noqa: BLE001
+            logger.error("[exit-retry] 更新恢复态失败: %s", e2)
+        _emit(db, notifier, cfg, Alert(
+            "data_error", symbol, bar_ms,
+            f"{cfg.alert_prefix}{symbol} 执行器离场重试仍异常（{type(e).__name__}）："
+            f"本轮未关账、未重发平仓单，bar 进度不推进，下一轮继续重评。"), sent)
+        return EXIT_RETRY_HOLD
+    _exit_retry_clear(db, symbol, pid)
+    if handled:
+        _emit(db, notifier, cfg, Alert(
+            "data_error", symbol, bar_ms,
+            f"{cfg.alert_prefix}{symbol} 上一轮离场异常已在重试中收口（执行器接管、已关账），"
+            f"bar 进度推进到最新。"), sent)
+        return EXIT_RETRY_DONE
+    # 执行器让出接管权（closing/mismatch/非 live/读不到快照…）：交回普通流程，walk 会
+    # 重新产出同一个 exit 事件，由既有分支处理（本地关账 / 账本待核对 / 人工卡）。
+    return EXIT_RETRY_NONE
 
 
 # ------------------------------------------------- 面板缓存（symbol_state）
@@ -582,6 +767,22 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
         # 区块头写的却是「每 30 分钟随信号 tick 更新」。
         row = db.open_position(symbol)
         has_open = row is not None and row["status"] == "open"
+        # 审计四轮 P2-D：先处理「上一轮 on_exit 异常」留下的恢复态，再决定 bar 进度。
+        # 必须排在 pending 分支之前 —— 异常发生在离场事件上，而同一 tick 里紧接着可能
+        # 已建了新的 pending 行（同根反手），`open_position()` 返回的会是新行，恢复态
+        # 指向的却是出事的那一行。
+        retry = _exit_retry_step(db, cfg, notifier, symbol, executor, sent)
+        if retry != EXIT_RETRY_NONE:
+            if retry == EXIT_RETRY_DONE:
+                # 这一根的离场已收口（或已确认不能自动重发）→ 消费掉，不重放
+                db.set_last_bar(symbol, bars[latest_closed_i].open_ms)
+            # HOLD：bar_state 原地不动，下一轮还要重评同一根；本轮不 walk（不重产事件、
+            # 不重发卡、不重复下单）。
+            row_now = db.open_position(symbol)
+            _record_symbol_state(db, cfg, symbol, bars, ind, latest_closed_i,
+                                 has_position=bool(row_now is not None
+                                                   and row_now["status"] == "open"))
+            return
         if from_i > latest_closed_i:
             db.set_last_bar(symbol, bars[latest_closed_i].open_ms)
             _record_symbol_state(db, cfg, symbol, bars, ind, latest_closed_i, has_open)
@@ -623,12 +824,17 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
         events, new_pos = walk(cfg, symbol, bars, ind, sq, position, from_i, latest_closed_i,
                                latest_closed_i)
         suspect_held = False          # 账本待核对：行没关，槽位仍算「有仓」
+        exec_exc_any = False          # 本轮有离场没走完 → bar 进度必须停在原地
 
         for ev in events:
             if ev.kind == "exit":
                 handled = False
                 exec_exc = False
                 if executor is not None and row is not None:
+                    # write-ahead：先落恢复态再调用。这样「进程死在 on_exit 里」
+                    # （没有捕获到异常、也就没有异常分支）同样留下一份持久化记录，
+                    # 下一轮的重评会先确认平仓单没发出，再决定是否重驱动。
+                    _exit_retry_save(db, symbol, int(row["id"]), ev)
                     try:
                         handled = executor.on_exit(row["id"], ev.reason, ev.exit_price)
                     except Exception as e:                       # noqa: BLE001
@@ -638,10 +844,21 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                         # 真实状态冲突（用户可能照卡片再去平一次=反手开新仓）。
                         # 异常路径只推告警，不动本地账，留给下一轮 tick/对账收敛。
                         exec_exc = True
+                        exec_exc_any = True
+                        # 审计四轮 P2-D：恢复态已在上面落库（这里补记错误与时次），并让
+                        # tick 尾部**不推进 bar_state** —— 否则下一轮从下一根开始，
+                        # 这一根的离场信号永久不再评估（裸仓 + 规则外持仓）。
+                        _exit_retry_save(db, symbol, int(row["id"]), ev,
+                                         error=f"{type(e).__name__}: {_brief(e)}")
                         _emit(db, notifier, cfg, Alert(
                             "data_error", symbol, None,
                             f"{cfg.alert_prefix}{symbol} 执行器离场时异常（{type(e).__name__}），"
-                            f"本轮未关账未发操作卡 —— 下一轮会重新评估，请留意后续提醒。"), sent)
+                            f"本轮未关账未发操作卡 —— 已记录离场恢复态，下一轮从同一根 bar 重评"
+                            f"（重评前会确认平仓单没发出，不会重复下单），请留意后续提醒。"), sent)
+                    else:
+                        # 正常收口（含执行器让出接管权）：恢复态必须消失，否则下一轮会
+                        # 把一笔已经处理过的离场当成待重试。
+                        _exit_retry_clear(db, symbol, int(row["id"]))
                 if handled or exec_exc:
                     # 执行器已经平仓并推送了成交回报 —— 不再发人工操作卡。
                     # exec_exc 同样跳过本地关账（见上），避免重复关账/误导卡。
@@ -719,6 +936,13 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                 _emit(db, notifier, cfg, Alert("entry_missed", symbol, ev.bar_ms,
                                                format_missed(cfg, ev.sig,
                                                              executor_managed=(executor is not None))), sent)
+        if exec_exc_any:
+            # 审计四轮 P2-D：离场没收口 → bar 进度停在原地（恢复态已落库），下一轮从
+            # 同一根 bar 重评；重评前会先确认平仓单没发出，所以不会重复下单。
+            # 面板状态照常刷新（纯展示，不影响信号与执行）。
+            _record_symbol_state(db, cfg, symbol, bars, ind, latest_closed_i,
+                                 has_position=(new_pos is not None or suspect_held))
+            return
         db.set_last_bar(symbol, bars[latest_closed_i].open_ms)
         # 面板状态（排在 set_last_bar 之后：写失败不影响 bar 进度与信号推送）。
         # has_position 取 walk 走完之后的真实状态：本轮刚离场 → False（照常给两条入场线）。

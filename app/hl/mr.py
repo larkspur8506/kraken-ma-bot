@@ -32,6 +32,10 @@
   （Lighter 侧没有这条链路，已在那边显式接 `RiskState`。）
 - **占用口径 = 价格敞口（名义 = 数量 × 标记价）**，不是保证金：5x 下保证金只有名义的
   1/5，按保证金扣会让 crypto 腿在 MR 持仓期间被放大 1.8 倍（Lighter 侧是 1x，扣满额）。
+- **组合总名义闸门**（第四轮审核 P2-E）：入场定仓后、下单前读**全账户**名义
+  （`user_state()` 的 `marginSummary.totalNtlPos`，含 MR 与主策略全部持仓），
+  与主策略 `_entry_gates` 用**同一个上限倍数**（env `HL_MAX_TOTAL_NOTIONAL_MULT`，
+  即 `ExecParams.max_total_notional_mult` 的同一来源）比较；超限/读不到都不下单。
 - 开关：configuration `mr_enabled`（默认 '0'）+ `/admin/hl/mr` 写入并落
   `mr_admin` 事件；全局 `hl_kill()` 同样挡 MR 入场。
 """
@@ -40,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, time as _at_time
@@ -61,6 +66,29 @@ _EXIT_INTENT_KIND = "mr_exit_intent"
 #: 旧值 0.0009 是 HL 的往返口径（4.5bp/边 × 2）且被当成单边用了 → 双倍高估。
 #: Kraken 6 级 taker 2.75bp；掉回 Tier 1 是 5bp。真实运行时以 HlMrConfig.taker_fee_rate 为准。
 TAKER_FEE_RATE = 0.000275
+
+#: 组合总名义上限的 env 键。与 `main.hl_params()` 装配
+#: `ExecParams.max_total_notional_mult` 读的**是同一个键**（同一解析口径：float，
+#: 读不懂/非正数 = 不设限）—— 不新增独立旋钮，主策略与 MR 腿共用一组配置。
+#: MR 腿由 `main._build_mr_leg` 构造、拿不到 ExecParams，所以在 mr.py 侧解析同一 env。
+TOTAL_NOTIONAL_MULT_ENV = "HL_MAX_TOTAL_NOTIONAL_MULT"
+
+
+def parse_total_notional_mult(raw: Any) -> float:
+    """配置值 / 环境变量 → 组合总名义上限倍数；读不懂、NaN、<=0 一律 0（不设限）。
+
+    与 `ExecParams.max_total_notional_mult` 的语义对齐：`0` = 关闭该闸门
+    （executor `_entry_gates` 也是 `if p.max_total_notional_mult and > 0`）。
+    """
+    if raw is None:
+        return 0.0
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0.0
+    if val != val or val <= 0:          # NaN / 非正数 = 不设限
+        return 0.0
+    return val
 
 
 @dataclass(frozen=True)
@@ -106,6 +134,11 @@ class HlMrConfig:
     #: 单边 taker 费率（fee_est 用）。**加在末尾**：dataclass 位置参数构造不能错位。
     #: Kraken 6 级 2.75bp；改账号档位时同步 KR_TAKER_FEE。
     taker_fee_rate: float = TAKER_FEE_RATE
+    #: 组合总名义上限（× 全账户权益），与主策略 `ExecParams.max_total_notional_mult`
+    #: 同源同口径。**None = 读 env `HL_MAX_TOTAL_NOTIONAL_MULT`**（生产走这条，与
+    #: main.hl_params 同一个键）；显式给 0 = 关闭闸门（不设限）。
+    #: 也必须加在**末尾**：20+ 个 MR 测试用位置参数构造 HlMrConfig。
+    max_total_notional_mult: Optional[float] = None
 
 
 def _round_px(px: float, sz_decimals: int) -> float:
@@ -336,6 +369,65 @@ class HlMrLeg:
                 # 展示用：**全账户**保证金（无 dex 拆分），不要拿它定仓/扣减。
                 "mr_margin_reserved": mr_margin_used,
                 "mr_margin_raw": mr_margin_used, "mr_pos": mr_pos}
+
+    # ------------------------------------------------------------------ 组合名义闸门
+
+    def total_notional_mult(self) -> float:
+        """组合总名义上限倍数：config 显式给值优先，否则读主策略同一个 env 键。
+
+        `HlMrConfig.max_total_notional_mult=None`（默认）⇒ env `HL_MAX_TOTAL_NOTIONAL_MULT`。
+        0（或读不懂）= 不设限：老配置/测试夹具没有这个能力时行为不变。
+        """
+        raw = getattr(self.config, "max_total_notional_mult", None)
+        if raw is None:
+            raw = os.environ.get(TOTAL_NOTIONAL_MULT_ENV, "")
+        return parse_total_notional_mult(raw)
+
+    def _total_notional_gate(self, equity_total: float, planned_notional: float
+                             ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+        """组合总名义闸门（第四轮审核 P2-E）→ `(total, cap, reason)`。
+
+        与主策略 `executor._entry_gates` 的 `HL_MAX_TOTAL_NOTIONAL_MULT` 闸门同一口径：
+        全账户**现有名义 + 本笔计划名义 > 权益 × 上限** 即拒。`totalNtlPos` 来自
+        `info.user_state()`，含 MR 与主策略全部持仓（KrInfo 已按 position_value 求和）。
+
+        `reason is None` = 放行。`cap is None` = 未配置上限（<=0），**不做额外账户读数**
+        —— 老配置/测试夹具没有 `user_state` 也不受影响。
+
+        读不到 totalNtlPos / 权益不足以为基数时返回 reason（fail-closed：调用方不得下单）。
+        """
+        cap_mult = self.total_notional_mult()
+        if cap_mult <= 0:
+            return None, None, None
+        try:
+            eq = float(equity_total)
+        except (TypeError, ValueError):
+            eq = 0.0
+        if not (eq > 0):
+            return None, None, (f"权益不可用（equity={equity_total!r}），"
+                                f"无法校验总名义上限，本轮不下单")
+        cap = eq * cap_mult
+        try:
+            state = self.info.user_state(self.address_fn() or "")
+        except Exception as exc:                              # noqa: BLE001
+            # 读不到 ≠ 没有仓位：放行等于回到「MR 无视组合上限」的老 bug。
+            return None, cap, (f"读不到全账户名义（{type(exc).__name__}: {exc}），"
+                               f"无法校验总名义上限 {cap:.0f}U，本轮不下单")
+        ms = (state or {}).get("marginSummary") if isinstance(state, Mapping) else None
+        raw = ms.get("totalNtlPos") if isinstance(ms, Mapping) else None
+        try:
+            total = float(raw)
+        except (TypeError, ValueError):
+            return None, cap, (f"全账户名义 totalNtlPos 不可用（{raw!r}），"
+                               f"无法校验总名义上限 {cap:.0f}U，本轮不下单")
+        if not (total >= 0) or total != total:                # 负数 / NaN
+            return None, cap, (f"全账户名义 totalNtlPos 非法（{raw!r}），"
+                               f"无法校验总名义上限 {cap:.0f}U，本轮不下单")
+        if total + planned_notional > cap:
+            return total, cap, (f"组合名义将达 {total + planned_notional:.0f}U"
+                                f"（现有 {total:.0f}U + 计划 {planned_notional:.0f}U）"
+                                f"超过上限 {cap:.0f}U（{cap_mult:g}x × 权益 {eq:.0f}U）")
+        return total, cap, None
 
     # ------------------------------------------------------------------ 认领
 
@@ -691,6 +783,33 @@ class HlMrLeg:
             return status
         if notional > base:
             self.db.mr_mark_skipped(signal_date, "notional > equity（保证金不足保护）")
+            return status
+
+        # 【P2-E】组合总名义闸门：主策略 `_entry_gates` 用「全账户名义 + 本笔」对
+        # `HL_MAX_TOTAL_NOTIONAL_MULT` 设限，而 MR 旧实现只看自身 base×exposure ——
+        # 主策略先到 2.0x 后 MR 还能再加 0.5x（组合 2.5x）；反向顺序会被主策略拦住，
+        # 所以偏差是单向「只超不收」。这里复用同一个上限（同一个 env），读全账户
+        # totalNtlPos（含 MR 与主策略全部持仓）。
+        total_ntl, cap, blocked = self._total_notional_gate(equity_total, notional)
+        if total_ntl is not None:
+            status["total_notional"] = total_ntl
+        if cap is not None:
+            status["total_notional_cap"] = cap
+        if blocked and total_ntl is None:
+            # 读不到账户名义/权益 → fail-closed：本轮不下单。**不写 SKIPPED 台账** ——
+            # 单次接口抖动不该吃掉当天唯一信号（入场窗口内还有下几个 tick 重试），
+            # 但按 30 分钟节流告警，让「MR 因读不到名义停摆」看得见。
+            status["state"] = "total_notional_unknown"
+            status["error"] = blocked
+            self._alert_throttled("total_notional_unknown",
+                                  f"MR 信号 {signal_date} 本轮不下单：{blocked}")
+            return status
+        if blocked:
+            # 超上限 = 结构性放弃本信号（与「权益不足」同口径写 SKIPPED，可审计）。
+            status["state"] = "skipped_total_notional"
+            status["error"] = blocked
+            self.db.mr_mark_skipped(signal_date, blocked)
+            self._alert(f"MR 信号 {signal_date} 放弃（组合总名义上限）：{blocked}")
             return status
 
         if not self._ensure_leverage(status):

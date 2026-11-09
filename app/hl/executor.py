@@ -116,6 +116,11 @@ PNL_SRC_NO_EXIT_FILLS = "no_exit_fills"   # 只有入场腿（平仓成交还没
 #   路径上被当成正常持仓去补挂止损），也不是 mismatch（还不是真矛盾，只是时滞）。
 HL_ST_CLOSING = "closing"
 
+# 触发单类型里**属于止盈、不属于止损**的取值（`KrInfo._orders` 直接透传交易所的
+# orderType，Kraken 是 "take_profit"，HL 侧历史数据有 "tp"）。审计四轮 P2-C：
+# 只挂止盈单的仓旧实现被判成「有止损」→ 下行裸仓既不补挂也不告警。
+_TAKE_PROFIT_TYPES = ("take_profit", "take-profit", "takeprofit", "tp")
+
 # 宽限状态的存储键：`hl_close_grace:<pid>` → "<first_seen>:<rounds>:<escalated>"（configuration 表）。
 # 为什么落在 DB 而不是进程内存：build_executor() 每轮新建实例、容器还会重启，
 # 宽限期必须跨轮/跨重启计时（内存版等于每轮都重新开始等 = 永远不 kill）。
@@ -187,6 +192,13 @@ KILL_CLEAN_MIN_GAP_S = 60.0
 REALIZED_DD_WARN_KEY = "hl_realized_dd_warn_at"
 REALIZED_DD_WARN_GAP_S = 24 * 3600.0
 
+# 「对账异常但 kill 已在触发状态」事件的去重键（审计四轮 P2-G）。
+# 该分支每轮都会走到（5 分钟一次），而 `hl_log_event` 是纯 INSERT 无去重：
+# 旧代码每轮写一条 EV_KILL → 生产探针用 `max(id)` 当水位（kind in kill/dd/error）
+# → 哈希每轮都变 → `.alert_pending` 每 5 分钟被覆盖重写，把真告警冲掉。
+# 现在只在「状态发生变化」（进入该状态 / 首次置 kill）时写一条，恢复时清键。
+RECON_KILL_HOLD_KEY = "hl_recon_kill_hold"
+
 # 定点回捞成交（证据不足那一轮才发，最多 2 次、间隔 1s）：
 #   窗口起点 = opened_at − 120s（与本地 _fill_close_proof 的下界同一口径），
 #   只用开始时间而不是「开始+结束」—— 平仓成交一定在 opened_at 之后，
@@ -203,6 +215,39 @@ LAST_FILL_SLACK_S = 120.0
 # HL `userFills` 是降序（最新在前），测试桩两种都有。消费侧一律按 `time`（毫秒）自己排，
 # 否则「取最近 N 条」「取最新一笔平仓」在 Kraken 上会静默取到最旧的那批 —— 手续费/净利/
 # 关账价全错，而且不报错。
+
+
+def _fill_get(f: Any, key: str, default: Any = None) -> Any:
+    """从「sqlite3.Row 或 dict」里取字段；两边都没有就返回 default。
+
+    对账里同一批成交有两个来源：`hl_fills` 的行（Row，没有 `.get()`，缺列抛
+    IndexError）与 info 的实盘 dict。统一走这里，免得每处都写两套取法。
+    """
+    try:
+        v = f[key]
+    except (KeyError, IndexError, TypeError):
+        try:
+            v = f.get(key, default)          # type: ignore[attr-defined]
+        except Exception:                    # noqa: BLE001
+            return default
+    return default if v is None else v
+
+
+def _fill_side(dir_txt: Any, side: Any) -> int:
+    """成交的**仓位方向**：+1 多 / -1 空 / 0 未知（从 dir 归一，缺失才看原始 side）。
+
+    DB 里 `hl_fills.side` 存的是 ±1（仓位方向），实盘 fills 的 `side` 是 buy/sell
+    字符串 —— 两套口径直接比会把所有「卖出」都判成空头。dir 是唯一同源的字段。
+    """
+    d = str(dir_txt or "").lower()
+    if "long" in d:
+        return 1
+    if "short" in d:
+        return -1
+    try:
+        return int(side) if side is not None else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def _fill_ts_ms(f: Any) -> Optional[int]:
@@ -768,8 +813,21 @@ class Executor:
         # 位置在 local_open 之前：本轮升级过的行下一段读出来就是 open，不会同一轮
         # 既 pending 又 open 再被判一次「有仓没止损」。
         pending_nostop: set = set()
+        # 【审计四轮 P2-B】entry 行**结果未知**（intent/planned/failed/skipped）时不能只信
+        # 本地状态：place_order 成功之后、DB 更新之前崩溃，交易所里有真仓，本地行却停在
+        # intent → 旧逻辑把它排除在 local_open 之外，真仓不补挂止损、引擎不判离场、
+        # 最终被 ignore。这里改成「用交易所事实复核」：
+        #   ① 交易所有该 coin 的**同向仓**（无仓 = on_entry 在读数据阶段就退出，交易所
+        #      什么都没有 —— 无条件纳入会误 kill + 误 mismatch，四轮 P1 的教训）；
+        #   ② 成交里能找到入场证据（cloid/oid 命中，或同向开仓腿数量够）。
+        # 两个条件同时成立才按「已发出」对待；证据不足维持原判（那会走既有的
+        # 「交易所有 X 仓位但本地无记录」告警 + kill 口径，不会静默）。
+        entry_ev_cache: Dict[int, Optional[dict]] = {}
+        fills_cache: Dict[str, List[dict]] = {}
         for r in self.db.recent_positions(50):
-            if r["status"] != "pending" or not self._entry_issued(r):
+            if r["status"] != "pending":
+                continue
+            if not self._entry_effective(r, ex_pos, entry_ev_cache, fills_cache):
                 continue
             coin_p = self._coin_or_none(r["symbol"])
             if coin_p is None:
@@ -789,28 +847,26 @@ class Executor:
                 continue
             if not trusted:
                 continue                       # 挂单表不可信 → 判不了止损，不升级也不补挂
-            if self._has_stop(snap, coin_p, side=(loc_side or None), sz=ex_sz):
-                # 成交价优先取入场单回执（avg_px，其次意图价 px），都没有才用信号价；
-                # 这只是补账口径的近似值，下一轮数量对账/流水口径会继续校正。
-                entry_px = float(r["entry_price"] or 0.0)
-                try:
-                    o = self.db.hl_order(r["symbol"], int(r["signal_bar_ms"] or 0), PURPOSE_ENTRY)
-                    if o is not None:
-                        entry_px = float(o["avg_px"] or o["px"] or entry_px)
-                except Exception as ex:                              # noqa: BLE001
-                    logger.warning("[hl-exec] pending 补账读入场单失败（用信号价）：%s", ex)
+            # 成交价优先取入场单回执（avg_px，其次意图价 px），都没有才用信号价；
+            # 这只是补账口径的近似值，下一轮数量对账/流水口径会继续校正。
+            entry_px = self._pos_entry_px(r)
+            if self._has_stop(snap, coin_p, side=(loc_side or None), sz=ex_sz,
+                              entry_px=entry_px):
                 stop_px = float(r["actual_stop"] or r["stop_price"] or 0.0)
                 # 只标 hl_status 不够：引擎按 positions.status=='pending' 判断「还没确认」，
                 # 3 根 bar 后会 ignore_position —— 真仓会从账本里消失。必须一起翻成 open。
                 self.db.promote_position(int(r["id"]), entry_px, ex_sz, stop_px,
                                          opened_at=float(r["created_at"] or 0) or None)
                 self.db.set_pos_hl(int(r["id"]), hl_sz=ex_sz, hl_status="open")
+                ev = entry_ev_cache.get(int(r["id"]))
                 self._event(EV_RECONCILE,
                             f"{r['symbol']} pending 行补齐：交易所已有 {ex_sz} "
-                            f"{'多' if loc_side >= 0 else '空'}仓且止损在场 → 标记 open",
+                            f"{'多' if loc_side >= 0 else '空'}仓且止损在场 → 标记 open"
+                            + (f"（入场证据：{ev.get('source')}）" if ev else ""),
                             symbol=r["symbol"],
                             data={"pid": int(r["id"]), "coin": coin_p, "hl_sz": ex_sz,
-                                  "entry_px": entry_px, "stop_px": stop_px})
+                                  "entry_px": entry_px, "stop_px": stop_px,
+                                  "entry_evidence": ev})
             else:
                 pending_nostop.add(int(r["id"]))
                 missing_stop.append(dict(r))
@@ -826,7 +882,11 @@ class Executor:
                       # on_entry 在读数据阶段就退出（快照/规格/mid 失败 → entry 行记成
                       # skipped）时交易所什么都没有，无条件纳入会让下一轮对账报
                       # 「本地有仓但交易所无仓位」→ 误置 kill + 误标 mismatch。
-                      and (r["status"] == "open" or self._entry_issued(r))
+                      # 审计四轮 P2-B：entry 行结果未知（intent/failed/skipped）但
+                      # 「交易所有同向仓 + 成交能证明入场」时同样按真仓纳入 —— 否则
+                      # 成交后崩溃留下的真仓永远不会被补挂止损/判离场（见 _entry_effective）。
+                      and (r["status"] == "open"
+                           or self._entry_effective(r, ex_pos, entry_ev_cache, fills_cache))
                       # 宽限期（closing）：**必须**每轮重试 —— 它正是「交易所无仓、
                       # 成交证据还没到」那个状态，不纳入就永远等不到证据（也永远
                       # 不会超时升级），宽限期就成了「永久挂起」。
@@ -897,13 +957,15 @@ class Executor:
             # 传 dict(r)：_size_* 里用 .get()，而 sqlite3.Row 没有 get（会 AttributeError）。
             if tx := self._size_check(dict(r), ex_pos[coin], kill_before=kill_before):
                 (size_problems if tx["kill"] else size_warn).append(tx["message"])
-            # 止损判定（审计三轮）：除了「有没有触发单」，还要求方向相反、数量够。
+            # 止损判定（审计三轮 + 四轮 P2-C）：除了「有没有触发单」，还要求方向相反、
+            # 数量够、不是止盈单、触发价位于该仓的亏损侧（entry_px 给了才判）。
             # 传入本地 side 与 hl_sz（hl_sz<=0 表示本地不知量 → 不传 sz，只判方向）。
             loc_sz = float(r["hl_sz"] or 0.0)
             if (int(r["id"]) not in pending_nostop
                     and not self._has_stop(snap, coin,
                                            side=(int(r["side"] or 0) or None),
-                                           sz=(loc_sz if loc_sz > 0 else None))):
+                                           sz=(loc_sz if loc_sz > 0 else None),
+                                           entry_px=self._pos_entry_px(r))):
                 if trusted:
                     problems.append(f"{r['symbol']} 有仓但**没有止损挂单**")
                     missing_stop.append(dict(r))
@@ -1533,6 +1595,10 @@ class Executor:
         if not residual:
             return True
         failed: List[str] = []
+        # 撤掉的单在 DB 里**没有对应行** = 不是本执行器挂的（很可能是用户手工挂的
+        # reduce-only 触发单）。撤单动作本身仍然正确（平仓后它只会咬下一笔仓），
+        # 但必须在事件/告警里说清，别让人事后查不到这张单是哪来的（审计四轮 P3）。
+        no_db_row: List[str] = []
         for o in residual:
             oid = o.get("oid")
             if not oid:
@@ -1575,13 +1641,20 @@ class Executor:
             self._event(EV_ORDER,
                         f"{symbol} 平仓后{'确认残留止损单已成交' if filled else '撤掉残留止损单'} "
                         f"{oid}"
-                        + (f"（{hit}）" if hit else "（DB 无对应行）"),
+                        + (f"（{hit}）" if hit else
+                           "（DB 无对应行 —— 可能是用户手工挂的 reduce-only 触发单，已一并撤掉）"),
                         symbol=symbol, data={"oid": oid, "purpose": hit,
+                                             "manual_suspect": hit is None,
                                              "cancel_status": res.get("status")})
+            if hit is None:
+                no_db_row.append(str(oid))
         if failed:
             self._alert(f"【Kraken】🛑 {coin} 已平仓，但交易所侧仍有撤不掉的 reduce-only "
                         f"止损单：{'；'.join(failed)}。该单若被触发会平掉**下一笔**新仓 —— "
-                        f"请立即到 Kraken 手工撤单并核对。", symbol=symbol)
+                        f"请立即到 Kraken 手工撤单并核对。"
+                        + (f"（其中 {len(no_db_row)} 张在本地台账里没有对应行，"
+                           f"可能是你手工挂的 reduce-only 单）" if no_db_row else ""),
+                        symbol=symbol)
         return not failed
 
     # ------------------------------------------------------------ 数量对账（PR-3）
@@ -2243,20 +2316,27 @@ class Executor:
         return None
 
     def _has_stop(self, snap: dict, coin: str, side: Optional[int] = None,
-                  sz: Optional[float] = None) -> bool:
+                  sz: Optional[float] = None, entry_px: Optional[float] = None) -> bool:
         """该 coin 在快照里是否有**真正能保护当前仓位**的止损单。
 
         旧实现只看 coin + reduce_only + is_trigger → fail-open：方向反了（多仓挂 buy 触发
         只会加仓不会止损）、数量不够（部分成交后只剩 1/3 的量）、trigger_px 为 0/空
         （等于市价单）都算「有止损」。对账据此不再补挂 → 裸仓被记成有保护。
 
-        现在（审计三轮）：
+        现在（审计三轮 + 四轮 P2-C）：
         - 基础三条件不变（coin / reduce_only / is_trigger）；
         - ``trigger_px`` 必须 > 0（0/NULL 的触发单不是有效保护）；
+        - ``order_type`` 是 ``take_profit``/``tp`` 的一律**不算止损**：它是盈利侧的了结单，
+          同样 reduce_only + is_trigger + trigger_px>0，旧实现照收 → 「只有止盈单」的仓
+          被判成有保护，真正的下行裸仓既不补挂也不告警（审计四轮 P2-C）；
         - 给了 ``side`` → 方向必须相反：多仓（side=1）要卖单（is_buy=False），
           空仓（side=-1）要买单（is_buy=True）；
         - 给了 ``sz``（>0）→ 张数必须 ≥ sz − 1 tick（拿不到 tick 时退化成 sz*1e-6 的
-          相对噪声容差：浮点往返本来就会差几十个末位）。
+          相对噪声容差：浮点往返本来就会差几十个末位）；
+        - 给了 ``entry_px``（>0，且给了 ``side``）→ 触发价必须位于**亏损侧**：
+          多仓 trigger < entry、空仓 trigger > entry。盈利侧的 stp 是移动止盈/保护利润，
+          不是这笔仓的策略止损（价格早已越过它时它也保护不了下行）。
+          ``entry_px`` 加在参数表**末尾**且默认 None：旧调用（只判「有没有」）行为不变。
 
         默认参数保留，旧调用（只判「有没有」）行为不变。
         """
@@ -2264,6 +2344,13 @@ class Executor:
             need_sz = float(sz) if sz is not None else 0.0
         except (TypeError, ValueError):
             need_sz = 0.0
+        try:
+            ref_px = float(entry_px) if entry_px is not None else 0.0
+        except (TypeError, ValueError):
+            ref_px = 0.0
+        # 盈利侧判据要有方向才有意义：只给 entry_px 不给 side 时**不猜**（保持旧语义）。
+        loss_side = ref_px > 0 and side is not None
+        side_i = int(side) if side is not None else 0
         tol = 0.0
         if need_sz > 0:
             tick = self._size_tick(coin) if hasattr(self, "info") else None
@@ -2271,17 +2358,28 @@ class Executor:
         for o in snap.get("open_orders") or []:
             if o.get("coin") != coin or not o.get("reduce_only") or not o.get("is_trigger"):
                 continue
+            # 止盈单不是止损（P2-C）。类型缺失（老桩/降级适配层）不当作止盈 —— 那种情况
+            # 已有下面 trigger/方向/数量/亏损侧四道判据，不靠类型缺失放行任何东西。
+            if str(o.get("order_type") or "").strip().lower() in _TAKE_PROFIT_TYPES:
+                continue
             try:
-                if float(o.get("trigger_px") or 0.0) <= 0:
+                trig = float(o.get("trigger_px") or 0.0)
+                if trig <= 0:
                     continue
             except (TypeError, ValueError):
                 continue
+            if loss_side:
+                # 多仓（side>0）的止损必须在入场价**下方**；空仓在上方。
+                if side_i > 0 and not trig < ref_px:
+                    continue
+                if side_i < 0 and not trig > ref_px:
+                    continue
             if side is not None:
                 try:
                     is_buy = bool(o.get("is_buy"))
                 except Exception:                                    # noqa: BLE001
                     continue
-                if is_buy != (int(side) < 0):
+                if is_buy != (side_i < 0):
                     continue
             if need_sz > 0:
                 try:
@@ -2375,9 +2473,16 @@ class Executor:
 
     # ------------------------------------------------------------ 开仓
     def _current_closed_bar_ms(self, symbol: str) -> int:
-        """当前最后一根已收盘 4h bar 的开盘时刻（平仓 cloid 用）。
+        """当前最后一根**已收盘** 4h bar 的开盘时刻（平仓 cloid 用）。
 
-        取 bar_state 里引擎已处理的进度；读不到时按当前时间对齐 4h 网格推导。
+        取 bar_state 里引擎已处理的进度（它就是「已处理 = 已收盘」的那根）；
+        读不到时按当前时间对齐 4h 网格推导 —— 兜底**必须再减一个周期**：
+        `now - now%4h` 是**正在进行中**的那根 bar（还没收盘），拿它当「已收盘 bar」
+        会让同一根 bar 的离场 cloid 在收盘前后变成两个不同的键（同期 DB 行键错位）。
+
+        已知口径限制（只影响 DB 行键/cloid 归属，不动钱）：bar_state 落后引擎一根时，
+        这里返回的是**上一根**已收盘 bar —— 与「此刻真正收盘的那根」差一个周期。
+        价格、数量、关账价另有来源，所以不改判据、不强行对齐，只把口径写清。
         返回 0 表示完全无法确定（调用方回落入场 bar）。
         """
         try:
@@ -2388,7 +2493,8 @@ class Executor:
             pass
         try:
             now_ms = int(time.time() * 1000)
-            return now_ms - (now_ms % (4 * 3600 * 1000))
+            period = 4 * 3600 * 1000
+            return now_ms - (now_ms % period) - period
         except Exception:                                        # noqa: BLE001
             return 0
 
@@ -2422,6 +2528,207 @@ class Executor:
         if o is None:
             return False
         return (o["status"] or "") in (ST_SENT, ST_RESTING, ST_FILLED)
+
+    #: entry 行「结果未知」的状态集合：交易所可能**已经成交**，本地却没来得及更新
+    #  （place_order 成功 → 进程崩 / DB 写失败）。这类行不能只信本地状态。
+    _ENTRY_UNKNOWN_STATUS = (ST_INTENT, ST_PLANNED, ST_FAILED, ST_SKIPPED, "")
+
+    def _pos_entry_px(self, row) -> Optional[float]:
+        """该仓的**实际入场价**：入场单回执 avg_px → 意图价 px → 仓位行 entry_price。
+
+        止损判据（P2-C）要判「触发价是否位于亏损侧」，锚点必须是真实成交价：
+        用信号价当锚点时，一次 0.3% 的滑点就能把「刚好在入场价下方」的合法止损
+        判成盈利侧 → 误补挂第二张止损。
+        """
+        px = 0.0
+        try:
+            o = self.db.hl_order(str(row["symbol"]), int(row["signal_bar_ms"] or 0),
+                                 PURPOSE_ENTRY)
+            if o is not None:
+                px = self._num(_fill_get(o, "avg_px")) or self._num(_fill_get(o, "px"))
+        except Exception as ex:                                       # noqa: BLE001
+            logger.debug("[hl-exec] 读入场单价格失败（用信号价）：%s", ex)
+        if px <= 0:
+            try:
+                px = float(_fill_get(row, "entry_price") or 0.0)
+            except (TypeError, ValueError):
+                px = 0.0
+        return px if px > 0 else None
+
+    def _entry_effective(self, row, ex_pos: Optional[dict] = None,
+                         cache: Optional[dict] = None,
+                         fills_cache: Optional[dict] = None) -> bool:
+        """pending 行能不能按**真实仓位**对账。
+
+        = `_entry_issued`（本地有 sent/resting/filled 的入场单）**或**
+          `_pending_entry_evidence`（entry 行结果未知，但交易所有同向仓 + 成交证据）。
+
+        为什么不是「无条件把所有 pending 当真仓」：`on_entry` 在读数据阶段就退出
+        （快照/规格/mid 失败）时交易所侧什么都没有，纳入会让下一轮对账报
+        「本地有仓但交易所无仓位」→ 误置 kill + 误标 mismatch（四轮 P1 教训）。
+        所以「交易所同向仓」是硬前提，「成交证据」是第二道 —— 两个都要有。
+
+        ``ex_pos``：{coin: 交易所仓位}；``cache``/``fills_cache``：本轮内复用
+        （同一行会被 pending 段与 local_open 段各问一次，成交证据不许因此多打接口）。
+        """
+        if self._entry_issued(row):
+            return True
+        try:
+            pid = int(row["id"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return False
+        if cache is not None and pid in cache:
+            return bool(cache[pid])
+        ev: Optional[dict] = None
+        try:
+            coin = self._coin_or_none(str(row["symbol"]))
+            if coin:
+                ev = self._pending_entry_evidence(row, coin, (ex_pos or {}).get(coin),
+                                                  fills_cache)
+        except Exception as ex:                                       # noqa: BLE001
+            # 证据判定本身出问题 → 保持原来的保守口径（当作没发过入场单），
+            # 绝不因为「查不到证据的代码崩了」就把不明仓位认成自己的。
+            logger.warning("[hl-exec] 入场成交证据判定失败（按未发出处理）：%s", ex)
+            ev = None
+        if cache is not None:
+            cache[pid] = ev
+        return bool(ev)
+
+    def _pending_entry_evidence(self, row, coin: str, pos: Optional[dict],
+                                fills_cache: Optional[dict] = None) -> Optional[dict]:
+        """entry 行停在 intent/planned/failed/skipped 时，用**交易所事实**证明入场单真的发过。
+
+        返回证据 dict（`source` = oid / cloid / open_fill）或 None（证据不足 → 维持原判）。
+        判据顺序（从强到弱）：
+          ⓪ 交易所有该 coin 的**同向仓**且数量 > 0 —— 硬前提，没有就什么都不做；
+          ① 成交的 oid 命中入场单的 oid（入场单回执已落库、只是状态没跟上）；
+          ② 成交的 cloid 命中入场单的 cloid（Kraken `/fills` 的 `cliOrdId`；cloid 是
+             确定性推导的，入场单漏写 oid 时@它仍然唯一）；
+          ③ 同向开仓腿成交量合计 ≥ 交易所仓位 − 1 tick（兼容「连 cloid 都没落库」的
+             极端崩溃窗口）。③ **只在本地有 entry intent 行时**才认：连意图都没落库说明
+             这笔不是本执行器发的，不能把人工单认成自己的仓。
+        """
+        if not pos:
+            return None
+        try:
+            ex_side = int(pos.get("side") or 0)
+            ex_sz = abs(float(pos.get("size") or 0.0))
+        except (TypeError, ValueError):
+            return None
+        if ex_sz <= 0:
+            return None
+        try:
+            loc_side = int(_fill_get(row, "side") or 0)
+        except (TypeError, ValueError):
+            loc_side = 0
+        if loc_side and ex_side and ex_side != loc_side:
+            return None                        # 方向不一致：不猜，交给既有 mismatch 口径
+        side = loc_side or ex_side
+        try:
+            order = self.db.hl_order(str(row["symbol"]),
+                                     int(_fill_get(row, "signal_bar_ms") or 0), PURPOSE_ENTRY)
+        except Exception as ex:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 读入场单失败（不做证据判定）：%s", ex)
+            return None
+        if order is not None and (order["status"] or "") not in self._ENTRY_UNKNOWN_STATUS:
+            # 已发出/已成交：`_entry_issued` 已经覆盖，这里不该被调用；防御性返回 None。
+            return None
+        order_oid = str(_fill_get(order, "oid") or "").strip()
+        order_cloid = str(_fill_get(order, "cloid") or "").strip()
+        if not order_cloid:
+            try:
+                order_cloid = make_cloid(str(row["symbol"]),
+                                         int(_fill_get(row, "signal_bar_ms") or 0),
+                                         PURPOSE_ENTRY)
+            except Exception:                                         # noqa: BLE001
+                order_cloid = ""
+        try:
+            created = float(_fill_get(row, "created_at") or 0.0)
+        except (TypeError, ValueError):
+            created = 0.0
+        if created <= 0:
+            return None                        # 没有时间锚点就无法把成交归到这一仓
+        lo = created - 120.0                   # 120s：信号落库与首笔成交的秒级漂移
+        hi = created + 6 * 3600.0              # 覆盖一个 4h bar 内的重试窗口
+        tick = self._size_tick(coin) if hasattr(self, "info") else None
+        tol = float(tick) if tick and tick > 0 else ex_sz * 1e-6
+        open_sz = 0.0
+        for f in self._entry_fill_rows(coin, lo, hi, fills_cache):
+            f_oid = str(_fill_get(f, "oid") or "").strip()
+            f_cloid = str(_fill_get(f, "cloid") or "").strip()
+            if order_oid and f_oid and f_oid == order_oid:
+                return {"source": "oid", "oid": f_oid, "tid": _fill_get(f, "tid"),
+                        "coin": coin}
+            if order_cloid and f_cloid and f_cloid == order_cloid:
+                return {"source": "cloid", "cloid": f_cloid, "tid": _fill_get(f, "tid"),
+                        "coin": coin}
+            if order is None:
+                continue                       # 无 intent 行 → 不认泛开仓腿（防认领人工单）
+            try:
+                if int(_fill_get(f, "reduce_only") or 0):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if "open" not in str(_fill_get(f, "dir") or "").lower():
+                continue
+            try:
+                f_side = int(_fill_get(f, "side") or 0)
+            except (TypeError, ValueError):
+                f_side = 0
+            if side and f_side and f_side != side:
+                continue
+            try:
+                open_sz += abs(float(_fill_get(f, "sz") or 0.0))
+            except (TypeError, ValueError):
+                continue
+        if order is not None and open_sz > 0 and open_sz >= ex_sz - tol:
+            return {"source": "open_fill", "sz": open_sz, "coin": coin}
+        return None
+
+    def _entry_fill_rows(self, coin: str, lo: float, hi: float,
+                         fills_cache: Optional[dict] = None) -> List[dict]:
+        """入场证据用的成交视图：DB 已同步的 + 实盘未落库的，归一成同一形状。
+
+        形状：{oid, cloid, tid, ts, dir, reduce_only, sz, side}。`side` 统一成
+        ±1（DB 里是仓位方向整数，实盘 fills 的 side 是 buy/sell 字符串 —— 用 dir
+        归一，避免两套口径在判据里打架）。
+        实盘 fills 只在「DB 里查不到证据」时才多打一次接口，且同一轮内按 coin 缓存。
+        """
+        key = str(coin)
+        if fills_cache is not None and key in fills_cache:
+            return fills_cache[key]
+        out: List[dict] = []
+
+        def _push(oid, cloid, tid, ts, d, ro, sz, side):
+            out.append({"oid": oid, "cloid": cloid, "tid": tid, "ts": ts,
+                        "dir": d, "reduce_only": ro, "sz": sz,
+                        "side": _fill_side(d, side)})
+
+        try:
+            for f in self.db.hl_fills_window(key, lo=lo, hi=hi) or []:
+                _push(_fill_get(f, "oid"), "", _fill_get(f, "tid"), _fill_get(f, "ts"),
+                      _fill_get(f, "dir"), _fill_get(f, "reduce_only"),
+                      _fill_get(f, "sz"), _fill_get(f, "side"))
+        except Exception as ex:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 读本地成交失败（入场证据可能不足）：%s", ex)
+        try:
+            live = self.info.user_fills(self.p.account_address) or []
+        except Exception:                                             # noqa: BLE001
+            live = []                          # 读不到实盘成交：只用 DB 证据（不足就维持原判）
+        for f in live:
+            try:
+                if str(f.get("coin") or "") != key:
+                    continue
+                ts = float(f.get("time") or 0.0) / 1000.0
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if ts and (ts < lo or ts > hi):
+                continue
+            _push(f.get("oid"), f.get("cloid") or f.get("cliOrdId"), f.get("tid"), ts,
+                  f.get("dir"), f.get("reduce_only"), f.get("sz"), f.get("side"))
+        if fills_cache is not None:
+            fills_cache[key] = out
+        return out
 
     def on_entry(self, position_id: int) -> bool:
         """接管一次开仓。返回 True = 已接管（调用方不要再走人工确认流）。"""
@@ -4251,6 +4558,26 @@ class Executor:
                 return res
 
     # ------------------------------------------------------------ 窄口径自动解 kill
+    def _mark_recon_kill_hold(self) -> None:
+        """记下「对账异常 + kill 已触发」这条事件已经写过（P2-G 去重）。
+
+        用一个 **DB 键**而不是实例属性：`build_executor()` 每轮新建 Executor，
+        内存标记跨轮就没了 —— 那正是旧代码每轮都写一条 EV_KILL 的原因。
+        写失败只告警：宁可多记一条事件，也不能因为去重键写不进去而不记事件。
+        """
+        try:
+            self.db.set_config(RECON_KILL_HOLD_KEY, "1")
+        except Exception as ex:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 写对账 kill 事件去重键失败（下轮可能重复记事件）：%s", ex)
+
+    def _clear_recon_kill_hold(self) -> None:
+        """对账恢复正常：清掉去重键，下次异常仍然写一条新的 EV_KILL。"""
+        try:
+            if str(self.db.get_config_str(RECON_KILL_HOLD_KEY) or "") == "1":
+                self.db.set_config(RECON_KILL_HOLD_KEY, "0")
+        except Exception as ex:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 清对账 kill 事件去重键失败：%s", ex)
+
     def _kill_clean_read(self) -> int:
         """连续干净轮次计数（configuration 表；读不懂按 0 —— 宁可多数两轮）。"""
         try:
@@ -4432,13 +4759,31 @@ class Executor:
                 # → 窄口径自解」—— 人工 kill 就这么被悄悄解除了，违反「人工 kill 永不
                 # 自动解」。与数量对账（_size_check 同一守卫）同口径：只告警、不动 kill。
                 if kill_before:
-                    self._event(EV_KILL,
-                                "对账异常（kill 已处于触发状态，保留原 origin=%s，"
-                                "不改写、不自动解除）" % (self.db.hl_kill_origin() or "unknown"),
-                                data={"origin_before": self.db.hl_kill_origin()})
+                    # 【审计四轮 P2-G】这个分支每轮都进得来，而 hl_log_event 是纯 INSERT：
+                    # 旧代码每轮写一条 EV_KILL，生产探针用 max(id) 当水位 → 每 5 分钟
+                    # 换一次哈希 → pending 被持续覆盖重写，真告警反而被冲掉。
+                    # 这里改成「只在状态变化时写一条」：进入该状态写一次、之后 debug；
+                    # 对账恢复正常（下面 else 分支）或人工解除 kill 时清键，下次异常
+                    # 仍是「状态变化」，会重新写一条。kill 本身与 6h 告警节流都不受影响
+                    # （节流在下面 due 判断里独立进行）。
+                    hold = False
+                    try:
+                        hold = str(self.db.get_config_str(RECON_KILL_HOLD_KEY) or "") == "1"
+                    except Exception as ex:                          # noqa: BLE001
+                        logger.warning("[hl-exec] 读对账 kill 事件去重键失败（本轮照常记事件）：%s", ex)
+                    if hold:
+                        logger.debug("[hl-exec] 对账异常仍在持续（kill 已触发，事件已记过，本轮不重复写）")
+                    else:
+                        self._event(EV_KILL,
+                                    "对账异常（kill 已处于触发状态，保留原 origin=%s，"
+                                    "不改写、不自动解除）" % (self.db.hl_kill_origin() or "unknown"),
+                                    data={"origin_before": self.db.hl_kill_origin()})
+                        self._mark_recon_kill_hold()
                 else:
                     self.db.hl_set_kill(True, "对账异常", origin="reconcile")
                     self._event(EV_KILL, "对账异常 → 自动 kill switch", data=rec)
+                    # 首次置 kill 已经写过事件 → 下一轮起走「已在触发状态」的静默分支。
+                    self._mark_recon_kill_hold()
             # 告警去重：kill 态下每轮 run() 都会走到这里（5 分钟一轮），
             # 同一状态只推送一次 + 每 6 小时提醒一次仍在等人工；恢复由下方 else 分支报告。
             key = "hl_recon_alert_at"
@@ -4456,6 +4801,7 @@ class Executor:
                 self._repair_missing_stop(row, snap, kill_before=kill_before)
         elif rec.get("unconfirmed"):
             # 读不到触发单：只提示、绝不动作（否则会误平仓）；同一状态只喊一次
+            self._clear_recon_kill_hold()      # 对账不再报矛盾 → 状态已变化（P2-G）
             items = rec["unconfirmed"]
             self.db.hl_log_event(EV_RECONCILE, "无法确认止损（挂单接口回落）：" + "；".join(items),
                                  code_rev=self.p.code_rev)
@@ -4465,6 +4811,7 @@ class Executor:
                               + "\n- ".join(items)
                               + "\n未做任何动作。请看一眼面板/交易所；恢复后我会再报一次。")
         else:
+            self._clear_recon_kill_hold()      # 对账恢复正常 → 下次异常要重新写一条（P2-G）
             if str(self.db.get_config_str("hl_stop_unconfirmed") or "") == "1":
                 self.db.set_config("hl_stop_unconfirmed", "0")
                 alerts.append("【Kraken】✅ 挂单接口已恢复，止损状态可正常确认")

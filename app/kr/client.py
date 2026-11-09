@@ -75,8 +75,20 @@ class KrEndpoints:
         return _raise_if_error(resp, st, "openpositions").get("openPositions") or []
 
     def openorders(self) -> list:
+        """挂单：缺键 / 类型不是 list 一律抛错（fail-closed）。
+
+        旧写法 `.get("openOrders") or []` 把「降级响应/被截断的响应」当成**可信空表**：
+        对账据此判「没有任何止损」→ 补挂一张重复止损，或（探针）报 stops_bad 授权
+        人工补单。空盘必须以 `"openOrders": []` 的形式出现，缺键不是「没有挂单」。
+        """
         resp, st = self.c.get_private(f"{API}/openorders")
-        return _raise_if_error(resp, st, "openorders").get("openOrders") or []
+        data = _raise_if_error(resp, st, "openorders")
+        rows = data.get("openOrders")
+        if not isinstance(rows, list):
+            raise KrApiError(
+                f"openorders：响应缺 openOrders 或类型不是 list（{type(rows).__name__}），"
+                f"按不可信处理", st, resp)
+        return rows
 
     def fills(self, last_fill_time: str | int | None = None) -> list:
         """成交分页（官方语义）：不传 = 最近 100 条（带 realized_pnl）；
