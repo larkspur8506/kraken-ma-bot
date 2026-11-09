@@ -6,7 +6,7 @@ L2  keyform 备份 chmod 600、message 转义（源码断言）
 L3  watchdog 无地址时不跳过 24h 失败单检查
 L4  admin_ui _rows 读取失败返回 _error 标记（不再显示「暂无记录」）
 L5  权益曲线降采样（>2×width 点时抽样）
-L6  _admin_required 认 cookie（与 hl_guard 同口径）
+L6  _admin_required 认 cookie（口径在 app/auth.py；views.py 不自己读 Cookie）
 L7  MIN_BARS_REQUIRED = BAND_WINDOW + WARMUP_BARS + 6
 L9  _retry_failed_alerts 按 (symbol, kind, bar_ms) 去重
 L10 彩排脚本存在且不含 notifier 网络推送
@@ -95,9 +95,53 @@ class TestEquitySvgDownsample(unittest.TestCase):
 
 
 class TestAdminRequiredCookie(unittest.TestCase):
-    def test_cookie_path_in_source(self):
-        src = (ROOT / "app" / "hl" / "views.py").read_text(encoding="utf-8")
-        self.assertIn('request.cookies.get("cma_admin")', src)
+    """L6 `_admin_required` 认 cookie —— 口径在 ``app/auth.py``，不在 views.py。
+
+    旧断言钉死「views.py 源码里有 ``request.cookies.get("cma_admin")``」：那是实现
+    细节，凭据读取搬进统一鉴权模块（app/auth.py）之后它只会误报。这里分两层验：
+    1) 结构：views 走 ``authn.is_admin``，自己不再读 Cookie；凭据读取只在 auth.py；
+    2) 行为：只带 ``cma_admin`` Cookie（无 ?k=、无 Bearer）时 ``_admin_required`` 放行，
+       凭据不对/缺失时仍拒绝。
+    """
+
+    def test_credential_reading_lives_in_auth_module(self):
+        views = (ROOT / "app" / "hl" / "views.py").read_text(encoding="utf-8")
+        self.assertIn("authn.is_admin(", views)
+        self.assertNotIn('request.cookies.get("cma_admin")', views,
+                         "凭据读取不该在 views.py 里复制一份")
+        auth = (ROOT / "app" / "auth.py").read_text(encoding="utf-8")
+        self.assertIn('COOKIE_NAME = "cma_admin"', auth)
+        self.assertIn("request.cookies.get(COOKIE_NAME)", auth)
+
+    def _deps(self):
+        from app.hl.views import DashboardDeps
+
+        class _Cfg:
+            admin_token = "cookie-only-tk"
+
+        return DashboardDeps(db=None, config_fn=lambda: _Cfg(), info=None,
+                             address_fn=lambda: "", mode_fn=lambda: "off")
+
+    class _Req:
+        def __init__(self, cookie=""):
+            self.headers = {}
+            self.query_params = {}
+            self.cookies = {"cma_admin": cookie} if cookie else {}
+
+    def test_cookie_only_is_auth_ok(self):
+        import app.hl.views as views
+
+        def need_auth(req):
+            return views._admin_required(self._deps(), "", req)   # type: ignore[arg-type]
+
+        os.environ["HL_DASH_REQUIRE_ADMIN"] = "1"
+        try:
+            self.assertFalse(need_auth(self._Req("cookie-only-tk")),
+                             "只有 Cookie 的会话应通过（与 main.hl_guard 同口径）")
+            self.assertTrue(need_auth(self._Req("wrong")), "错的 Cookie 不该放行")
+            self.assertTrue(need_auth(self._Req()), "没有凭据不该放行")
+        finally:
+            os.environ.pop("HL_DASH_REQUIRE_ADMIN", None)
 
 
 class TestMinBars(unittest.TestCase):

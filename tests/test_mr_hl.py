@@ -484,7 +484,9 @@ class TestMrPanelAndSizing(unittest.TestCase):
             self.assertIn("/admin/hl/mr", html)
             self.assertIn("name='on' value='1'", html)
             self.assertIn("name='on' value='0'", html)
-            self.assertIn("value='tok'", html)
+            # P1-C：表单不再渲染 k 隐藏域（token 不进 HTML），提交靠第一跳种的 Cookie
+            self.assertNotIn("value='tok'", html)
+            self.assertNotIn("name='k'", html)
             self.assertIn("已启用" if want_on else "已停用", html)
             # 开关卡片必须与拉闸同一张卡（页尾唯一写入口）
             self.assertLess(html.index("拉闸（kill switch）"), html.index("MR 腿（QQQ 超跌反弹）"))

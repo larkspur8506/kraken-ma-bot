@@ -30,7 +30,6 @@
 from __future__ import annotations
 
 import csv
-import contextvars
 import datetime as dt
 import html
 import io
@@ -62,11 +61,8 @@ logger = logging.getLogger(__name__)
 
 _AUTH_HINT = "需要 ADMIN_TOKEN：?k= 参数，或 Authorization: Bearer 请求头"
 
-# 已用 Cookie/Bearer 认证的请求：渲染期不再把 token 写进 HTML（链接 / 隐藏域）。
-# 用 ContextVar 而不是改 AdminDeps 的字段：deps 是每进程一份、并发请求共享，
-# 改字段会把「这个会话不带 k」串到别的请求上。各路由 set 完在 finally 里 reset。
-_NO_K_IN_HTML: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "admin_ui_no_k_in_html", default=False)
+# 面板 HTML 一律不含 ADMIN_TOKEN 真值（P1-C 收口）：链接 / 隐藏域 / Location 都不带 k，
+# 凭据只在 HttpOnly 的 ``cma_admin`` Cookie 里。第一跳由 ``_session_cookie`` 种下。
 
 # 提醒日志（alert_logs.kind）→ 中文。以前直接显示英文原文（heartbeat_local /
 # exec_alert_fills），和「执行器事件」那张表的中文列不一致、看不懂（用户 2026-10-15 反馈）。
@@ -1827,6 +1823,19 @@ def _with_k(url: str, k: str) -> str:
     return f"{url}{sep}k={quote(token, safe='')}"
 
 
+def _strip_k(url: str) -> str:
+    """摘掉 URL 查询串里的 ``k`` 参数。
+
+    用于转发客户端给的 ``back``：即使旧书签/旧链接里带着 token，也不许它经这条
+    302 再回显到 Location（浏览器历史 / 反代日志都会留档）。
+    """
+    path, sep, query = str(url or "").partition("?")
+    if not sep:
+        return path
+    keep = [p for p in query.split("&") if p and not p.startswith("k=")]
+    return f"{path}?{'&'.join(keep)}" if keep else path
+
+
 def _hidden_k(token: str) -> str:
     """表单里的 k 隐藏域：token 为空就**整个不渲染**（Cookie/Bearer 会话不需要它）。"""
     t = str(token or "")
@@ -1834,22 +1843,38 @@ def _hidden_k(token: str) -> str:
 
 
 def _links_k(request: Request, token: str) -> str:
-    """HTML/跳转里要不要带 k：Cookie/Bearer 已认证 → ""（token 不落进页面）。"""
-    return "" if authn.keeps_credential_in_url(request, token) else str(token or "")
+    """HTML/跳转里要不要带 k：**永远不带**。
+
+    P1-C 收口：任何已通过鉴权的管理/面板 HTML（包括只用 ``?k=`` 的第一跳）都不许
+    出现 ADMIN_TOKEN 真值 —— 一旦落进 HTML，它就会进浏览器历史、截图、粘贴板与
+    任何共享链接。凭据改由 Cookie 承担：第一跳由 ``_session_cookie`` 种下
+    ``cma_admin``（HttpOnly），后续页内链接只带路径与业务参数。
+
+    代价（已与用户确认）：**不支持 Cookie 的客户端**（纯 curl 且不存 cookie jar）
+    只能自己每次手带 ``?k=`` 或 Authorization 头，页内链接不再替他携带密钥。
+    直连 query 访问本身仍然可用（``/admin?k=…`` 照常 200）。
+
+    保留 request/token 形参只为调用点稳定（旧签名被测试与调用方引用）。
+    """
+    return ""
+
+
+def _session_cookie(resp: Any, request: Request, token: str, k: Optional[str] = None) -> Any:
+    """凭据来自 URL（?k= / 表单 k）时，把会话写成 HttpOnly Cookie 再返回响应。
+
+    页内链接与 Location 都不再带 k，浏览器只能靠这个 Cookie 继续访问；不种的话
+    「第一跳之后全 401」。Bearer 会话与已有 Cookie 会话不需要重种。
+    """
+    return authn.set_session_cookie(resp, request, token, k or None)
 
 
 def _token_of(deps: AdminDeps) -> str:
-    """当前面板 token（给卡片里的表单当隐藏字段）。取不到就用空串（Cookie 也能鉴权）。
+    """页面里给表单用的 k：**永远空串**（token 不进 HTML）。
 
-    已用 Cookie/Bearer 认证的请求（``_NO_K_IN_HTML``）一律返回空串：隐藏域与链接
-    都不该再带真值 —— 那等于把 ADMIN_TOKEN 写进每个页面的 HTML。
+    P1-C 收口后隐藏域与链接都不带真值；表单提交靠 Cookie 鉴权（第一跳已种）。
+    保留函数是为了不改四个调用点（``_all_link``/卡片表单都按「k 可空」写成）。
     """
-    if _NO_K_IN_HTML.get():
-        return ""
-    try:
-        return str(_call(deps.token_fn, "") or "")
-    except Exception:                                             # noqa: BLE001
-        return ""
+    return ""
 
 
 def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
@@ -1902,8 +1927,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
     def admin_panel(request: Request, tab: str = "overview",
                     k: Optional[str] = None, msg: str = ""):
         token = _auth(deps, request, k or None)
-        # Cookie/Bearer 会话：链接与隐藏域都不带 k（token 不进 HTML）。只用 ?k= 的
-        # 第一跳仍回显 k（下面 set_cookie 后浏览器下一跳就走 Cookie 了）。
+        # P1-C：HTML 里不带 k（含只用 ?k= 的第一跳）——凭据改由这一跳种下的 Cookie 承担。
         link_k = _links_k(request, token)
         if tab not in _TAB_KEYS:
             tab = "overview"
@@ -1911,36 +1935,27 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         # 每页行数：?n= 优先（页脚链接会用），否则读 cookie，认不出回落默认 20
         rows_n = normalize_rows(request.query_params.get("n")
                                 or request.cookies.get(ROWS_COOKIE))
-        tok_ctx = _NO_K_IN_HTML.set(not link_k)
-        try:
-            payload = get_payload(deps)
-            # 盈亏曲线时间窗（P1）：总览复用 views._render_body，它从 payload 读
-            # curve_span / admin_k —— 不在这里注入的话 span 参数被静默忽略（恒 7 天）、
-            # 切换链接缺 k（无 cookie 深链 401，PR #54 同款）。
-            payload["curve_span"] = normalize_span(request.query_params.get("span"))
-            payload["admin_k"] = link_k
-            # 注：payload["rows"] 已删除（2026-10-18）—— 总览不再有长表切片，唯一消费者
-            # views._render_body 的两张表搬到了记录页，记录页直接用 rows_n 走 DB 取数。
-            strip = _status_strip(payload)
-            # 只剩两个页签：总览（含「管理」卡）/ 记录。旧书签里的 tab=params|switch 不认，
-            # 上面已回落成 overview —— 不 404（书签来自已发消息，落在总览最有用）。
-            if tab == "overview":
-                body = _overview_body(deps, payload, cfg)
-            else:
-                body = render_records(deps, rows_n, payload.get("signals"))
-            resp = _page(link_k, tab, strip, body, msg,
-                         theme=normalize_theme(request.cookies.get(THEME_COOKIE)),
-                         rows_n=rows_n)
-        finally:
-            _NO_K_IN_HTML.reset(tok_ctx)
+        payload = get_payload(deps)
+        # 盈亏曲线时间窗（P1）：总览复用 views._render_body，它从 payload 读
+        # curve_span / admin_k —— 不在这里注入的话 span 参数被静默忽略（恒 7 天）。
+        payload["curve_span"] = normalize_span(request.query_params.get("span"))
+        payload["admin_k"] = link_k          # 恒 ""（上面的 _links_k）
+        # 注：payload["rows"] 已删除（2026-10-18）—— 总览不再有长表切片，唯一消费者
+        # views._render_body 的两张表搬到了记录页，记录页直接用 rows_n 走 DB 取数。
+        strip = _status_strip(payload)
+        # 只剩两个页签：总览（含「管理」卡）/ 记录。旧书签里的 tab=params|switch 不认，
+        # 上面已回落成 overview —— 不 404（书签来自已发消息，落在总览最有用）。
+        if tab == "overview":
+            body = _overview_body(deps, payload, cfg)
+        else:
+            body = render_records(deps, rows_n, payload.get("signals"))
+        resp = _page(link_k, tab, strip, body, msg,
+                     theme=normalize_theme(request.cookies.get(THEME_COOKIE)),
+                     rows_n=rows_n)
         # Cookie 必须设在返回的 response 上：Starlette 在函数返回新 Response 时会丢弃
         # 注入的 response 上写的头（所以这里不能用依赖注入的 response）。
-        if k:
-            https_ = request.url.scheme == "https" or \
-                str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
-            resp.set_cookie("cma_admin", token, httponly=True, max_age=30 * 86400,
-                            secure=https_, samesite="lax")
-        return resp
+        # 只在「凭据来自 URL」时种 —— 页内链接已不带 k，这一跳是 Cookie 的唯一来源。
+        return _session_cookie(resp, request, token, k)
 
     # ---------------- kill switch（页尾「管理」卡，2026-10-30 从开关页迁来） ----------------
     # 迁移**只动位置与 redirect 目标**（tab=switch → tab=overview）：字段（on=1/0）、
@@ -1965,14 +1980,16 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                 deps.log_event("kill", f"解除回撤熔断（origin=dd）→ {'重置基线成功' if ok else '重置基线失败'}：{msg}")
             _manual_kill(deps, want, "人工" if want else "")
             deps.log_event("kill", f"面板{'触发' if want else '解除'} kill switch")
-            return RedirectResponse(
-                _back(link_k, "overview", (f"已解除 kill switch{note}" if not want
-                                           else "已触发 kill switch")),
-                status_code=303)
+            return _session_cookie(
+                RedirectResponse(
+                    _back(link_k, "overview", (f"已解除 kill switch{note}" if not want
+                                               else "已触发 kill switch")),
+                    status_code=303), request, token, k)
         # 没有真实动作就不记「已触发」事件 —— 事件与事实必须一致
         deps.log_event("kill", f"面板请求{'触发' if want else '解除'} kill switch，"
                                "但执行器未接线（无动作）")
-        return RedirectResponse(_back(link_k, "overview"), status_code=303)
+        return _session_cookie(RedirectResponse(_back(link_k, "overview"), status_code=303),
+                               request, token, k)
 
     # ---------------- 清除手工兜底有效期（M3 的显式入口） ----------------
     @router.post("/admin/hl/agent/fallback/clear")
@@ -1990,8 +2007,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         if err:
             raise HTTPException(400, f"清除失败：{err}")
         deps.log_event("decision", "面板清除手工兜底有效期（hl_agent_valid_until_ms）")
-        return RedirectResponse(_back(link_k, "overview", "已清除手工兜底有效期"),
-                                status_code=303)
+        return _session_cookie(
+            RedirectResponse(_back(link_k, "overview", "已清除手工兜底有效期"),
+                             status_code=303), request, token, k)
 
     # ---------------- 更新 API（到期续期后热切换私钥） ----------------
     @router.post("/admin/hl/agent/renew")
@@ -2016,7 +2034,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         ok, msg = (res if isinstance(res, (tuple, list)) and len(res) >= 2 else (False, str(res)))
         if not ok:
             raise HTTPException(400, str(msg))
-        return RedirectResponse(_back(link_k, "overview", str(msg)), status_code=303)
+        return _session_cookie(
+            RedirectResponse(_back(link_k, "overview", str(msg)), status_code=303),
+            request, token, k)
 
     # ---------------- 主题切换（零 JS：设 cookie 后跳回） ----------------
     @router.get("/admin/theme")
@@ -2033,7 +2053,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         # max_age=0 删除；auto 也写死成 cookie（显式「跟随系统」选择）
         resp.set_cookie(THEME_COOKIE, theme, max_age=365 * 86400,
                         secure=https_, samesite="lax")
-        return resp
+        return _session_cookie(resp, request, token, k)
 
     # ---------------- 每页行数切换（零 JS：设 cookie 后跳回） ----------------
     @router.get("/admin/rows")
@@ -2048,7 +2068,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                                 status_code=302)
         resp.set_cookie(ROWS_COOKIE, str(rows_n), max_age=365 * 86400,
                         secure=https_, samesite="lax")
-        return resp
+        return _session_cookie(resp, request, token, k)
 
     # ---------------- 列表子页：行数切换（切完回本子页带原筛选参数） ----------------
     # 必须声明在 /admin/list/{slug} **之前**：否则 "rows" 会被当成 slug 吃掉。
@@ -2058,19 +2078,17 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         token = _auth(deps, request, k or None)
         link_k = _links_k(request, token)
         rows_n = normalize_rows(n)
-        # back 只接受本面板的子页路径（防开放跳转）；没有/不像 → 回记录页
-        target = back if back.startswith("/admin/list/") else \
+        # back 只接受本面板的子页路径（防开放跳转）；没有/不像 → 回记录页。
+        # 深链（无 cookie 只带 k）靠这条 302 顺手种 cma_admin Cookie 活过跳转
+        # —— 链接里已经不带 k 了，Cookie 是唯一的会话载体。
+        target = _strip_k(back) if back.startswith("/admin/list/") else \
             _with_k("/admin?tab=records", link_k)
-        # 深链（无 cookie 只带 k）也要能活过这条 302：请求带 k 而 back 里没有时补上，
-        # 否则跳回去就 401（子页路由不像 /admin/rows 那样顺手写 cma_admin cookie）。
-        if link_k and "k=" not in target:
-            target += ("&" if "?" in target else "?") + f"k={quote(link_k)}"
         https_ = request.url.scheme == "https" or \
             str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
         resp = RedirectResponse(target, status_code=302)
         resp.set_cookie(ROWS_COOKIE, str(rows_n), max_age=365 * 86400,
                         secure=https_, samesite="lax")
-        return resp
+        return _session_cookie(resp, request, token, k)
 
     # ---------------- 列表子页（记录页每块「全部 ›」的落点） ----------------
     @router.get("/admin/list/{slug}", response_class=HTMLResponse)
@@ -2082,14 +2100,11 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         rows_n = normalize_rows(request.query_params.get("n")
                                 or request.cookies.get(ROWS_COOKIE))
         link_k = _links_k(request, token)
-        tok_ctx = _NO_K_IN_HTML.set(not link_k)
-        try:
-            body = render_list_subpage(deps, slug, rows_n, request.query_params)
-            return _subpage_page(link_k, slug, body,
-                                 theme=normalize_theme(request.cookies.get(THEME_COOKIE)),
-                                 rows_n=rows_n)
-        finally:
-            _NO_K_IN_HTML.reset(tok_ctx)
+        body = render_list_subpage(deps, slug, rows_n, request.query_params)
+        resp = _subpage_page(link_k, slug, body,
+                             theme=normalize_theme(request.cookies.get(THEME_COOKIE)),
+                             rows_n=rows_n)
+        return _session_cookie(resp, request, token, k)
 
     # ---------------- 列表子页：CSV 导出（同筛选全量流式） ----------------
     @router.get("/admin/export")
@@ -2111,23 +2126,32 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                                              parsed["tf"], parsed["tt"]),
                                  media_type="text/csv; charset=utf-8", headers=headers)
 
-    # ---------------- 旧地址兼容（302 到新位置，保持 ?k= 透传） ----------------
+    # ---------------- 旧地址兼容（302 到新位置；k 一律不再透传，改种 Cookie） ----------------
     @router.get("/hl", response_class=HTMLResponse)
     def hl_redirect(request: Request, k: Optional[str] = None, refresh: int = 0):
-        return RedirectResponse(_with_k("/admin?tab=overview", k or ""),
+        """旧入口：跳到合并面板总览。
+
+        以前把 ``k`` 原样拼进 Location —— 那会把 token 写进浏览器历史、反代日志与
+        转发给别人的链接。现在只在 k 有效时种会话 Cookie，Location 保持干净。
+        """
+        token = str(_call(deps.token_fn, "") or "")
+        resp = RedirectResponse(_with_k("/admin?tab=overview", _links_k(request, token)),
                                 status_code=302)
+        return _session_cookie(resp, request, token, k)
 
     @router.get("/admin/rules", response_class=HTMLResponse)
     def rules_redirect(request: Request, k: Optional[str] = None):
         # 旧参数页书签：参数页已删（2026-10-30），落到总览。
         token = _auth(deps, request, k or None)
-        return RedirectResponse(_with_k("/admin?tab=overview", _links_k(request, token)),
+        resp = RedirectResponse(_with_k("/admin?tab=overview", _links_k(request, token)),
                                 status_code=302)
+        return _session_cookie(resp, request, token, k)
 
     @router.get("/admin/logs", response_class=HTMLResponse)
     def logs_redirect(request: Request, k: Optional[str] = None):
         token = _auth(deps, request, k or None)
-        return RedirectResponse(_with_k("/admin?tab=records", _links_k(request, token)),
+        resp = RedirectResponse(_with_k("/admin?tab=records", _links_k(request, token)),
                                 status_code=302)
+        return _session_cookie(resp, request, token, k)
 
     return router

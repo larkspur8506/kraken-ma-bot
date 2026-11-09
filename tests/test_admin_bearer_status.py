@@ -358,6 +358,19 @@ class TestNoTokenInRenderedHtml(BaseCase):
         self.assertEqual(r.status_code, 303)
         self.assertNotIn(TOKEN, r.headers.get("location", ""))
 
+    def test_query_only_post_redirect_sets_cookie_and_has_no_token(self):
+        """只在表单里带 k 的写操作：303 的 Location 不许回显 token，但要把会话种成 Cookie。
+
+        否则「不用 Cookie 的客户端」会在 303 之后被自己的下一页打回 401。
+        """
+        self.client.cookies.clear()
+        r = self.client.post("/admin/switch/kill", data={"on": "1", "k": TOKEN},
+                             follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertNotIn(TOKEN, r.headers.get("location", ""))
+        self.assertIn("cma_admin", r.headers.get("set-cookie", ""))
+        self.assertEqual(self.client.get(r.headers["location"]).status_code, 200)
+
     def test_links_still_work_after_suppression(self):
         """去掉 k 后，Cookie 会话里的页签链接必须仍然能打开（不能 401）。"""
         c = self._cookie_session()
@@ -366,11 +379,68 @@ class TestNoTokenInRenderedHtml(BaseCase):
         r = c.get("/admin/list/orders")
         self.assertEqual(r.status_code, 200)
 
-    def test_first_page_with_k_still_works(self):
-        """向后兼容：只用 ?k= 的第一跳照常可用（此时 HTML 可能带 k —— 见剩余泄露点）。"""
+    def test_first_page_with_k_sets_cookie_and_has_no_token(self):
+        """只用 ?k= 的第一跳：照常 200、种 cma_admin，且 HTML 不含真值（P1-C 收口）。
+
+        旧版这里只断言「第一跳能用」，还留了一句「此时 HTML 可能带 k」—— 那正是本轮
+        要收掉的口子。现在断言换成安全要求：真值只进 HttpOnly Cookie，不进页面。
+        """
         r = self.client.get("/admin", params={"k": TOKEN})
         self.assertEqual(r.status_code, 200)
         self.assertIn("账户权益", r.text)
+        self.assertNotIn(TOKEN, r.text, "首跳 HTML 不许出现 ADMIN_TOKEN 真值")
+        self.assertNotIn("name='k'", r.text)
+        self.assertIn("cma_admin", r.headers.get("set-cookie", ""))
+        # 页内链接（不带 k）在 Cookie 会话里仍能打开
+        self.assertEqual(self.client.get("/admin?tab=records").status_code, 200)
+
+
+# ---------------------------------------------------------------- 3b. /hl 首跳 HTML
+class TestHlPageFirstHopNoToken(unittest.TestCase):
+    """``views./hl`` 的第一跳（只带 ?k=）也不许把 ADMIN_TOKEN 写进 HTML。
+
+    这一条独立挂 HL 路由：主 app 里 ``/hl`` 先被 admin_ui 的旧入口 302 接走，
+    行为测试要看到真正渲染出的页面。
+    """
+
+    def setUp(self):
+        if FastAPI is None:
+            self.skipTest("fastapi 未安装")
+        self._old = os.environ.get("HL_DASH_REQUIRE_ADMIN")
+        os.environ["HL_DASH_REQUIRE_ADMIN"] = "1"
+        tmp = tempfile.mkdtemp(prefix="hl_first_hop_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+
+        class _Cfg:
+            admin_token = TOKEN
+
+        deps = DashboardDeps(db=None, config_fn=lambda: _Cfg(), info=FakeInfo(),
+                             address_fn=lambda: ADDR, mode_fn=lambda: "off",
+                             now_fn=lambda: NOW)
+        app = FastAPI()
+        app.include_router(build_hl_router(deps))
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("HL_DASH_REQUIRE_ADMIN", None)
+        else:
+            os.environ["HL_DASH_REQUIRE_ADMIN"] = self._old
+
+    def test_first_hop_html_has_no_token_and_sets_cookie(self):
+        r = self.client.get("/hl", params={"k": TOKEN})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn(TOKEN, r.text, "/hl 的 HTML 不许出现 ADMIN_TOKEN 真值")
+        self.assertIn("cma_admin", r.headers.get("set-cookie", ""))
+        # 页内链接不再带 k（会话靠刚种下的 Cookie）
+        self.assertIn("/admin/theme?t=dark&tab=overview", r.text)
+        self.assertIn("/hl?refresh=30", r.text)
+        self.assertNotIn("&k=", r.text)
+
+    def test_wrong_k_still_401_and_not_echoed(self):
+        r = self.client.get("/hl", params={"k": "definitely-wrong"})
+        self.assertEqual(r.status_code, 401)
+        self.assertNotIn("definitely-wrong", r.text)
 
 
 # ---------------------------------------------------------------- 4. 全 app 的 hl_guard

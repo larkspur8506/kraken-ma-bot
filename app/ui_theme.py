@@ -58,17 +58,18 @@ def theme_attr(theme: str) -> str:
 
 
 def theme_switch_html(tab: str, current: str, k: str = "") -> str:
-    """页脚的主题切换行。current 已 normalize；k 只在「凭据得靠 URL 带」时才拼
-    （Cookie/Bearer 会话不拼 —— 页面 HTML 里不该出现 token 真值）。"""
-    from urllib.parse import quote
+    """页脚的主题切换行。current 已 normalize。
+
+    P1-C：``k`` 形参保留只为调用点稳定，**已不再拼进链接** —— 任何已鉴权的 HTML
+    都不许出现 ADMIN_TOKEN 真值（旧实现把 k 拼成 ``&k=…``，等于把它发到每个页面）。
+    会话靠 ``cma_admin`` Cookie 延续，主题路由照常认 Cookie。
+    """
     cur = normalize_theme(current)
-    q = quote(str(k or ""), safe="")
     links = []
     for t in THEMES:
         label = _THEME_LABELS[t]
         cls = "btn" if t == cur else "btn gray"
-        tail = f"&k={q}" if q else ""
-        links.append(f"<a class='{cls}' href='/admin/theme?t={t}&tab={_esc_attr(tab)}{tail}'>{label}</a>")
+        links.append(f"<a class='{cls}' href='/admin/theme?t={t}&tab={_esc_attr(tab)}'>{label}</a>")
     return ("<div class='foot'><span class='muted'>主题：</span>" + " ".join(links) + "</div>")
 
 

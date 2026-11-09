@@ -239,8 +239,11 @@ class TestOverviewTab(BaseCase):
     def test_tabs_switch_via_querystring(self):
         html = self.body(tab="overview")
         for tab, label in (("overview", "总览"), ("records", "记录")):
-            self.assertIn(f"/admin?tab={tab}&k={TOKEN}", html)
+            # P1-C：页内链接不再带 k（token 不进 HTML），会话靠 Cookie 延续
+            self.assertIn(f"/admin?tab={tab}'", html)
+            self.assertNotIn(f"/admin?tab={tab}&k=", html)
             self.assertIn(label, html)
+        self.assertNotIn(TOKEN, html, "HTML 里不许出现 ADMIN_TOKEN 真值")
         # 被删的两个页签不许再出现在导航里
         self.assertNotIn("tab=params", html)
         self.assertNotIn("tab=switch", html)
@@ -475,21 +478,26 @@ class TestMobileNoJs(BaseCase):
 
 
 class TestLegacyRedirects(BaseCase):
-    def test_hl_redirects_302_and_keeps_k(self):
+    def test_hl_redirects_302_without_k_and_sets_cookie(self):
+        """P1-C：跳转目标不带 k（token 不进 Location/历史），改由 Set-Cookie 接力。"""
         r = self.client.get("/hl", params={"k": TOKEN, "refresh": 30}, follow_redirects=False)
         self.assertEqual(r.status_code, 302)
-        self.assertEqual(r.headers["location"], f"/admin?tab=overview&k={TOKEN}")
+        self.assertEqual(r.headers["location"], "/admin?tab=overview")
+        self.assertNotIn(TOKEN, r.headers["location"])
+        self.assertIn("cma_admin", r.headers.get("set-cookie", ""))
+        # 顺着跳转（不带 k）仍能打开 —— 证明 Cookie 确实接上了
+        self.assertEqual(self.client.get(r.headers["location"]).status_code, 200)
 
     def test_admin_rules_redirects_3xx(self):
         """参数页已删（2026-10-30）：旧 GET 书签落到总览，不是 404。"""
         r = self.get("/admin/rules")
         self.assertIn(r.status_code, (301, 302, 303))
-        self.assertEqual(r.headers["location"], f"/admin?tab=overview&k={TOKEN}")
+        self.assertEqual(r.headers["location"], "/admin?tab=overview")
 
     def test_admin_logs_redirects_3xx(self):
         r = self.get("/admin/logs")
         self.assertIn(r.status_code, (301, 302, 303))
-        self.assertEqual(r.headers["location"], f"/admin?tab=records&k={TOKEN}")
+        self.assertEqual(r.headers["location"], "/admin?tab=records")
 
     def test_redirect_without_token_passes_through(self):
         r = self.client.get("/hl", follow_redirects=False)
@@ -595,7 +603,10 @@ class TestFullAppWiring(unittest.TestCase):
         with TestClient(mod.app) as c:
             r = c.get("/hl", params={"k": TOKEN}, follow_redirects=False)
             self.assertEqual(r.status_code, 302)
-            self.assertEqual(r.headers["location"], f"/admin?tab=overview&k={TOKEN}")
+            # P1-C：Location 不带 token，改由 cma_admin Cookie 接力
+            self.assertEqual(r.headers["location"], "/admin?tab=overview")
+            self.assertNotIn(TOKEN, r.headers["location"])
+            self.assertEqual(c.get("/admin").status_code, 200)
             r = c.get("/api/hl/status", params={"k": TOKEN})
             self.assertEqual(r.status_code, 200)
             self.assertEqual(r.json()["schema_version"], 1)
@@ -607,7 +618,8 @@ class TestFullAppWiring(unittest.TestCase):
             for path, tab in (("/admin/rules", "overview"), ("/admin/logs", "records")):
                 r = c.get(path, params={"k": TOKEN}, follow_redirects=False)
                 self.assertEqual(r.status_code, 302, path)
-                self.assertEqual(r.headers["location"], f"/admin?tab={tab}&k={TOKEN}")
+                self.assertEqual(r.headers["location"], f"/admin?tab={tab}")
+                self.assertNotIn(TOKEN, r.headers["location"])
 
     def test_removed_write_endpoints_404(self):
         """被删的写端点一律 404（不设兼容层，也不留半截实现）。"""

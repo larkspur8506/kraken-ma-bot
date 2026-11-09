@@ -239,12 +239,19 @@ class TestCurveSpan(BaseCase):
         html30 = self.hl(span="30")
         self.assertIn("净入金 1,002.59U", html30)
 
-    def test_span_links_zero_js_carry_k_and_refresh(self):
+    def test_span_links_zero_js_no_token(self):
+        """P1-C：时间窗切换仍是纯链接，但**不带 k**（真值不进 HTML）。
+
+        旧断言要求每条链接都拼 `&k=sek`；那正是本轮收掉的口子。现在要求链接
+        保留 span/refresh（行为不变），并且页面里不出现凭据。
+        """
         html = self.hl(span="30", k="sek", refresh=10)
         self.assertNotIn("<script", html.lower(), "时间切换必须是纯链接（零 JS）")
         for val in ("7", "30", "all"):
-            self.assertIn(f"href='/admin?tab=overview&span={val}&refresh=10&k=sek'", html,
-                          "链接必须指向面板单一入口并带回 k 与 refresh（PR #54 教训）")
+            self.assertIn(f"href='/admin?tab=overview&span={val}&refresh=10'", html,
+                          "链接必须指向面板单一入口并带回 span 与 refresh")
+            self.assertNotIn(f"span={val}&refresh=10&k=", html)
+        self.assertNotIn("k=sek", html, "HTML 里不许出现 ADMIN_TOKEN 真值")
         self.assertIn("✅ 近 30 天", html, "当前项要标 ✅")
         self.assertNotIn("✅ 近 7 天", html)
 
@@ -255,8 +262,9 @@ class TestCurveSpan(BaseCase):
         html30 = self.admin(tab="overview", span="30")
         self.assertIn("近 18 天（5 个快照）", html30, "span=30 在 /admin 上必须生效")
         self.assertIn("净入金 1,002.59U", html30, "摘要行随窗口重算")
-        # 链接留在面板内并带回 k（无 cookie 深链也不 401）。
-        self.assertIn("href='/admin?tab=overview&span=all&k=", html30)
+        # 链接留在面板内，且不再带 k（P1-C：会话靠 Cookie，token 不进 HTML）
+        self.assertIn("href='/admin?tab=overview&span=all'", html30)
+        self.assertNotIn(TOKEN, html30, "总览 HTML 里不许出现 ADMIN_TOKEN 真值")
         self.assertIn("✅ 近 30 天", html30)
 
     def test_dd_line_unchanged_by_span(self):

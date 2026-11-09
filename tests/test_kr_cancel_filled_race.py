@@ -99,11 +99,18 @@ class FakeInfo:
 
 
 class FakeExchange:
-    def __init__(self, cancel_result=None, exit_result=None, stop_result=None):
+    def __init__(self, cancel_result=None, exit_result=None, stop_result=None,
+                 orders_now=None, orders_trusted=True):
         self.calls = []
         self.cancel_result = cancel_result or {"ok": True, "status": STATUS_RESTING}
         self.exit_result = exit_result
         self.stop_result = stop_result
+        # 交易所实时挂单表快照（`_open_orders_checked`）
+        self.orders_now = list(orders_now or [])
+        self.orders_trusted = orders_trusted
+
+    def _open_orders_checked(self):
+        return [dict(o) for o in self.orders_now], self.orders_trusted
 
     def mid(self, coin):
         return ENTRY
@@ -132,7 +139,13 @@ class FakeExchange:
 
     def cancel(self, coin, oid):
         self.calls.append({"kind": "cancel", "coin": coin, "oid": oid})
-        return dict(self.cancel_result, oid=oid)
+        res = self.cancel_result
+        # 允许按调用顺序给结果（第一张 filled、后续 cancelled）：列表弹出 / 可调用。
+        if isinstance(res, list):
+            res = res.pop(0) if res else {"ok": True, "status": STATUS_RESTING}
+        elif callable(res):
+            res = res(coin, oid)
+        return dict(res, oid=oid)
 
     # ---- 断言辅助
     def orders(self):
@@ -576,6 +589,101 @@ class TestFilledRowWithFailedCancel(Base):
         ex = self.executor()
         self.assertTrue(ex.on_exit(self.pid, "ma20", REF_PRICE))
         self._assert_filled_wrapup("撤单状态不可识别")
+
+
+class TestNoEvidenceCleansResidualStops(Base):
+    """P1-B 残余闭环（1）：已确认交易所无仓、但成交证据不足这一支，也必须先清残留止损。
+
+    `on_exit` 第一步撤到 filled 就 break 出 purpose 循环（stop:fix / exit:rehang 不再撤），
+    随后 proof=None 只置 closing 并发「自动重试，无需人工操作」。若此刻交易所还挂着上一轮
+    重挂的 reduce-only 触发单，这条告警就是假话：孤儿单会咬下一笔开仓。
+    验收：残余单按 oid 被撤掉（DB 行落 cancelled），且仍然零新平仓 / 零重挂。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.pid = self.open_pos()
+        self.db.hl_record_intent("BTC_USDT", "BTC", BAR, PURPOSE_STOP, 1, QTY, px=STOP,
+                                 reduce_only=True, status="resting", oid=STOP_OID)
+        self.db.hl_record_intent("BTC_USDT", "BTC", BAR, PURPOSE_EXIT_REHANG, 1, QTY,
+                                 px=STOP, reduce_only=True, status="resting", oid=REHANG_OID)
+        self.info._snap = _snap(positions=[])
+        self.info._fills = []            # 成交回报还没回流 → proof=None
+        # 第 1 次 cancel（离场撤 stop）= filled；第 2 次（清理残留 rehang）= 撤成功
+        self.ex.cancel_result = [
+            {"ok": True, "status": STATUS_FILLED, "raw": {}},
+            {"ok": True, "status": STATUS_RESTING,
+             "raw": {"cancelStatus": {"status": "cancelled"}}},
+        ]
+        self.ex.orders_now = [{"coin": "BTC", "oid": REHANG_OID, "is_trigger": True,
+                               "reduce_only": True, "sz": QTY, "trigger_px": STOP}]
+
+    def test_residual_stop_cancelled_before_closing_alert(self):
+        ex = self.executor()
+        self.assertTrue(ex.on_exit(self.pid, "ma20", REF_PRICE))
+
+        self.assertIn({"kind": "cancel", "coin": "BTC", "oid": REHANG_OID}, self.ex.calls,
+                      "break 出 purpose 循环后，交易所侧残留的 rehang 单仍必须被撤")
+        self.assertEqual(self.db.hl_order("BTC_USDT", BAR, PURPOSE_EXIT_REHANG)["status"],
+                         "cancelled", "撤掉的残留单要按 oid 落到 cancelled")
+        self.assertEqual(self.stop_row()["status"], "filled",
+                         "成交的那张止损行仍是 filled")
+        # 零新单：既不许平仓，也不许重挂（含「清理后重挂」）
+        self.assertEqual(self.ex.orders(), [], "这条路径一张新单都不许发")
+        self.assertEqual(self.ex.closes(), [])
+        self.assertEqual(self.ex.triggers(), [])
+        row = self.db.position_by_id(self.pid)
+        self.assertEqual(row["status"], "open", "证据不足仍不关账")
+        self.assertEqual(row["hl_status"], "closing", "仍置 closing 交宽限/对账")
+        self.assertIn("无需人工操作", "\n".join(self.notifier.messages),
+                      "残留单已清干净，才可以说「无需人工操作」")
+
+
+class TestResidualCancelFilledKeepsAttribution(Base):
+    """P1-B 残余闭环（2）：清理残留止损时 cancel 返回 ok+filled → DB 行不得写 cancelled。
+
+    `_verify_no_residual_stops` 用交易所挂单表发现残留触发单，但那张单可能在本轮已经
+    成交（快照与撤单之间）。此时它在交易所已不在场，写 cancelled 会把「成交」抹成
+    「撤销」—— 成交归因（哪张单、多少量、什么价）永久丢失。cancelled / notFound
+    （适配层映射成 ok+resting）仍是 cancelled。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.pid = self.open_pos()
+        self.purpose = PURPOSE_STOP + ":fix"
+        self.residual_oid = "a1b2c3d4-0000-4000-8000-000000000001"
+        self.db.hl_record_intent("BTC_USDT", "BTC", BAR, self.purpose, 1, QTY, px=STOP,
+                                 reduce_only=True, status="resting", oid=self.residual_oid)
+        self.ex.orders_now = [{"coin": "BTC", "oid": self.residual_oid, "is_trigger": True,
+                               "reduce_only": True, "sz": QTY, "trigger_px": STOP}]
+
+    def _verify(self):
+        self.executor()._verify_no_residual_stops(self.db.position_by_id(self.pid), "BTC")
+
+    def _row(self):
+        return self.db.hl_order("BTC_USDT", BAR, self.purpose)
+
+    def test_cancel_filled_keeps_row_filled(self):
+        self.ex.cancel_result = {"ok": True, "status": STATUS_FILLED,
+                                 "raw": {"cancelStatus": {"status": "filled"}}}
+        self._verify()
+        row = self._row()
+        self.assertEqual(row["status"], "filled",
+                         "撤单返回 filled = 这张单已成交，行必须落 filled（保留成交归因）")
+        self.assertNotEqual(row["status"], "cancelled")
+        self.assertIsNone(row["error"])
+
+    def test_cancelled_and_notfound_still_marked_cancelled(self):
+        for raw_status in ("cancelled", "notFound"):
+            with self.subTest(raw_status=raw_status):
+                self.db.hl_update_order("BTC_USDT", BAR, self.purpose,
+                                        status="resting", error=None)
+                self.ex.cancel_result = {"ok": True, "status": STATUS_RESTING,
+                                         "raw": {"cancelStatus": {"status": raw_status}}}
+                self._verify()
+                self.assertEqual(self._row()["status"], "cancelled",
+                                 f"{raw_status} 表示单确实不在场，仍按既有一口径落 cancelled")
 
 
 if __name__ == "__main__":

@@ -1480,7 +1480,7 @@ class Executor:
                         f"（{scan_failed[:120]}），无法确认是否还残留 reduce-only 止损单 —— "
                         f"请到 Kraken 看一眼挂单。", symbol=symbol)
 
-    def _verify_no_residual_stops(self, row, coin: str) -> None:
+    def _verify_no_residual_stops(self, row, coin: str) -> bool:
         """平仓关账后复核：交易所侧是否还留着该 coin 的 reduce-only 触发单（残留止损）。
 
         为什么必须复核（审计三轮）：离场第 1 步撤止损的结果可能失败（接口抖动/单已不在/
@@ -1492,17 +1492,28 @@ class Executor:
         （``self.ex._open_orders_checked()``）：关账那一刻的快照已经过期了。
         - 读不到/不可信（trusted=False）→ **一条告警**喊人看，绝不凭猜撤单；
         - 可信 → 只针对**这个 coin** 的 is_trigger + reduce_only 逐个撤，按 oid 回写对应
-          DB 行为 cancelled；撤不掉的收成**一条**告警（列出 oid + 错误）。
+          DB 行；撤不掉的收成**一条**告警（列出 oid + 错误）。
         不认识的 coin 一律不做 cancel_all：那会把别的仓的保护单一起撤掉。
 
-        适配器没有这个能力（老 MEXC 适配器 / 测试桩）时只记 debug：它同样没有「按 coin
-        读挂单」的语义，硬造一次调用等于拿错误数据做撤单决定。
+        按 oid 回写 DB 行时的状态口径（审计四轮 P1-B 残余闭环）：
+        - 撤单返回 `ok+STATUS_FILLED` = 这张残留单**已经成交**（快照与撤单之间的竞态）。
+          行落 `filled`，绝不写 cancelled —— 否则「成交」被抹成「撤销」，成交归因
+          （哪张单/多少量/什么价）永久丢失。已是 filled 的行同样保持 filled（不降级）。
+        - cancelled / notFound（适配层映射成 ok+resting）→ 行落 `cancelled`（单确实不在场）。
+        - 撤单失败 → 行保持原状 + 计入 failed（见上）。
+
+        返回值（给调用方判断能不能说「无需人工操作」）：
+        True = 已确认没有残留（或撤干净了）；False = 读不到挂单表或仍有撤不掉的残留单，
+        此时本函数已经发过告警，调用方不得再声称「无需人工操作」。
+
+        适配器没有这个能力（老 MEXC 适配器 / 测试桩）时只记 debug（返回 True）：它同样
+        没有「按 coin 读挂单」的语义，硬造一次调用等于拿错误数据做撤单决定。
         """
         symbol = str(row["symbol"])
         fn = getattr(self.ex, "_open_orders_checked", None)
         if not callable(fn):
             logger.debug("[hl-exec] %s 平仓后复核跳过：交易所适配器无 _open_orders_checked", symbol)
-            return
+            return True
         try:
             orders, trusted = fn()
         except Exception as e:                                       # noqa: BLE001
@@ -1511,7 +1522,7 @@ class Executor:
         if not trusted:
             self._alert(f"【Kraken】⚠️ {coin} 平仓后挂单表读取失败，无法确认是否残留 "
                         f"reduce-only 止损，请到 Kraken 看一眼", symbol=symbol)
-            return
+            return False
         residual: List[dict] = []
         for o in orders or []:
             if o.get("coin") != coin:
@@ -1520,7 +1531,7 @@ class Executor:
                 continue
             residual.append(dict(o))
         if not residual:
-            return
+            return True
         failed: List[str] = []
         for o in residual:
             oid = o.get("oid")
@@ -1539,6 +1550,9 @@ class Executor:
                             f"{symbol} 平仓后残留止损单 {oid} 撤销失败（{err}）→ 需人工撤单",
                             symbol=symbol, data={"oid": oid, "error": err})
                 continue
+            # 撤单回执说它已经成交 → 这张单不在场的原因是**成交**，不是撤销。
+            # 写 cancelled 会把成交归因抹掉（与 `_stop_cancel_apply` 同一口径）。
+            filled = str(res.get("status") or "") == STATUS_FILLED
             # 按 oid 把对应 DB 行落到终态（三处 purpose 都可能，跨 bar 扫描）
             hit = None
             try:
@@ -1547,19 +1561,28 @@ class Executor:
                             and r["purpose"] in (PURPOSE_STOP, PURPOSE_STOP + ":fix",
                                                  PURPOSE_EXIT_REHANG)
                             and r["oid"] is not None and str(r["oid"]) == str(oid)):
-                        self.db.hl_update_order(symbol, int(r["bar_ms"]), r["purpose"],
-                                                status=ST_CANCELLED, error=None)
+                        cur = str(r["status"] or "")
+                        if filled or cur == ST_FILLED:
+                            # 已成交的行永不降级（本轮拿到 notFound 也推翻不了本地证据）。
+                            self.db.hl_update_order(symbol, int(r["bar_ms"]), r["purpose"],
+                                                    status=ST_FILLED, error=None)
+                        else:
+                            self.db.hl_update_order(symbol, int(r["bar_ms"]), r["purpose"],
+                                                    status=ST_CANCELLED, error=None)
                         hit = r["purpose"]
             except Exception as e:                                   # noqa: BLE001
                 logger.warning("[hl-exec] %s 残留止损 %s 撤后回写失败（忽略）：%s", symbol, oid, e)
             self._event(EV_ORDER,
-                        f"{symbol} 平仓后撤掉残留止损单 {oid}"
+                        f"{symbol} 平仓后{'确认残留止损单已成交' if filled else '撤掉残留止损单'} "
+                        f"{oid}"
                         + (f"（{hit}）" if hit else "（DB 无对应行）"),
-                        symbol=symbol, data={"oid": oid, "purpose": hit})
+                        symbol=symbol, data={"oid": oid, "purpose": hit,
+                                             "cancel_status": res.get("status")})
         if failed:
             self._alert(f"【Kraken】🛑 {coin} 已平仓，但交易所侧仍有撤不掉的 reduce-only "
                         f"止损单：{'；'.join(failed)}。该单若被触发会平掉**下一笔**新仓 —— "
                         f"请立即到 Kraken 手工撤单并核对。", symbol=symbol)
+        return not failed
 
     # ------------------------------------------------------------ 数量对账（PR-3）
     def _tick_bucket(self) -> Optional[Dict[str, Tuple[float, float]]]:
@@ -2843,6 +2866,11 @@ class Executor:
             logger.warning("[hl-exec] 止损已成交后取成交证据失败（按证据不足处理）：%s", e)
 
         if proof is None:
+            # 证据不足：先清残留止损 —— 撤单拿到 filled 时上面已经 break 出 purpose 循环，
+            # 其余 purpose（stop:fix / exit:rehang）根本没撤；交易所侧可能还挂着上一轮
+            # 重挂的 reduce-only 触发单。关账/告警前按实时挂单表补一遍，否则「自动重试，
+            # 无需人工操作」就会和一张孤儿单并存（它会咬下一笔开仓）。
+            clean = self._verify_no_residual_stops(row, coin)
             # 证据不足：先落成 closing（与对账宽限同一状态词，表示「交易所已无仓、
             # 只差成交核对」）—— 这样下一轮即便先来的是 stop 事件，也会走
             # 「成交价核对中」那支而不是按 ref_price 猜价关账。宽限开关关 = 维持 open
@@ -2856,9 +2884,15 @@ class Executor:
             self._event(EV_RECONCILE,
                         f"{symbol} 止损单已成交、交易所已无该仓，但成交证据不足："
                         f"未关账（交下一轮对账/宽限核对）",
-                        symbol=symbol, data=event_data)
-            self._alert(f"【Kraken】⏳ {coin} 止损单已成交、交易所已无该仓，平仓价核对中"
-                        f"（自动重试，无需人工操作）。", symbol=symbol)
+                        symbol=symbol, data={**event_data, "residual_stops_clean": clean})
+            if clean:
+                self._alert(f"【Kraken】⏳ {coin} 止损单已成交、交易所已无该仓，平仓价核对中"
+                            f"（自动重试，无需人工操作）。", symbol=symbol)
+            else:
+                # 残留止损读不准/撤不掉：不能再说「无需人工操作」，前一条告警已列出细节。
+                self._alert(f"【Kraken】⏳ {coin} 止损单已成交、交易所已无该仓，平仓价核对中"
+                            f"（自动重试）；但交易所侧仍可能有残留 reduce-only 止损"
+                            f"（见上一条告警）—— 请先核对清楚再开新仓。", symbol=symbol)
             return True
 
         px = float(proof["px"])

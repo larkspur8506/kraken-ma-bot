@@ -239,9 +239,12 @@ if FastAPI is not None:
             r = self.client.get("/admin/theme", params={"t": "light", "k": TOKEN},
                                 follow_redirects=False)
             self.assertEqual(r.status_code, 302)
-            self.assertEqual(r.headers["location"], f"/admin?tab=overview&k={TOKEN}")
+            # P1-C：Location 不带 token；会话由 cma_admin Cookie 接力
+            self.assertEqual(r.headers["location"], "/admin?tab=overview")
+            self.assertNotIn(TOKEN, r.headers["location"])
             sc = r.headers.get("set-cookie", "")
             self.assertIn(f"{THEME_COOKIE}=light", sc)
+            self.assertIn("cma_admin", sc)
 
         def test_theme_route_rejects_bad_value_to_auto(self):
             r = self.client.get("/admin/theme", params={"t": "purple", "k": TOKEN},
@@ -271,10 +274,11 @@ if FastAPI is not None:
             html = self.client.get("/hl", params={"k": TOKEN}).text
             self.assertIn("<html lang='zh-CN' data-theme='dark'>", html)
 
-        def test_hl_page_theme_switch_row_carries_k(self):
-            # 主题行链接要带 k，否则切完主题 401
+        def test_hl_page_theme_switch_row_has_no_token(self):
+            # P1-C：/hl 的 HTML 也不许带 token；主题链接靠 Cookie 鉴权
             html = self.client.get("/hl", params={"k": TOKEN}).text
-            self.assertIn(f"/admin/theme?t=dark&tab=overview&k={TOKEN}", html)
+            self.assertIn("/admin/theme?t=dark&tab=overview", html)
+            self.assertNotIn(TOKEN, html)
 
         def test_hl_page_theme_switch_row_present(self):
             html = self.client.get("/hl", params={"k": TOKEN}).text

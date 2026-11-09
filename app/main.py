@@ -805,11 +805,12 @@ def _admin_url(tab: str, k: str = "") -> str:
 
 
 def _k_out(request: Request, k: Optional[str]) -> str:
-    """跳转里还要不要回显 k：Cookie/Bearer 会话不需要（token 不该进 Location）。"""
-    token = config.admin_token
-    if token and authn.keeps_credential_in_url(request, token):
-        return ""
-    return str(k or "")
+    """跳转里还要不要回显 k：**永远不要**（P1-C 收口，token 不写进 Location）。
+
+    凭据来自 URL 时由 ``authn.set_session_cookie`` 在同一个响应上种 Cookie，
+    所以跳转目标不需要 k —— 这也顺带让 token 不再进浏览器历史/反代日志。
+    """
+    return ""
 
 
 @app.get("/health")
@@ -1109,7 +1110,8 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
             db.hl_log_event("kill", f"解除回撤熔断时重置基线失败：{type(e).__name__}: {e}")
     db.hl_set_kill(want, "人工" if want else "", origin="manual")
     db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
-    return RedirectResponse(_admin_url("overview", _k_out(request, k)), status_code=303)
+    resp = RedirectResponse(_admin_url("overview", _k_out(request, k)), status_code=303)
+    return authn.set_session_cookie(resp, request, config.admin_token, k or None)
 
 
 @app.post("/admin/hl/mr")
@@ -1124,4 +1126,5 @@ def admin_hl_mr(request: Request, on: str = Form("0"), k: str = Form("")):
     want = on in ("1", "true", "on")
     db.set_config("mr_enabled", "1" if want else "0")
     db.hl_log_event("mr_admin", f"MR 腿人工{'启用' if want else '停用'}")
-    return RedirectResponse(_admin_url("overview", _k_out(request, k)), status_code=303)
+    resp = RedirectResponse(_admin_url("overview", _k_out(request, k)), status_code=303)
+    return authn.set_session_cookie(resp, request, config.admin_token, k or None)

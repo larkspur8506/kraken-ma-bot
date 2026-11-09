@@ -569,7 +569,9 @@ class TestRenewPanel(Base):
             follow_redirects=False)
         self.assertEqual(r.status_code, 303)
         self.assertIn("tab=overview", r.headers["location"])
-        self.assertIn("k=tk", r.headers["location"])
+        # P1-C：303 的 Location 不带 token（旧版要求 k=tk），会话改由 Cookie 接力
+        self.assertNotIn("k=tk", r.headers["location"])
+        self.assertIn("cma_admin", r.headers.get("set-cookie", ""))
         self.assertEqual(seen["pair"], ("kr-key-1", "c2VjcmV0"))
 
     def test_renew_endpoint_failure_400(self):
