@@ -168,14 +168,20 @@ class BaseCase(unittest.TestCase):
 class AuthAndRoutes(BaseCase):
 
     def test_six_subpages_and_export_auth(self):
-        """规格测试 1：六个子页 + export 无 k → 401；有 k → 200。"""
+        """规格测试 1：六个子页 + export 无凭据 → 401；有 k → 200。
+
+        P1-C 起带 k 的响应会种 ``cma_admin``，所以每验一次 401 前先清空 Cookie jar
+        —— 否则上一轮的会话会把「无凭据」变成「有 Cookie」，测的就不是 401 分支了。
+        """
         for slug in SLUGS:
+            self.client.cookies.clear()
             r = self.client.get(f"/admin/list/{slug}")
             self.assertEqual(r.status_code, 401, slug)
             r = self.client.get(f"/admin/list/{slug}", params={"k": TOKEN})
             self.assertEqual(r.status_code, 200, slug)
             self.assertIn("导出 CSV", r.text, slug)
             self.assertIn("筛选", r.text, slug)
+        self.client.cookies.clear()
         r = self.client.get("/admin/export", params={"table": "orders"})
         self.assertEqual(r.status_code, 401)
         r = self.client.get("/admin/export", params={"table": "orders", "k": TOKEN})
@@ -196,13 +202,14 @@ class AuthAndRoutes(BaseCase):
             self.assertNotIn("https://", r.text, slug)
 
     def test_rows_switch_keeps_filters(self):
-        """/admin/list/rows 设 cookie 并跳回本子页（带原筛选参数）。"""
+        """/admin/list/rows 设 cookie 并跳回本子页（带原筛选参数、不带 k）。"""
         r = self.client.get("/admin/list/rows",
                             params={"n": "50", "back": f"/admin/list/orders?coin=BTC&k={TOKEN}",
                                     "k": TOKEN}, follow_redirects=False)
         self.assertEqual(r.status_code, 302)
         self.assertIn("coin=BTC", r.headers["location"])
-        self.assertIn(f"k={TOKEN}", r.headers["location"])
+        # P1-C：Location 不再回显 token（旧 back 里的 k 也不该被沿用）
+        self.assertNotIn(TOKEN, r.headers["location"])
         self.assertIn("cma_rows=50", r.headers["set-cookie"])
         # 防开放跳转：back 不是本面板子页时一律回记录页
         r = self.client.get("/admin/list/rows",
@@ -214,16 +221,24 @@ class AuthAndRoutes(BaseCase):
         self.assertIn("<input type='hidden' name='n' value='20'>", page,
                       "筛选表单缺 n 参数，提交后会掉回 cookie 行数")
 
-    def test_rows_switch_deep_link_keeps_k(self):
-        """审查 M3：无 cookie 只带 k 的深链，切行数后 302 必须带回 k，否则 401。"""
+    def test_rows_switch_deep_link_survives_via_cookie(self):
+        """审查 M3：只带 ?k= 的深链，切行数后 302 必须把会话续上（种 Cookie）。
+
+        旧实现是把 k 拼回 Location；P1-C 收口后 Location 不许带 token，改由
+        ``Set-Cookie`` 承担 —— 断言从「location 含 k」换成「302 种了 Cookie 且回跳 200」。
+        为了模拟「外部客户端只带 query 凭据」，链接请求前先清空 Cookie jar。
+        """
         self.add_orders(2)
         page = self.client.get("/admin/list/orders", params={"k": TOKEN, "n": "10"}).text
         m = re.search(r"href='(/admin/list/rows\?[^']*)'", page)
         self.assertIsNotNone(m, "子页缺行数切换链接")
-        rr = self.client.get(m.group(1), follow_redirects=False)
+        self.assertNotIn(TOKEN, m.group(1), "行数切换链接里不该带 token")
+        self.client.cookies.clear()                      # 只留 ?k=，不留会话
+        rr = self.client.get(m.group(1), params={"k": TOKEN}, follow_redirects=False)
         self.assertEqual(rr.status_code, 302)
-        self.assertIn(f"k={TOKEN}", rr.headers["location"],
-                      "行数切换 302 丢了 k，深链会被打回 401")
+        self.assertNotIn(TOKEN, rr.headers["location"])
+        self.assertIn("cma_admin", rr.headers.get("set-cookie", ""),
+                      "行数切换 302 没续会话，深链会被打回 401")
         self.assertEqual(self.client.get(rr.headers["location"]).status_code, 200,
                          "深链 → 切行数 → 回子页全链路应 200")
 
@@ -460,10 +475,11 @@ class MainRecordsRegression(BaseCase):
                  r.index("<h2>信号</h2>"), r.index("提醒日志（最近"),
                  r.index("执行器事件（最近")]
         self.assertEqual(order, sorted(order), "记录页块顺序被改变了")
-        # 「全部 ›」六条，指向各自的子页
+        # 「全部 ›」六条，指向各自的子页（P1-C：链接不带 token，会话靠 Cookie）
         for slug in SLUGS:
-            self.assertIn(f"href='/admin/list/{slug}?k={TOKEN}'",
+            self.assertIn(f"href='/admin/list/{slug}'",
                           r, f"缺 {slug} 的「全部 ›」入口")
+        self.assertNotIn(TOKEN, r, "记录页 HTML 里不许出现 ADMIN_TOKEN 真值")
         self.assertEqual(r.count("全部 ›"), 6)
         # 既有行数选择器不变
         for n in ("10", "20", "50"):

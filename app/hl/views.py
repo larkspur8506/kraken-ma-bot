@@ -38,8 +38,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from urllib.parse import quote
 
+from app import auth as authn
 from app import posfields
 from app.hl import flows as hl_flows
 from app.hl import dd as hl_dd
@@ -47,6 +47,9 @@ from app.ui_theme import (ICON_LINKS, SYMBOL_CSS, THEME_CSS, H1_BLOCK, PRODUCT_N
                           normalize_theme, theme_attr, theme_switch_html)
 
 logger = logging.getLogger(__name__)
+
+#: 401 提示：只说明「凭据放哪」，**不含任何真值**（也不用示例值冒充）。
+_AUTH_HINT = "需要 ADMIN_TOKEN：Authorization: Bearer 请求头，或 ?k= 参数"
 
 # 公开导出（含面板合并时复用的 _render_body / DASH_CSS；其余为原有公开 API）。
 __all__ = [
@@ -764,6 +767,12 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         latency_ms = None
     snap_positions: List[dict] = snap.get("positions") or []
     snap_orders: List[dict] = snap.get("open_orders") or []
+    # 挂单列表可信度：**唯一来源**是快照的 orders_trusted（挂单接口回落/非 list 时 False）。
+    # 顶层也发给 /api/hl/status（监控契约）：snap 读不到 = {} → 一律 False（宁缺勿信）。
+    # 严格布尔：只有 JSON 布尔 true 可信（`bool("false")` == True，会把脏值翻成可信，
+    # 方向正好反了）。与监控端 fail-closed 同口径。
+    # 下面「止损列」与 system.mismatch 对账都用这同一个布尔，不许各算一份。
+    orders_trusted = snap.get("orders_trusted") is True
 
     # ---------------- DB 侧 ----------------
     db_rows = _db_call(deps.db, "recent_positions", 50) or []
@@ -787,7 +796,7 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
 
         stop_px: Optional[float] = None
         has_stop = False
-        trusted = bool(snap.get("orders_trusted", False))
+        trusted = orders_trusted
         if trusted:
             for o in snap_orders:
                 od = _rowd(o)
@@ -1170,6 +1179,9 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         "positions": positions_out,
         "orders_open": orders_open,
         "orders_recent": orders_recent,
+        # 挂单列表可信度（监控契约 2026-11-09）：顶层布尔，与上面止损列/下面对账
+        # 同一来源（快照 orders_trusted）；读不到快照时为 False。
+        "orders_trusted": orders_trusted,
         "fills": fills_out[:100],   # JSON 也截断（看守/巡检只看头部；全量会让响应无限膨胀）
         "signals": signals,
         "symbol_state": symbol_state_out,
@@ -1180,8 +1192,7 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             "stuck_orders": len(stuck),
             "mismatch": _reconcile(reachable, snap_positions, snap_orders,
                                    open_by_coin, stuck,
-                                   orders_trusted=bool(snap.get("orders_trusted", False))
-                                   if snap else False,
+                                   orders_trusted=orders_trusted,
                                    own_coins=own_coins),
         },
         # 盈亏曲线（已剔除出入金）+ TWR 指数。旧键 equity_curve（原始权益曲线）已按
@@ -2186,19 +2197,18 @@ def _pct_txt(v: Any, dash: str = "—") -> str:
 def _span_links(cur: str, k: str = "", refresh: int = 0) -> str:
     """盈亏曲线时间窗切换链接（P1 功能二，零 JS 纯 <a>）。
 
-    当前项标 ✅ 并用高亮 btn；k 与 refresh 原样带回 —— PR #54 的教训：深链路由
-    丢 k 会 401，这里所有链接都必须带全参数。链接统一指向 /admin?tab=overview：
-    面板已合并为单一入口，在 /hl 旧页点上也会回到面板，不再各自为政。
+    当前项标 ✅ 并用高亮 btn；``refresh`` 原样带回。链接统一指向 /admin?tab=overview
+    （面板已合并为单一入口，在 /hl 旧页点上也会回到面板）。
+
+    P1-C：``k`` 形参保留只为调用点稳定，**不再拼进链接** —— 已鉴权的 HTML 不许含
+    ADMIN_TOKEN 真值，会话靠 ``cma_admin`` Cookie 延续。
     """
     cur = normalize_span(cur)
-    q = quote(str(k or ""), safe="")
     parts: List[str] = []
     for val, label in SPAN_CHOICES:
         href = f"/admin?tab=overview&span={val}"
         if refresh:
             href += f"&refresh={int(refresh)}"
-        if q:
-            href += f"&k={q}"
         if val == cur:
             parts.append(f"<a class='btn' href='{href}'>✅ {label}</a>")
         else:
@@ -2674,32 +2684,27 @@ def render_dashboard(payload: dict) -> str:
 
 
 # ---------------------------------------------------------------- 路由
+def _auth_token(deps: DashboardDeps) -> str:
+    """面板当前 ADMIN_TOKEN（读不到就空串 = 不鉴权/不种 Cookie）。"""
+    try:
+        return str(getattr(_call(deps.config_fn), "admin_token", "") or "")
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
 def _admin_required(deps: DashboardDeps, k: str, request: "Request" = None) -> bool:
     """可选鉴权：仅 HL_DASH_REQUIRE_ADMIN=1 时生效（默认关闭，便于内网直连）。
 
     返回 True = 应拒绝（401）。未开启或未配 ADMIN_TOKEN 一律放行。
-    与 main.hl_guard 同口径：?k= 命中或 cma_admin cookie 命中任一即放行
-    （审计三轮 L：以前只认 k，开 REQUIRE_ADMIN 后带 cookie 的浏览器会话也被 401）。
+    与 main.hl_guard 同口径（app/auth.py）：Bearer 头 / ?k= / cma_admin Cookie
+    任一命中即放行 —— 监控统一用 Authorization 头，浏览器会话用 Cookie。
     """
     if os.environ.get("HL_DASH_REQUIRE_ADMIN", "").strip().lower() not in ("1", "true", "yes", "on"):
         return False
-    token = ""
-    cfg = _call(deps.config_fn)
-    try:
-        token = str(getattr(cfg, "admin_token", "") or "")
-    except Exception:                                            # noqa: BLE001
-        return False
+    token = _auth_token(deps)
     if not token:
         return False
-    if str(k or "") == token:
-        return False
-    if request is not None:
-        try:
-            if str(request.cookies.get("cma_admin") or "") == token:
-                return False
-        except Exception:                                        # noqa: BLE001
-            pass
-    return True
+    return not authn.is_admin(request, token, k)
 
 
 def build_router(deps: DashboardDeps) -> Any:
@@ -2709,14 +2714,17 @@ def build_router(deps: DashboardDeps) -> Any:
     @router.get("/hl", response_class=HTMLResponse)
     def hl_page(request: Request, refresh: int = 0, k: str = "", span: str = "7"):
         if _admin_required(deps, k, request):
-            raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
+            raise HTTPException(401, _AUTH_HINT)
         payload = dict(status_payload(deps))
         payload["refresh"] = refresh if refresh in (10, 30, 60) else 0
         # 盈亏曲线时间窗（P1）：白名单外（含缺参）回落 7，见 normalize_span。
         payload["curve_span"] = normalize_span(span)
         payload["theme"] = normalize_theme(request.cookies.get("cma_theme"))
-        payload["admin_k"] = str(k or "")
-        return HTMLResponse(render_dashboard(payload))
+        # P1-C：页面里不带 token 真值 —— admin_k 恒空（链接与隐藏域都靠 Cookie 鉴权）。
+        # 只用 ?k= 的第一跳由这次响应的 Set-Cookie 转成会话，后续点击走 Cookie。
+        payload["admin_k"] = ""
+        resp = HTMLResponse(render_dashboard(payload))
+        return authn.set_session_cookie(resp, request, _auth_token(deps), k or None)
 
     @router.get("/api/hl/status")
     def hl_status(request: Request, k: str = "", curve: int = 0, live: int = 0):
@@ -2728,7 +2736,7 @@ def build_router(deps: DashboardDeps) -> Any:
           省去每轮实连 Kraken 的 ~1s 延迟；传 `?live=1` 强制走实时客户端。
         """
         if _admin_required(deps, k, request):
-            raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
+            raise HTTPException(401, _AUTH_HINT)
         eff_deps = deps
         if not live and deps.snapshot_info_fn is not None:
             sinfo = _call(deps.snapshot_info_fn)
@@ -2747,7 +2755,7 @@ def build_router(deps: DashboardDeps) -> Any:
         - 当前无已知外部消费方（trade-hub / 脚本 / cron 均不读它），参数保持向后兼容。
         """
         if _admin_required(deps, k, request):
-            raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
+            raise HTTPException(401, _AUTH_HINT)
         eff_deps = deps
         if not live and deps.snapshot_info_fn is not None:
             sinfo = _call(deps.snapshot_info_fn)
@@ -2780,14 +2788,14 @@ def build_router(deps: DashboardDeps) -> Any:
         「现在为什么不开仓」，而不必去翻 HTML。只读，无任何副作用。
         """
         if _admin_required(deps, k, request):
-            raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
+            raise HTTPException(401, _AUTH_HINT)
         rows = _why_rows(deps)
         return {"ts": _num(_call(deps.now_fn), time.time()), "symbols": rows}
 
     @router.get("/api/hl/snapshot")
     def hl_snapshot(request: Request, k: str = ""):
         if _admin_required(deps, k, request):
-            raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
+            raise HTTPException(401, _AUTH_HINT)
         p = status_payload(deps)
         return {
             "ts": p.get("ts"),

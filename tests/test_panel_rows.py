@@ -54,7 +54,9 @@ class TestRowsSwitch(BaseCase):
         r = self.get("/admin/rows", n=10, tab="records")
         self.assertEqual(r.status_code, 302)
         self.assertIn("tab=records", r.headers["location"])
-        self.assertIn(TOKEN, r.headers["location"])
+        # P1-C：Location 不带 token，改由 cma_admin Cookie 接力
+        self.assertNotIn(TOKEN, r.headers["location"])
+        self.assertIn("cma_admin", r.headers.get("set-cookie", ""))
         self.assertEqual(r.cookies.get(ROWS_COOKIE), "10")
 
     def test_switch_clamps_illegal_value(self):

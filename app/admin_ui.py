@@ -43,6 +43,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
+from app import auth as authn
 from app import engine, posfields
 from app.db import DB
 from app.hl import dd as hl_dd
@@ -57,6 +58,11 @@ from app.ui_theme import (ICON_LINKS, THEME_COOKIE, DEFAULT_THEME, H1_BLOCK, PRO
                           theme_switch_html)
 
 logger = logging.getLogger(__name__)
+
+_AUTH_HINT = "需要 ADMIN_TOKEN：?k= 参数，或 Authorization: Bearer 请求头"
+
+# 面板 HTML 一律不含 ADMIN_TOKEN 真值（P1-C 收口）：链接 / 隐藏域 / Location 都不带 k，
+# 凭据只在 HttpOnly 的 ``cma_admin`` Cookie 里。第一跳由 ``_session_cookie`` 种下。
 
 # 提醒日志（alert_logs.kind）→ 中文。以前直接显示英文原文（heartbeat_local /
 # exec_alert_fills），和「执行器事件」那张表的中文列不一致、看不懂（用户 2026-10-15 反馈）。
@@ -101,11 +107,11 @@ BACKFILL_PREFIX = "[回填] "
 def rows_switch_html(tab: str, current: int, k: str = "") -> str:
     """页脚「每页行数」切换行（零 JS，纯链接；与主题切换同一套做法）。"""
     cur = normalize_rows(current)
-    q = quote(str(k or ""), safe="")
     links = []
     for n in ROW_CHOICES:
         cls = "btn" if n == cur else "btn gray"
-        links.append(f"<a class='{cls}' href='/admin/rows?n={n}&tab={_esc(tab)}&k={q}'>{n}</a>")
+        href = _with_k(f"/admin/rows?n={n}&tab={_esc(tab)}", k)
+        links.append(f"<a class='{cls}' href='{href}'>{n}</a>")
     return ("<div class='foot'><span class='muted'>每页行数：</span>" + " ".join(links)
             + "<span class='muted'>&nbsp;（历史类长表；不影响图表）</span></div>")
 
@@ -462,10 +468,9 @@ def _ledger_trade_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _all_link(slug: str, token: str) -> str:
     """记录页各块的「全部 ›」入口（feat/list-subpages）：跳到该表的独立子页。
 
-    零 JS 的普通链接；k 原样带上（子页与其余 admin 路由同法鉴权）。
+    零 JS 的普通链接；只有「凭据得靠 URL 带」时才拼 k（Cookie/Bearer 会话不拼）。
     """
-    q = quote(str(token or ""), safe="")
-    return (f"<a class='alllink' href='/admin/list/{slug}?k={q}' "
+    return (f"<a class='alllink' href='{_with_k(f'/admin/list/{slug}', token)}' "
             f"title='查看该表全部记录（可筛选、可导出 CSV）'>全部 ›</a>")
 
 
@@ -994,13 +999,12 @@ def _subpage_parse(deps: AdminDeps, slug: str, params: Any) -> Dict[str, Any]:
 
 
 def _subpage_url(slug: str, k: str, qs: str, cursor: str = "") -> str:
-    """拼子页链接：k + 筛选串（翻页链接必须把筛选条件原样带上，spec 定案 3）。"""
-    parts = [f"k={quote(str(k or ''), safe='')}"]
-    if qs:
-        parts.append(qs)
-    if cursor:
-        parts.append(cursor)
-    return f"/admin/list/{slug}?" + "&".join(parts)
+    """拼子页链接：k（只在需要时）+ 筛选串（翻页链接必须把筛选条件原样带上，spec 定案 3）。"""
+    parts = [p for p in (qs, cursor) if p]
+    url = f"/admin/list/{slug}"
+    if parts:
+        url += "?" + "&".join(parts)
+    return _with_k(url, k)
 
 
 def _subpage_rows_html(slug: str, rows: List[Dict[str, Any]],
@@ -1123,7 +1127,7 @@ def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) ->
     after_s = str(params.get("after", "") or "").strip()
 
     head_html = (f"<h2>{_esc(cfg['title'])}</h2>"
-                 f"<div class='hint'><a href='/admin?tab=records&amp;k={quote(str(token), safe='')}'>"
+                 f"<div class='hint'><a href='{_with_k('/admin?tab=records', token)}'>"
                  "‹ 返回记录页</a></div>")
 
     # ---- 取数（fail-soft：DB 层坏掉时显示错误行，页面不 500） ----
@@ -1219,7 +1223,7 @@ def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) ->
     # ---- 筛选器（GET 表单，零 JS：提交即重载） ----
     # 隐藏 n 与翻页链接口径一致：提交筛选不掉回 cookie 行数。
     form: List[str] = [f"<form method='get' action='/admin/list/{slug}' class='inline'>"
-                       f"<input type='hidden' name='k' value='{_esc(token)}'>"
+                       f"{_hidden_k(token)}"
                        f"<input type='hidden' name='n' value='{int(n)}'>"]
     for key, label, kind in cfg["filters"]:
         cur = parsed["raw"].get(key, "")
@@ -1262,12 +1266,12 @@ def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) ->
     back = quote(f"/admin/list/{slug}" + (f"?{qs}" if qs else ""), safe="")
     row_links = " ".join(
         f"<a class='{'btn' if m == n else 'btn gray'}' "
-        f"href='/admin/list/rows?n={m}&back={back}&k={quote(str(token), safe='')}'>{m}</a>"
+        f"href='{_with_k(f'/admin/list/rows?n={m}&back={back}', token)}'>{m}</a>"
         for m in ROW_CHOICES)
 
     # ---- 导出 CSV（同筛选条件下全量流式，不分页） ----
     export_qs = ("&" + qs) if qs else ""
-    export_link = (f"<a class='btn' href='/admin/export?table={slug}&k={quote(str(token), safe='')}"
+    export_link = (f"<a class='btn' href='{_with_k(f'/admin/export?table={slug}', token)}"
                    f"{export_qs}'>导出 CSV</a>")
 
     # 资金流水筛选态的余额口径必须写在**可见文字**里（spec 定案 5）：筛选后的余额
@@ -1464,11 +1468,10 @@ def _status_strip(p: dict) -> str:
 
 
 def _tabs_html(tab: str, k: str) -> str:
-    q = quote(str(k or ""))
     out = ["<div class='tabs'>"]
     for key, label in TABS:
         cls = "on" if key == tab else ""
-        out.append(f"<a class='{cls}' href='/admin?tab={key}&k={q}'>{label}</a>")
+        out.append(f"<a class='{cls}' href='{_with_k(f'/admin?tab={key}', k)}'>{label}</a>")
     out.append("</div>")
     return "".join(out)
 
@@ -1678,7 +1681,7 @@ def render_agent_renew_block(deps: AdminDeps) -> str:
              "<div class='hint'>Kraken → Derivatives → More → API：<b>General API=Full</b>、"
              "<b>Withdrawal=No Access</b>；把 Key 与 Secret（base64）粘到下面保存。</div>"
              "<form method='post' action='/admin/hl/agent/renew' autocomplete='off'>"
-             f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
+             f"{_hidden_k(_token_of(deps))}"
              "<input type='text' name='apikey' autocomplete='off' spellcheck='false' "
              "placeholder='API Key' required>"
              "<input type='password' name='apisecret' autocomplete='off' spellcheck='false' "
@@ -1737,9 +1740,8 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
     else:
         o.append("<div class='hint'>当前未触发。触发后执行器不再开新仓。</div>")
     o.append("<form method='post' action='/admin/switch/kill'>"
-             # hidden k：拉闸是应急动作，不允许因 cookie 被禁/30 天过期而 401
-             # （同卡的 renew/clear 都带 k，这里补齐同一种风格——审查 m1）。
-             f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
+             # hidden k：只在「凭据靠 URL」时渲染；Cookie/Bearer 会话不带（token 不进 HTML）
+             f"{_hidden_k(_token_of(deps))}"
              f"<button class='{'red' if not kill else 'gray'}' type='submit' name='on' value='1'>"
              "触发（暂停开仓）</button>"
              f"<button class='{'gray' if kill else 'red'}' type='submit' name='on' value='0'>"
@@ -1759,7 +1761,7 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
              + (f" · {_esc(mr_bits)}" if mr_bits else "")
              + "&nbsp;｜ PF_QQQXUSD · 名义 = 权益×0.5 · 只挡新入场</div>")
     o.append("<form method='post' action='/admin/hl/mr'>"
-             f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
+             f"{_hidden_k(_token_of(deps))}"
              f"<button class='{'red' if not mr_on else 'gray'}' type='submit' name='on' value='1'>"
              "启用 MR 腿</button>"
              f"<button class='{'gray' if mr_on else 'red'}' type='submit' name='on' value='0'>"
@@ -1812,12 +1814,67 @@ def _mr_switch(deps: AdminDeps) -> tuple:
     return on, " · ".join(bits)
 
 
+def _with_k(url: str, k: str) -> str:
+    """给 URL 追加 ``k`` 参数；k 为空就**整段省略**（Cookie/Bearer 会话不需要它）。"""
+    token = str(k or "")
+    if not token:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}k={quote(token, safe='')}"
+
+
+def _strip_k(url: str) -> str:
+    """摘掉 URL 查询串里的 ``k`` 参数。
+
+    用于转发客户端给的 ``back``：即使旧书签/旧链接里带着 token，也不许它经这条
+    302 再回显到 Location（浏览器历史 / 反代日志都会留档）。
+    """
+    path, sep, query = str(url or "").partition("?")
+    if not sep:
+        return path
+    keep = [p for p in query.split("&") if p and not p.startswith("k=")]
+    return f"{path}?{'&'.join(keep)}" if keep else path
+
+
+def _hidden_k(token: str) -> str:
+    """表单里的 k 隐藏域：token 为空就**整个不渲染**（Cookie/Bearer 会话不需要它）。"""
+    t = str(token or "")
+    return f"<input type='hidden' name='k' value='{_esc(t)}'>" if t else ""
+
+
+def _links_k(request: Request, token: str) -> str:
+    """HTML/跳转里要不要带 k：**永远不带**。
+
+    P1-C 收口：任何已通过鉴权的管理/面板 HTML（包括只用 ``?k=`` 的第一跳）都不许
+    出现 ADMIN_TOKEN 真值 —— 一旦落进 HTML，它就会进浏览器历史、截图、粘贴板与
+    任何共享链接。凭据改由 Cookie 承担：第一跳由 ``_session_cookie`` 种下
+    ``cma_admin``（HttpOnly），后续页内链接只带路径与业务参数。
+
+    代价（已与用户确认）：**不支持 Cookie 的客户端**（纯 curl 且不存 cookie jar）
+    只能自己每次手带 ``?k=`` 或 Authorization 头，页内链接不再替他携带密钥。
+    直连 query 访问本身仍然可用（``/admin?k=…`` 照常 200）。
+
+    保留 request/token 形参只为调用点稳定（旧签名被测试与调用方引用）。
+    """
+    return ""
+
+
+def _session_cookie(resp: Any, request: Request, token: str, k: Optional[str] = None) -> Any:
+    """凭据来自 URL（?k= / 表单 k）时，把会话写成 HttpOnly Cookie 再返回响应。
+
+    页内链接与 Location 都不再带 k，浏览器只能靠这个 Cookie 继续访问；不种的话
+    「第一跳之后全 401」。Bearer 会话与已有 Cookie 会话不需要重种。
+    """
+    return authn.set_session_cookie(resp, request, token, k or None)
+
+
 def _token_of(deps: AdminDeps) -> str:
-    """当前面板 token（给卡片里的表单当隐藏字段）。取不到就用空串（Cookie 也能鉴权）。"""
-    try:
-        return str(_call(deps.token_fn, "") or "")
-    except Exception:                                             # noqa: BLE001
-        return ""
+    """页面里给表单用的 k：**永远空串**（token 不进 HTML）。
+
+    P1-C 收口后隐藏域与链接都不带真值；表单提交靠 Cookie 鉴权（第一跳已种）。
+    保留函数是为了不改四个调用点（``_all_link``/卡片表单都按「k 可空」写成）。
+    """
+    return ""
 
 
 def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
@@ -1843,7 +1900,9 @@ def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
 
 
 def _back(token: str, tab: str, msg: str = "已保存") -> str:
-    q = [f"tab={tab}", f"k={quote(str(token or ''))}"]
+    q = [f"tab={tab}"]
+    if str(token or ""):
+        q.append(f"k={quote(str(token))}")
     if msg:
         q.append(quote(msg, safe=""))
         q[-1] = "msg=" + q[-1]
@@ -1854,9 +1913,8 @@ def _auth(deps: AdminDeps, request: Request, k: Optional[str]) -> str:
     token = str(_call(deps.token_fn, "") or "")
     if not token:
         raise HTTPException(500, "ADMIN_TOKEN 未配置")
-    supplied = k or request.query_params.get("k") or request.cookies.get("cma_admin")
-    if supplied != token:
-        raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
+    if not authn.is_admin(request, token, k):
+        raise HTTPException(401, _AUTH_HINT)
     return token
 
 
@@ -1869,6 +1927,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
     def admin_panel(request: Request, tab: str = "overview",
                     k: Optional[str] = None, msg: str = ""):
         token = _auth(deps, request, k or None)
+        # P1-C：HTML 里不带 k（含只用 ?k= 的第一跳）——凭据改由这一跳种下的 Cookie 承担。
+        link_k = _links_k(request, token)
         if tab not in _TAB_KEYS:
             tab = "overview"
         cfg = _call(deps.config_fn)
@@ -1877,10 +1937,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                                 or request.cookies.get(ROWS_COOKIE))
         payload = get_payload(deps)
         # 盈亏曲线时间窗（P1）：总览复用 views._render_body，它从 payload 读
-        # curve_span / admin_k —— 不在这里注入的话 span 参数被静默忽略（恒 7 天）、
-        # 切换链接缺 k（无 cookie 深链 401，PR #54 同款）。
+        # curve_span / admin_k —— 不在这里注入的话 span 参数被静默忽略（恒 7 天）。
         payload["curve_span"] = normalize_span(request.query_params.get("span"))
-        payload["admin_k"] = str(k or "")
+        payload["admin_k"] = link_k          # 恒 ""（上面的 _links_k）
         # 注：payload["rows"] 已删除（2026-10-18）—— 总览不再有长表切片，唯一消费者
         # views._render_body 的两张表搬到了记录页，记录页直接用 rows_n 走 DB 取数。
         strip = _status_strip(payload)
@@ -1890,17 +1949,13 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             body = _overview_body(deps, payload, cfg)
         else:
             body = render_records(deps, rows_n, payload.get("signals"))
-        resp = _page(token, tab, strip, body, msg,
+        resp = _page(link_k, tab, strip, body, msg,
                      theme=normalize_theme(request.cookies.get(THEME_COOKIE)),
                      rows_n=rows_n)
         # Cookie 必须设在返回的 response 上：Starlette 在函数返回新 Response 时会丢弃
         # 注入的 response 上写的头（所以这里不能用依赖注入的 response）。
-        if k:
-            https_ = request.url.scheme == "https" or \
-                str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
-            resp.set_cookie("cma_admin", token, httponly=True, max_age=30 * 86400,
-                            secure=https_, samesite="lax")
-        return resp
+        # 只在「凭据来自 URL」时种 —— 页内链接已不带 k，这一跳是 Cookie 的唯一来源。
+        return _session_cookie(resp, request, token, k)
 
     # ---------------- kill switch（页尾「管理」卡，2026-10-30 从开关页迁来） ----------------
     # 迁移**只动位置与 redirect 目标**（tab=switch → tab=overview）：字段（on=1/0）、
@@ -1908,6 +1963,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
     @router.post("/admin/switch/kill")
     def admin_switch_kill(request: Request, on: str = Form("0"), k: str = Form("")):
         token = _auth(deps, request, k or None)
+        link_k = _links_k(request, token)
         want = str(on or "") in ("1", "true", "on")
         if deps.hl_set_kill is not None:
             # 【v2·高2】解除**回撤熔断**时必须同时把回撤基线重置掉：
@@ -1924,14 +1980,16 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                 deps.log_event("kill", f"解除回撤熔断（origin=dd）→ {'重置基线成功' if ok else '重置基线失败'}：{msg}")
             _manual_kill(deps, want, "人工" if want else "")
             deps.log_event("kill", f"面板{'触发' if want else '解除'} kill switch")
-            return RedirectResponse(
-                _back(token, "overview", (f"已解除 kill switch{note}" if not want
-                                          else "已触发 kill switch")),
-                status_code=303)
+            return _session_cookie(
+                RedirectResponse(
+                    _back(link_k, "overview", (f"已解除 kill switch{note}" if not want
+                                               else "已触发 kill switch")),
+                    status_code=303), request, token, k)
         # 没有真实动作就不记「已触发」事件 —— 事件与事实必须一致
         deps.log_event("kill", f"面板请求{'触发' if want else '解除'} kill switch，"
                                "但执行器未接线（无动作）")
-        return RedirectResponse(_back(token, "overview"), status_code=303)
+        return _session_cookie(RedirectResponse(_back(link_k, "overview"), status_code=303),
+                               request, token, k)
 
     # ---------------- 清除手工兜底有效期（M3 的显式入口） ----------------
     @router.post("/admin/hl/agent/fallback/clear")
@@ -1944,12 +2002,14 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         （docs/HL_RUNBOOK.md）。
         """
         token = _auth(deps, request, k or None)
+        link_k = _links_k(request, token)
         err = deps.put("hl_agent_valid_until_ms", "")
         if err:
             raise HTTPException(400, f"清除失败：{err}")
         deps.log_event("decision", "面板清除手工兜底有效期（hl_agent_valid_until_ms）")
-        return RedirectResponse(_back(token, "overview", "已清除手工兜底有效期"),
-                                status_code=303)
+        return _session_cookie(
+            RedirectResponse(_back(link_k, "overview", "已清除手工兜底有效期"),
+                             status_code=303), request, token, k)
 
     # ---------------- 更新 API（到期续期后热切换私钥） ----------------
     @router.post("/admin/hl/agent/renew")
@@ -1962,6 +2022,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         请求 fail-closed 暴露（签名错 = 全部私有读数报错并停手，不会错单）。
         """
         token = _auth(deps, request, k or None)
+        link_k = _links_k(request, token)
         if deps.renew_fn is None:
             raise HTTPException(400, "更新 API 未接线（执行器模块未装配），本次没有保存任何东西")
         try:
@@ -1973,7 +2034,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         ok, msg = (res if isinstance(res, (tuple, list)) and len(res) >= 2 else (False, str(res)))
         if not ok:
             raise HTTPException(400, str(msg))
-        return RedirectResponse(_back(token, "overview", str(msg)), status_code=303)
+        return _session_cookie(
+            RedirectResponse(_back(link_k, "overview", str(msg)), status_code=303),
+            request, token, k)
 
     # ---------------- 主题切换（零 JS：设 cookie 后跳回） ----------------
     @router.get("/admin/theme")
@@ -1985,11 +2048,12 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         token = _auth(deps, request, k or None)
         https_ = request.url.scheme == "https" or \
             str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
-        resp = RedirectResponse(f"/admin?tab={tab}&k={quote(str(token))}", status_code=302)
+        resp = RedirectResponse(_with_k(f"/admin?tab={tab}", _links_k(request, token)),
+                                status_code=302)
         # max_age=0 删除；auto 也写死成 cookie（显式「跟随系统」选择）
         resp.set_cookie(THEME_COOKIE, theme, max_age=365 * 86400,
                         secure=https_, samesite="lax")
-        return resp
+        return _session_cookie(resp, request, token, k)
 
     # ---------------- 每页行数切换（零 JS：设 cookie 后跳回） ----------------
     @router.get("/admin/rows")
@@ -2000,10 +2064,11 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         token = _auth(deps, request, k or None)
         https_ = request.url.scheme == "https" or \
             str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
-        resp = RedirectResponse(f"/admin?tab={tab}&k={quote(str(token))}", status_code=302)
+        resp = RedirectResponse(_with_k(f"/admin?tab={tab}", _links_k(request, token)),
+                                status_code=302)
         resp.set_cookie(ROWS_COOKIE, str(rows_n), max_age=365 * 86400,
                         secure=https_, samesite="lax")
-        return resp
+        return _session_cookie(resp, request, token, k)
 
     # ---------------- 列表子页：行数切换（切完回本子页带原筛选参数） ----------------
     # 必须声明在 /admin/list/{slug} **之前**：否则 "rows" 会被当成 slug 吃掉。
@@ -2011,20 +2076,19 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
     def admin_list_rows(request: Request, n: str = str(DEFAULT_ROWS), back: str = "",
                         k: Optional[str] = None):
         token = _auth(deps, request, k or None)
+        link_k = _links_k(request, token)
         rows_n = normalize_rows(n)
-        # back 只接受本面板的子页路径（防开放跳转）；没有/不像 → 回记录页
-        target = back if back.startswith("/admin/list/") else \
-            f"/admin?tab=records&k={quote(str(token))}"
-        # 深链（无 cookie 只带 k）也要能活过这条 302：请求带 k 而 back 里没有时补上，
-        # 否则跳回去就 401（子页路由不像 /admin/rows 那样顺手写 cma_admin cookie）。
-        if k and "k=" not in target:
-            target += ("&" if "?" in target else "?") + f"k={quote(str(token))}"
+        # back 只接受本面板的子页路径（防开放跳转）；没有/不像 → 回记录页。
+        # 深链（无 cookie 只带 k）靠这条 302 顺手种 cma_admin Cookie 活过跳转
+        # —— 链接里已经不带 k 了，Cookie 是唯一的会话载体。
+        target = _strip_k(back) if back.startswith("/admin/list/") else \
+            _with_k("/admin?tab=records", link_k)
         https_ = request.url.scheme == "https" or \
             str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
         resp = RedirectResponse(target, status_code=302)
         resp.set_cookie(ROWS_COOKIE, str(rows_n), max_age=365 * 86400,
                         secure=https_, samesite="lax")
-        return resp
+        return _session_cookie(resp, request, token, k)
 
     # ---------------- 列表子页（记录页每块「全部 ›」的落点） ----------------
     @router.get("/admin/list/{slug}", response_class=HTMLResponse)
@@ -2035,10 +2099,12 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         # ?n= 优先（行数切换链接会用），否则读 cookie，与主记录页同一口径
         rows_n = normalize_rows(request.query_params.get("n")
                                 or request.cookies.get(ROWS_COOKIE))
+        link_k = _links_k(request, token)
         body = render_list_subpage(deps, slug, rows_n, request.query_params)
-        return _subpage_page(token, slug, body,
+        resp = _subpage_page(link_k, slug, body,
                              theme=normalize_theme(request.cookies.get(THEME_COOKIE)),
                              rows_n=rows_n)
+        return _session_cookie(resp, request, token, k)
 
     # ---------------- 列表子页：CSV 导出（同筛选全量流式） ----------------
     @router.get("/admin/export")
@@ -2060,23 +2126,32 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                                              parsed["tf"], parsed["tt"]),
                                  media_type="text/csv; charset=utf-8", headers=headers)
 
-    # ---------------- 旧地址兼容（302 到新位置，保持 ?k= 透传） ----------------
+    # ---------------- 旧地址兼容（302 到新位置；k 一律不再透传，改种 Cookie） ----------------
     @router.get("/hl", response_class=HTMLResponse)
     def hl_redirect(request: Request, k: Optional[str] = None, refresh: int = 0):
-        return RedirectResponse(f"/admin?tab=overview&k={quote(str(k or ''))}",
+        """旧入口：跳到合并面板总览。
+
+        以前把 ``k`` 原样拼进 Location —— 那会把 token 写进浏览器历史、反代日志与
+        转发给别人的链接。现在只在 k 有效时种会话 Cookie，Location 保持干净。
+        """
+        token = str(_call(deps.token_fn, "") or "")
+        resp = RedirectResponse(_with_k("/admin?tab=overview", _links_k(request, token)),
                                 status_code=302)
+        return _session_cookie(resp, request, token, k)
 
     @router.get("/admin/rules", response_class=HTMLResponse)
     def rules_redirect(request: Request, k: Optional[str] = None):
         # 旧参数页书签：参数页已删（2026-10-30），落到总览。
-        _auth(deps, request, k or None)
-        return RedirectResponse(f"/admin?tab=overview&k={quote(str(k or ''))}",
+        token = _auth(deps, request, k or None)
+        resp = RedirectResponse(_with_k("/admin?tab=overview", _links_k(request, token)),
                                 status_code=302)
+        return _session_cookie(resp, request, token, k)
 
     @router.get("/admin/logs", response_class=HTMLResponse)
     def logs_redirect(request: Request, k: Optional[str] = None):
-        _auth(deps, request, k or None)
-        return RedirectResponse(f"/admin?tab=records&k={quote(str(k or ''))}",
+        token = _auth(deps, request, k or None)
+        resp = RedirectResponse(_with_k("/admin?tab=records", _links_k(request, token)),
                                 status_code=302)
+        return _session_cookie(resp, request, token, k)
 
     return router
