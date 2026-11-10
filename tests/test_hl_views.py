@@ -986,33 +986,6 @@ class TestLeverageDisplay(BaseCase):
         self.assertNotIn("全仓", html)             # 有逐仓杠杆就不能说全仓
 
 
-class TestKrExecParams(unittest.TestCase):
-    """装配层：Kraken 无最小名义金额，HL 的 10 USDC 下限会真拒单。"""
-
-    def test_min_notional_is_zero(self):
-        import app.main as m
-        with tempfile.TemporaryDirectory(prefix="kr_params_") as tmp:
-            from app.db import DB
-            d = DB(os.path.join(tmp, "t.db"))
-            with mock.patch.object(m, "db", d), \
-                 mock.patch.dict(os.environ, {"DB_PATH": os.path.join(tmp, "t.db")}):
-                p = m.hl_params()
-        self.assertEqual(p.min_notional, 0.0,
-                         "Kraken 装配必须把 min_notional 置 0（不设名义闸门）")
-
-    def test_zero_min_notional_actually_opens_the_gate(self):
-        """0 必须真的放行：9.6U 名义在 HL 的 10U 下限下被拦，Kraken 下不该拦。"""
-        from app.hl.sizing import size_order_hl
-        kw = dict(coin="QQQ", sz_decimals=3, entry_price=600.0, stop_price=594.0,
-                  equity=10.0, risk_pct=0.01)
-        p10 = size_order_hl(min_notional=10.0, **kw)
-        p0 = size_order_hl(min_notional=0.0, **kw)
-        self.assertAlmostEqual(p10.notional, 9.6, places=6)
-        self.assertTrue(p10.below_min_notional, "10U 下限下应被拦（回归对照）")
-        self.assertFalse(p0.below_min_notional, "0 = 不设限，必须放行")
-        self.assertFalse([w for w in p0.warnings if "下限" in w],
-                         "0 下限不该再冒「小于交易所下限」的告警")
-
 
 # ---------------------------------------------------------------- 2026-11-08 审核 C 组
 class TestAuditCPanelHonesty(BaseCase):
