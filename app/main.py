@@ -1014,6 +1014,37 @@ def _admin_deps():
     )
 
 
+def _refresh_chg_24h(rows: list) -> None:
+    """把快照 why 行里的 `chg_24h` 现算覆盖（**只读 K 线缓存，零网络**）。
+
+    只有这一个字段需要滚动：六步结论/触发线随「4h bar 收盘」才变，跟着快照冻住是对的；
+    24h 涨跌幅是滚动窗口，冻住就变成「几小时前的涨跌幅」，而升级前写入的旧快照压根没有
+    这个字段（胶囊永不显示）。见 `why.chg_24h_for_symbol`。
+
+    取不到（缓存未热/根数不足）→ 保留快照里的原值；原本没有这个键就**不加键**
+    （why 行结构保持原样，面板读 _opt_num(None) 一样不渲染，绝不编数字）。
+    """
+    if not rows:
+        return
+    try:
+        from app import why as why_mod
+    except Exception as e:                                          # noqa: BLE001
+        logger.debug("/why 无法导入 why 模块（涨跌幅沿用快照）：%s", e)
+        return
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            fresh = why_mod.chg_24h_for_symbol(r.get("symbol") or "")
+        except Exception as e:                                     # noqa: BLE001
+            logger.debug("/why 现算 24h 涨跌幅失败（沿用快照）：%s", e)
+            fresh = None
+        # 取到新值才覆盖；取不到时保留快照原值，且**不凭空加空键**（老快照没有
+        # chg_24h 时 why 行结构应保持原样，面板读 _opt_num(None) 一样不渲染）。
+        if fresh is not None:
+            r["chg_24h"] = fresh
+
+
 def _why_rows(live: bool = False) -> list:
     """面板「为什么没开仓」的数据源（只读；异常一律退回空列表，别弄挂总览）。
 
@@ -1030,7 +1061,10 @@ def _why_rows(live: bool = False) -> list:
             info = panel_snapshot_info()
             row = info.stored_row()                   # 同一套「过期就不用」的判据
             if row is not None and row.get("why"):
-                return copy.deepcopy(row["why"])
+                rows = copy.deepcopy(row["why"])
+                # 快照 why 只在 tick 时重写；滚动量（24h 涨跌幅）渲染前现算覆盖。
+                _refresh_chg_24h(rows)
+                return rows
         except Exception as e:                                  # noqa: BLE001
             logger.warning("/why 快照读取失败（改现取）：%s", e)
     try:
@@ -1118,7 +1152,7 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
     【v2·高2】解除**回撤熔断**（origin=='dd'）时，必须在本请求内把回撤基线（peak_index）
     重置为当前 index：否则下一轮 DD 仍是 31% → 立刻又置 kill，「人工解」形同虚设。
     这条 curl 入口与面板 `/admin/switch/kill` 同一口径（runbook 用的是这条；
-    面板上的按钮在总览页尾「管理」卡）。
+    面板上的按钮在「设置」页「管理」卡）。
     """
     _require_admin(request, k or None)
     want = on in ("1", "true", "on")
@@ -1150,5 +1184,6 @@ def admin_hl_mr(request: Request, on: str = Form("0"), k: str = Form("")):
     want = on in ("1", "true", "on")
     db.set_config("mr_enabled", "1" if want else "0")
     db.hl_log_event("mr_admin", f"MR 腿人工{'启用' if want else '停用'}")
-    resp = RedirectResponse(_admin_url("overview", _k_out(request, k)), status_code=303)
+    # 面板 MR 开关现在在「设置」页「管理」卡 → 提交后回设置页，别跳回总览。
+    resp = RedirectResponse(_admin_url("settings", _k_out(request, k)), status_code=303)
     return authn.set_session_cookie(resp, request, config.admin_token, k or None)

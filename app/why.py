@@ -158,6 +158,31 @@ def _chg_24h(bars: Sequence[strategy.Bar]) -> Optional[float]:
     return (last - prev) / prev * 100.0
 
 
+def chg_24h_for_symbol(symbol: str) -> Optional[float]:
+    """某标的的 24h 涨跌幅（%，现价 vs 24h 前那根 4h 收盘），**只读 K 线缓存、零网络**。
+
+    为什么需要它：面板的 why 行来自 `panel_snapshots.why_json`（tick 时由 build_rows 写入），
+    渲染时不再重算六步 —— 但 24h 涨跌幅是**滚动**窗口，跟着快照一起冻住就会显示几小时前的
+    数字（升级前的旧快照甚至根本没有这个字段，胶囊永远不出现）。这个函数用本进程里现成的
+    `_FEED_CACHE`（TTL 900s，tick 每 30 分钟续一次）重算一遍，不触发任何交易所请求。
+
+    缺缓存 / 根数不足 / 解析失败 → None（面板宁可不显示胶囊，也不编一个数）。
+    纯展示字段：不参与任何判定，也不改 build_rows 的六步逻辑。
+    """
+    hit = _FEED_CACHE.get(str(symbol or ""))
+    if not hit:
+        return None
+    try:
+        # 与 _fetch_bars 同源判 TTL：缓存过期时宁可不显示，也别拿旧 bar 算出一个
+        # 与大字现价（快照 mids）不同步的涨跌幅。
+        if time.time() - hit[0] >= FEED_TTL_S:
+            return None
+        bars = hit[1]
+    except (TypeError, IndexError):
+        return None
+    return _chg_24h(bars)
+
+
 def why_row(db: Any, cfg: Any, symbol: str, bars: Sequence[strategy.Bar]) -> Dict[str, Any]:
     """单个标的的诊断行（纯计算 + 只读 DB 查询；行情由调用方给，便于测试与复用）。
 

@@ -112,8 +112,12 @@ class BaseCase(unittest.TestCase):
 
     @staticmethod
     def account_seg(html: str) -> str:
-        """账户卡片段（顶层/次级/重复词断言只看这块，避免命中仓位表同名列）。"""
-        return html.split("<div class='sec'>账户</div>", 1)[1].split("<h2>盈亏曲线", 1)[0]
+        """账户卡片段（顶层/次级/重复词断言只看这块，避免命中仓位表同名列）。
+
+        P1-2 起账户卡提到状态条之后、仓位之前 → 段末切在「仓位」标题（不再是盈亏曲线，
+        否则仓位表/三标的动态会被算进这段）。
+        """
+        return html.split("<div class='sec'>账户</div>", 1)[1].split("<h2>仓位</h2>", 1)[0]
 
     @staticmethod
     def pos_seg(html: str) -> str:

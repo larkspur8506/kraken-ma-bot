@@ -1,14 +1,16 @@
 """管理面板：单一入口 ``/admin?k=<ADMIN_TOKEN>&tab=<tab>``。
 
-两个 Tab（链接切换，服务端渲染，**无 CDN / 无框架 / 无外部资源**，手机弱网可开；
+三个 Tab（链接切换，服务端渲染，**无 CDN / 无框架 / 无外部资源**，手机弱网可开；
 页面**零 JS**）：
 
 - ``overview`` 总览 —— 直接复用 :func:`app.hl.views._render_body`（不重写仓位/盈亏曲线区块）；
-  末尾接「API 有效期」状态卡（地址/到期日/剩余/状态 + 到期前自动清仓开关状态）
-  与「管理」卡（页尾唯一的写入口，见下）
+  只放「当下」信息，不再挂任何运维/写操作卡
 - ``records``  记录 —— 资金流水 / hl_orders / hl_fills / signals / alert_logs / hl_events
   （「信号」2026-10-18 从总览迁入，复用 hl/views._signals_html；P4 删了页顶锚点导航
   行与六个区块容器的 id —— 手机上用不到，跳转靠滚动）
+- ``settings`` 设置 —— 「API 有效期」状态卡（地址/到期日/剩余/状态 + 到期前自动清仓开关状态）
+  与「管理」卡（面板唯一写入口，见下）。2026-11-10（P1-3）从总览页尾整体搬来，
+  两卡内容/字段/form action 一字未改，只是换了页面
 
 2026-10-30 面板精简（feat/panel-slim）：**只移除「可变性」，不改变任何生效行为值**。
 参数页与开关页整体删除（连同它们的 POST 端点）——改参数/开关不再有任何面板写路径，
@@ -117,11 +119,14 @@ def rows_switch_html(tab: str, current: int, k: str = "") -> str:
             + "<span class='muted'>&nbsp;（历史类长表；不影响图表）</span></div>")
 
 
-# 2026-10-30（feat/panel-slim）：只剩两个页签。参数/开关两页连同它们的 POST 端点整体
-# 删除 —— 面板不再提供改参数、改开关、切模式、重置峰值的入口（改这些走 DB 直改）。
+# 2026-10-30（feat/panel-slim）：参数/开关两页连同它们的 POST 端点整体删除 —— 面板不再
+# 提供改参数、改开关、切模式、重置峰值的入口（改这些走 DB 直改）。
+# 2026-11-10（P1-3）：三个仅存的写操作（拉闸 / MR 开关 / 更新 API）连同「API 有效期」状态卡
+# 从总览页尾搬到二级页 tab=settings（「设置」），总览只留当下行情与仓位。
 TABS: Tuple[Tuple[str, str], ...] = (
     ("overview", "总览"),
     ("records", "记录"),
+    ("settings", "设置"),
 )
 _TAB_KEYS = tuple(k for k, _ in TABS)
 _MODE_TXT = {"off": "只通知", "dry": "影子", "live": "实盘"}
@@ -1489,13 +1494,10 @@ def _overview_body(deps: AdminDeps, payload: dict, cfg: Any = None) -> str:
     _render_body 自带 <h1> 和它自己的状态条，而本面板顶部已有标题 + 状态条，
     所以把这两块剥掉，避免同一屏出现两个 <h1>、两条状态条。
 
-    「API 有效期」状态卡接在整个总览的**最后**（在「系统」卡之后）：它是低频查看的
-    运维信息，用户日常看的是三标的动态/账户/仓位；同时它不插进「三标的动态」与账户卡
-    之间（那个位置由需求钉死给三标的动态）。卡片自己兜底，渲染失败不弄挂总览。
-
-    「管理」卡（2026-10-30）接在「API 有效期」之后：面板仅存的三个写操作（拉闸 /
-    更新 API / 清除兜底）全在这里，页面最底部是为了不让人日常滑屏顺手碰到；同样
-    fail-soft（任何异常都不弄挂总览）。
+    2026-11-10（P1-3）：**总览不再挂任何运维卡**。「API 有效期」状态卡与「管理」卡
+    （拉闸 / MR 开关 / 更新 API）搬到了二级页 tab=settings，见 :func:`_settings_body`；
+    总览只回答「现在什么行情、我有什么仓」。``cfg`` 形参保留，仅为调用点/测试签名稳定
+    （本函数不再用它）。
 
     「为什么没开仓」（/why）已经并进 views._render_body 的「三标的动态」板块（原因行 /
     闸门异常行），数据源是这里现算并注入 payload["why"] —— 见 PR-5：面板不重算判定，
@@ -1510,17 +1512,29 @@ def _overview_body(deps: AdminDeps, payload: dict, cfg: Any = None) -> str:
     body = re.sub(r"<h1>.*?</h1>\s*(?:<div class='h1sub'>.*?</div>\s*)?", "", body,
                   count=1, flags=re.S)
     body = re.sub(r"<div class='bar'>.*?</div>\s*", "", body, count=1, flags=re.S)
-    try:
-        body += render_agent_card(deps)
-    except Exception as e:                                        # noqa: BLE001
-        logger.warning("[admin] API 有效期卡片渲染失败：%s", e)
+    return body
+
+
+def _settings_body(deps: AdminDeps, cfg: Any = None) -> str:
+    """设置页（``GET /admin?tab=settings``）：运维卡集中地，2026-11-10 从总览页尾搬来。
+
+    页面 = 顶部状态条 + tabs（由 :func:`_page` 统一组装，这里只出正文）+
+    「API 有效期」状态卡 + 「管理」卡。两张卡**原样复用**（``render_agent_card`` /
+    ``render_admin_card``），内容、字段、form action 一字未动 —— 本轮只改它们出现在哪个
+    页面。每张卡各自 fail-soft：一张渲染失败不影响另一张，也不会 500。
+    """
     if cfg is None:
         cfg = _call(deps.config_fn)
+    o: List[str] = []
     try:
-        body += render_admin_card(deps, cfg)
+        o.append(render_agent_card(deps))
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[admin] API 有效期卡片渲染失败：%s", e)
+    try:
+        o.append(render_admin_card(deps, cfg))
     except Exception as e:                                        # noqa: BLE001
         logger.warning("[admin] 管理卡渲染失败：%s", e)
-    return body
+    return "".join(o)
 
 
 def _why_rows_for(deps: AdminDeps) -> List[Dict[str, Any]]:
@@ -1554,13 +1568,13 @@ def _agent_source_txt(src: str) -> str:
 
 
 def render_agent_card(deps: AdminDeps) -> str:
-    """「API 有效期」状态卡（总览末尾）：地址（截断）/到期日/剩余天数/状态词/自动清仓开关。
+    """「API 有效期」状态卡（设置页 tab=settings）：地址（截断）/到期日/剩余天数/状态词/自动清仓开关。
 
     数据只来自 ``hl_agent_state``（DB 缓存）—— 渲染**零网络调用**，面板在交易所接口
     全挂时也能打开。state 缺失/损坏时显示「未知」并给出「下一个整点会刷新」的说明。
 
-    **只渲染状态，不渲染写操作**：「更新 API（续期）」表单在「参数」页，见
-    :func:`render_agent_renew_block`。
+    **只渲染状态，不渲染写操作**：「更新 API（续期）」表单在「管理」卡里，
+    见 :func:`render_agent_renew_block`。
     """
     from app.hl import agent as agent_mod
     state = {}
@@ -1661,7 +1675,7 @@ def render_agent_card(deps: AdminDeps) -> str:
                  "Kraken API key 在「更新 API」卡维护，无到期概念。</div>")
     elif src == "manual":
         o.append("<div class='hint'>有效期来自 DB 里的手工兜底值（交易所侧授权接口没查到同名 Hermes）；"
-                 "可在总览「管理」卡里清除。</div>")
+                 "可在「设置」页「管理」卡里清除。</div>")
     o.append("<div class='legend'>到期后执行器不能再开仓、平仓、撤单；到期前系统会按剩余天数提醒"
              f"（≤{agent_mod.THRESH_CLEANUP} 天且有仓位时自动清仓；agent_expiry_cleanup 沿用 DB 里的 "
              "值，面板不再提供切换入口）。</div>")
@@ -1670,7 +1684,7 @@ def render_agent_card(deps: AdminDeps) -> str:
 
 
 def render_agent_renew_block(deps: AdminDeps) -> str:
-    """「更新 API（续期）」折叠表单（总览「管理」卡里的一块，2026-10-30 迁入）。
+    """「更新 API（续期）」折叠表单（设置页「管理」卡里的一块，2026-10-30 迁入）。
 
     2026-10-19 从总览状态卡里**原样搬出**、2026-10-30 随参数页删除搬回总览的
     「管理」卡：动作、表单 action、字段、步骤文案一字未改，只是外层 ``card`` +
@@ -1700,7 +1714,10 @@ def render_agent_renew_block(deps: AdminDeps) -> str:
 
 
 def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
-    """总览页尾「管理」卡：面板**仅存**的三个写动作 + 只读状态（2026-10-30 精简后）。
+    """设置页「管理」卡：面板**仅存**的三个写动作 + 只读状态（2026-10-30 精简后）。
+
+    2026-11-10（P1-3）整卡从总览页尾搬到 tab=settings：内容、字段、form action、
+    三个 POST 路由与鉴权一字未改，只有所在页面与 POST 后的 redirect 目标变了。
 
     精简原则是「只移除可变性」：参数页/开关页删掉以后，页面里还能改东西的只剩这三条，
     而且每一条都是「钱/权限遇到事」时才用的应急动作，所以集中在页尾一张红框卡里，
@@ -1950,10 +1967,13 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         # 注：payload["rows"] 已删除（2026-10-18）—— 总览不再有长表切片，唯一消费者
         # views._render_body 的两张表搬到了记录页，记录页直接用 rows_n 走 DB 取数。
         strip = _status_strip(payload)
-        # 只剩两个页签：总览（含「管理」卡）/ 记录。旧书签里的 tab=params|switch 不认，
-        # 上面已回落成 overview —— 不 404（书签来自已发消息，落在总览最有用）。
+        # 三个页签：总览（当下行情/仓位）/ 记录 / 设置（管理卡 + API 有效期）。旧书签里的
+        # tab=params|switch 不认，上面已回落成 overview —— 不 404（书签来自已发消息，
+        # 落在总览最有用）。
         if tab == "overview":
             body = _overview_body(deps, payload, cfg)
+        elif tab == "settings":
+            body = _settings_body(deps, cfg)
         else:
             body = render_records(deps, rows_n, payload.get("signals"))
         resp = _page(link_k, tab, strip, body, msg,
@@ -1964,9 +1984,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         # 只在「凭据来自 URL」时种 —— 页内链接已不带 k，这一跳是 Cookie 的唯一来源。
         return _session_cookie(resp, request, token, k)
 
-    # ---------------- kill switch（页尾「管理」卡，2026-10-30 从开关页迁来） ----------------
-    # 迁移**只动位置与 redirect 目标**（tab=switch → tab=overview）：字段（on=1/0）、
-    # 路由、事件文案、DD 熔断解除时重置基线的那段逻辑全部原样保留。
+    # ---------------- kill switch（设置页「管理」卡，2026-10-30 从开关页迁来） ----------------
+    # 迁移**只动位置与 redirect 目标**（tab=switch → tab=overview → 2026-11-10 起 tab=settings）：
+    # 字段（on=1/0）、路由、事件文案、DD 熔断解除时重置基线的那段逻辑全部原样保留。
     @router.post("/admin/switch/kill")
     def admin_switch_kill(request: Request, on: str = Form("0"), k: str = Form("")):
         token = _auth(deps, request, k or None)
@@ -1989,13 +2009,13 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             deps.log_event("kill", f"面板{'触发' if want else '解除'} kill switch")
             return _session_cookie(
                 RedirectResponse(
-                    _back(link_k, "overview", (f"已解除 kill switch{note}" if not want
+                    _back(link_k, "settings", (f"已解除 kill switch{note}" if not want
                                                else "已触发 kill switch")),
                     status_code=303), request, token, k)
         # 没有真实动作就不记「已触发」事件 —— 事件与事实必须一致
         deps.log_event("kill", f"面板请求{'触发' if want else '解除'} kill switch，"
                                "但执行器未接线（无动作）")
-        return _session_cookie(RedirectResponse(_back(link_k, "overview"), status_code=303),
+        return _session_cookie(RedirectResponse(_back(link_k, "settings"), status_code=303),
                                request, token, k)
 
     # ---------------- 清除手工兜底有效期（M3 的显式入口） ----------------
@@ -2015,7 +2035,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             raise HTTPException(400, f"清除失败：{err}")
         deps.log_event("decision", "面板清除手工兜底有效期（hl_agent_valid_until_ms）")
         return _session_cookie(
-            RedirectResponse(_back(link_k, "overview", "已清除手工兜底有效期"),
+            RedirectResponse(_back(link_k, "settings", "已清除手工兜底有效期"),
                              status_code=303), request, token, k)
 
     # ---------------- 更新 API（到期续期后热切换私钥） ----------------
@@ -2042,7 +2062,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         if not ok:
             raise HTTPException(400, str(msg))
         return _session_cookie(
-            RedirectResponse(_back(link_k, "overview", str(msg)), status_code=303),
+            RedirectResponse(_back(link_k, "settings", str(msg)), status_code=303),
             request, token, k)
 
     # ---------------- 主题切换（零 JS：设 cookie 后跳回） ----------------
