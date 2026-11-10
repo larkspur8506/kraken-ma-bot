@@ -1,14 +1,14 @@
 """管理面板（app/admin_ui.py）的单元测试。
 
-验收点逐条对应（2026-10-30 面板精简后：只剩 overview / records 两个页签）：
+验收点逐条对应（2026-11-10 P1-3 起：overview / records / settings 三个页签）：
 - 未授权 401
-- 两个 Tab 各 200 且含关键区块串（账户权益 / 下单记录 …）
+- 三个 Tab 各 200 且含关键区块串（账户权益 / 下单记录 …）
 - 手机优先：无框架、无外部资源、零 JS、字号 ≥13px
 - 参数页/开关页及其 POST 端点已删除（一律 404/405，不设兼容层）
-- kill switch 往返（页面入口搬到总览页尾「管理」卡）
+- kill switch 往返（页面入口在「设置」页「管理」卡，2026-11-10 从总览页尾搬来）
 - 旧链接 /hl、/admin/rules → 总览；/admin/logs → 记录页
 - /api/hl/status 仍 200（合并没弄坏 JSON API）
-- info 只读接口全挂时两个页签仍 200
+- info 只读接口全挂时三个页签仍 200
 
 全部用临时 sqlite DB + 假 HlInfo，不触网。
 """
@@ -200,8 +200,9 @@ class TestOverviewTab(BaseCase):
         # 本 fixture 的快照没带 orders_trusted（挂单不可信）→ P3 R1 fail-open：
         # 判不清就照常渲染挂单表（正常态 0 处的两态断言在 tests/test_panel_p3.py）
         self.assertIn("交易所挂单", html)
-        # 2026-10-19：状态卡在总览末尾；P3 R3 降级为 <details>（默认收起）
-        self.assertIn("<summary>API 状态</summary>", html)
+        # 2026-10-19：状态卡曾在总览末尾；2026-11-10（P1-3）随「管理」卡搬到 tab=settings
+        self.assertNotIn("<summary>API 状态</summary>", html,
+                        "总览不再挂 API 有效期卡（已搬 settings）")
         # 2026-10-15 用户反馈：总览与「记录」页的执行器事件表完全重复 → 总览移除
         self.assertNotIn("执行器事件", html)
         # 2026-10-18 同一类操作：下单记录 / 最近成交 / 信号 三张历史表迁到「记录」页
@@ -216,7 +217,8 @@ class TestOverviewTab(BaseCase):
                      "<h2>盈亏曲线（已剔除出入金）</h2>"):
             self.assertIn(keep, html, f"总览缺少当下块：{keep}")
         # P3 R2：对账/熔断两行从「系统」（现「执行器」）卡删除 —— 状态条徽章是唯一出处
-        self.assertIn("<summary>API 状态</summary>", html)
+        self.assertNotIn("<summary>API 状态</summary>", html,
+                         "API 有效期卡在 settings 页，不在总览")
         # 三标的动态（用户钉死在 tabs 之后第一块）仍在
         self.assertIn("三标的动态", html)
 
@@ -231,14 +233,14 @@ class TestOverviewTab(BaseCase):
         self.assertNotIn("<h2>下单记录", html)
 
     def test_status_strip_is_always_present(self):
-        for tab in ("overview", "records"):
+        for tab in ("overview", "records", "settings"):
             html = self.body(tab=tab)
             for s in ("模式", "熔断", "对账", "Kraken 延迟", "更新"):
                 self.assertIn(s, html, f"{tab} 缺状态条：{s}")
 
     def test_tabs_switch_via_querystring(self):
         html = self.body(tab="overview")
-        for tab, label in (("overview", "总览"), ("records", "记录")):
+        for tab, label in (("overview", "总览"), ("records", "记录"), ("settings", "设置")):
             # P1-C：页内链接不再带 k（token 不进 HTML），会话靠 Cookie 延续
             self.assertIn(f"/admin?tab={tab}'", html)
             self.assertNotIn(f"/admin?tab={tab}&k=", html)
@@ -249,9 +251,24 @@ class TestOverviewTab(BaseCase):
         self.assertNotIn("tab=switch", html)
         self.assertIn("class='on'", html)
 
+    def test_settings_tab_renders(self):
+        """2026-11-10（P1-3）：设置页 200，且仍是同一套 tabs（不拼出两个）。"""
+        html = self.body(tab="settings")
+        self.assertEqual(html.count("<div class='tabs'>"), 1, "整页只能有一组 tabs")
+        self.assertEqual(html.count("<h1>"), 1)
+        self.assertIn("class='on' href='/admin?tab=settings'", html, "settings 页要高亮自己")
+        self.assertIn("<summary>API 状态</summary>", html, "API 有效期卡在设置页")
+        self.assertIn("<div class='sec'>管理</div>", html, "管理卡在设置页")
+        # 旧书签 tab=params|switch 仍回落总览（不 404、不落到设置页）
+        for old in ("params", "switch"):
+            fallback = self.body(tab=old)
+            self.assertIn("账户权益", fallback)
+            self.assertNotIn("<div class='sec'>管理</div>", fallback)
+
 
 class TestAdminCard(BaseCase):
-    """总览页尾「管理」卡：面板仅存的三个写动作（2026-10-30 参数/开关页删除后）。
+    """设置页「管理」卡：面板仅存的三个写动作（2026-10-30 参数/开关页删除后、
+    2026-11-10 P1-3 从总览页尾搬到 tab=settings）。
 
     被删的是**可变性**（改参数/改开关/切模式/重置峰值），kill 这条应急通道必须还在，
     且交互与原来开关页「应急操作」卡一致（字段 on=1/0、按钮文案、配色）。
@@ -262,19 +279,24 @@ class TestAdminCard(BaseCase):
         r1 = self.post("/admin/switch/kill", on="1")
         self.assertEqual(r1.status_code, 303)
         self.assertTrue(self.db.hl_kill())
-        self.assertIn("tab=overview", r1.headers["location"], "拉闸后回总览（开关页已删）")
+        self.assertIn("tab=settings", r1.headers["location"],
+                      "拉闸后回设置页（管理卡在那里）")
         r2 = self.post("/admin/switch/kill", on="0")
         self.assertEqual(r2.status_code, 303)
         self.assertFalse(self.db.hl_kill())
-        html = self.body(tab="overview")
+        html = self.body(tab="settings")
         self.assertIn("当前未触发", html)
         self.assertTrue(any(e["kind"] == "kill" for e in self.db.hl_recent_events(5)))
 
     def test_management_card_has_three_write_actions(self):
-        html = self.body(tab="overview")
+        html = self.body(tab="settings")
         self.assertIn("<div class='sec'>管理</div>", html)
         self.assertIn("action='/admin/switch/kill'", html)
         self.assertIn("action='/admin/hl/agent/renew'", html)
+        # 三个写表单只在设置页；总览一个都不许留（P1-3）
+        for act in ("/admin/switch/kill", "/admin/hl/mr", "/admin/hl/agent/renew"):
+            self.assertNotIn(f"action='{act}'", self.body(tab="overview"),
+                             f"总览不该再有写表单 {act}")
         # 执行模式只读徽章：有「实盘/影子/只通知」字样，但没有切换表单
         self.assertIn("模式", html)
         self.assertNotIn("name='mode'", html)
@@ -285,20 +307,20 @@ class TestAdminCard(BaseCase):
 
         兜底值哪怕残留在 DB 里也不再摆到手机上；清除 route 仍保留（幂等无害）。
         """
-        html = self.body(tab="overview")
+        html = self.body(tab="settings")
         self.assertNotIn("action='/admin/hl/agent/fallback/clear'", html)
         self.db.set_config("hl_agent_valid_until_ms", "1830000000000")
-        html = self.body(tab="overview")
+        html = self.body(tab="settings")
         self.assertNotIn("action='/admin/hl/agent/fallback/clear'", html)
         self.assertNotIn("清除兜底", html)
         # 卡片按 cfg 读这个键；apply_db 对空串是「不改动」语义（Config._CLEARABLE_STR 为空），
         # 而本夹具复用了同一个 Config 实例 → 换一个干净实例再验渲染条件（等价于进程重启）。
         self.cfg_cache["cfg"] = Config()
-        self.assertNotIn("action='/admin/hl/agent/fallback/clear'", self.body(tab="overview"))
+        self.assertNotIn("action='/admin/hl/agent/fallback/clear'", self.body(tab="settings"))
 
     def test_management_card_hides_hl_credentials(self):
         """Kraken 没有代理钱包地址/私钥，管理卡不再摆这两项空壳。"""
-        html = self.body(tab="overview")
+        html = self.body(tab="settings")
         self.assertNotIn("私钥：", html)
         self.assertNotIn("钱包地址：", html)
 
@@ -411,7 +433,7 @@ class TestMobileNoJs(BaseCase):
         —— 弱网/老浏览器/禁用 JS 都能用，也不再有「脚本没跑起来字段被 disabled
         导致表单静默提交失败」那一类回退问题。
         """
-        for tab in ("overview", "records"):
+        for tab in ("overview", "records", "settings"):
             html = self.body(tab=tab)
             self.assertNotIn("<script", html.lower(), f"{tab} 不该有 <script>")
             self.assertNotIn("javascript:", html.lower())
@@ -425,7 +447,7 @@ class TestMobileNoJs(BaseCase):
         同源链接，剩下的（http://、//cdn…、相对路径）任一条出现都算外部资源。
         """
         import re
-        for tab in ("overview", "records"):
+        for tab in ("overview", "records", "settings"):
             html = self.body(tab=tab).lower()
             for bad in (" src=", "<img", "cdn.", "<iframe"):
                 self.assertNotIn(bad, html, f"{tab} 含外部资源 {bad}")
@@ -594,7 +616,7 @@ class TestFullAppWiring(unittest.TestCase):
             r = c.get("/admin", params={"k": TOKEN})
             self.assertEqual(r.status_code, 200)
             self.assertIn("双均线交易台", r.text)
-            for tab in ("overview", "records"):
+            for tab in ("overview", "records", "settings"):
                 self.assertIn(f"tab={tab}", r.text)
             self.assertNotIn("tab=params", r.text)
 
@@ -659,8 +681,8 @@ class TestFullAppWiring(unittest.TestCase):
             self.assertAlmostEqual(mod.current_config().risk_pct, 0.03, places=6)
             self.assertFalse(mod.current_config().enable_shorts)
             self.assertEqual(mod.hl_mode(), "dry")
-            # 页面上「管理」卡照实反映生效模式（只读徽章）
-            r = c.get("/admin", params={"k": TOKEN})
+            # 页面上「管理」卡照实反映生效模式（只读徽章）—— 2026-11-10 起在设置页
+            r = c.get("/admin", params={"k": TOKEN, "tab": "settings"})
             self.assertEqual(r.status_code, 200)
             self.assertIn("影子", r.text)
 

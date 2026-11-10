@@ -390,8 +390,13 @@ class TestWiring(unittest.TestCase):
     def test_why_rows_prefers_snapshot(self):
         rows = [{"symbol": "ETH_USDT", "ok": True, "step": "from-snapshot"}]
         self.assertTrue(self._capture(why=rows))
-        with mock.patch("app.why.build_rows", side_effect=AssertionError("不该现算")):
+        # 24h 涨跌幅是渲染前用 K 线缓存现算覆盖的滚动量（P1 N1），与本用例的
+        # 「快照优先、不重算六步」是两件事：钉成 None 隔离缓存，让逐字相等仍成立，
+        # 同时断言这个新接线确实被走到（不是被静默跳过）。
+        with mock.patch("app.why.build_rows", side_effect=AssertionError("不该现算")), \
+             mock.patch("app.why.chg_24h_for_symbol", return_value=None) as chg_fn:
             self.assertEqual(self.mod._why_rows(), rows)
+            chg_fn.assert_called_once_with("ETH_USDT")
 
     def test_why_rows_recomputes_right_after_a_write(self):
         self.assertTrue(self._capture(why=[{"symbol": "OLD"}]))

@@ -1506,6 +1506,13 @@ h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
 .badge-small .muted{font-size:11px}
 .sec{font-size:11px;color:var(--muted);letter-spacing:1.5px;margin-bottom:8px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:2px 20px}
+/* 三标的横向对比（P1-1）：三张 .sym 卡在桌面端一行 3 列等宽。
+   为什么不直接改 .grid：执行器卡等其它块也用 .grid（auto-fit minmax(220px)），
+   在 1180 宽下会开 4 列 —— 3 张标的卡只填满 3 列、右侧留一个空槽，看起来就是
+   「竖排/muddled」。这里给三标的容器另挂 .sym-grid，只覆盖列数，display/gap 仍
+   沿用 .grid；minmax(0,1fr) 让长数字/长标的名可收缩，不在 390px 上撑出横向滚动。
+   .mrline（超跌腿 QQQ）的 grid-column:1/-1 因此横跨三列，语义不变。 */
+.sym-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
 .mrline{grid-column:1/-1;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line2);
         font-size:12px}
 .kv{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:4px 0;
@@ -1578,6 +1585,23 @@ a{color:var(--link)}
 details.acct-details>summary,details.card>summary{cursor:pointer;color:var(--muted);
    font-size:12.5px;letter-spacing:1px;padding:2px 0}
 details.card>summary{font-size:12px;color:var(--h2)}
+/* 账户横幅（P1-2）：账户卡从「仓位之后」提到状态条之后 —— 首屏先给钱、再看监控。
+   外层 **专属 class .acct-banner**（不复用 .grid / .sym-grid，那些是标的与执行器
+   区块的容器，改它们会连带另一块布局）；内层仍是 .acct-top（P2 的关键数 flex 行）。
+   这里只加位置/尺寸上的横幅外观：关键数一行铺开、窄屏自动换行，零 JS，
+   颜色全部取主题变量（亮/暗主题由 THEME_CSS 给值，本文件不写死色值）。 */
+.acct-banner{padding:10px 14px 6px}
+.acct-banner>.sec{margin-bottom:2px}
+.acct-banner .acct-top{gap:2px 30px;align-items:baseline;padding:0 0 6px}
+.acct-banner .acct-top b{font-size:20px}
+.acct-banner details.acct-details>summary{padding:4px 0 2px}
+/* 横幅窄屏（≤640px）：单独成块，不与下面那块公共窄屏规则混在一起 ——
+   横幅的尺寸只属于横幅，改横幅时不必动别的区块的 media query。
+   不加任何 nowrap / 固定宽度，靠 .acct-top 的 flex-wrap 自然折行，390px 不横向溢出。 */
+@media (max-width:640px){
+    .acct-banner{padding:9px 11px 5px}
+    .acct-banner .acct-top{gap:0 18px}
+    .acct-banner .acct-top b{font-size:17px}}
 /* 仓位表窄屏适配（P2）：小字行 tr.subm 默认隐藏（宽屏 13 列齐全）；≤640px 时
    隐藏 .hidem 列、显示小字行 —— 显隐只靠 CSS media query，零 JS。 */
 tr.subm{display:none}
@@ -1597,9 +1621,12 @@ tr.subm td{white-space:normal;font-size:11px;line-height:1.4;color:var(--muted);
 .trigger-item .coin{font-size:13px;font-weight:600}
 .trigger-label{font-size:11px;color:var(--muted)}
 .trigger-val{font-size:16px;font-weight:600;margin:4px 0;font-variant-numeric:tabular-nums}
-.trigger-price{font-size:11px}
+/* .trigger-price（引导卡内的「现价 XX」小字）随 N3 一起删除：现价统一由三标的
+   大字卡展示，同屏不再出现第二个现价。 */
 @media (max-width:640px){body{padding:9px;font-size:13px}h1{font-size:17px}
     .badge{padding:5px 10px;font-size:11px}.grid{grid-template-columns:1fr}
+    /* 三标的：窄屏降为 1 列（垂直堆叠），与卡片自身的窄屏字级规则配合。 */
+    .sym-grid{grid-template-columns:1fr}
     .bar-primary,.bar-secondary{gap:6px}
     .badge-small{padding:2px 8px}
     .hidem{display:none}tr.subm{display:table-row}
@@ -2042,7 +2069,8 @@ def _symbol_dynamics(p: dict) -> str:
     stamps = [t for t in (_opt_num(r.get("updated_at")) for r in rows) if t]
     when = _fmt_dt(max(stamps), "%H:%M") if stamps else "—"
     o = [f"<h2>三标的动态<span class=\"muted\">行情 {when} · 每 30 分钟随信号 tick 更新</span></h2>",
-         "<div class=\"card\"><div class=\"grid\">"]
+         # 桌面端 3 列横排（.sym-grid，见 DASH_CSS）；≤640px 由 media query 降为 1 列。
+         "<div class=\"card\"><div class=\"grid sym-grid\">"]
     for r in rows:
         o.append(_sym_card(r, feed_map, last_bar))
     # 超跌腿（QQQ）：与上面三个「均线腿」同卡、不同列（RSI2/离场线/距入场），
@@ -2415,6 +2443,10 @@ def _empty_positions_html(p: dict, reachable: bool) -> str:
 
     距离口径复用 ``_need_pct``（上破 = (线−现价)/现价、下破 = (现价−线)/现价），
     与「三标的动态」卡里的 ②③ 两行同一套算法，不做第二套算术。
+
+    现价（N2/N3）：距离里的现价取 ``_merged_cards`` 的同源值（与三标的大字卡同一个数，
+    不再读 signal tick 缓存的 price）；本卡**只答「还差多远」，不再单独显示现价** ——
+    现价由大字卡统一展示，同屏只出现一次。
     """
     if not reachable:
         return ("<div class='card card-empty-state'>"
@@ -2426,6 +2458,22 @@ def _empty_positions_html(p: dict, reachable: bool) -> str:
                 "</div></div>")
 
     rows = [_as_dict(x) for x in _as_list(p.get("symbol_state"))]
+    # 现价同源（N2）：_merged_cards 是「why 现价优先、symbol_state 兜底」的收敛点，
+    # 也就是「三标的动态」大字卡显示的那个数 —— 从这里取，同屏才不会出现
+    # 74,407（why） vs 74,416（signal tick 缓存）两个现价。
+    # 触发线仍然只取 symbol_state 的 long/short_trigger（策略唯一出处，不从这里换源）。
+    px_by_sym: Dict[str, Optional[float]] = {}
+    px_by_coin: Dict[str, Optional[float]] = {}
+    for c in _merged_cards(p):
+        cpx = _opt_num(c.get("price"))
+        if cpx is None:
+            continue
+        csym = str(c.get("symbol") or "").strip()
+        ccoin = str(c.get("coin") or "").strip().upper()
+        if csym:
+            px_by_sym[csym] = cpx
+        if ccoin:
+            px_by_coin[ccoin] = cpx
     coins = [str(r.get("coin") or _disp(r.get("symbol")) or "").strip() for r in rows]
     coins = [c for c in coins if c]
     watch = " / ".join(coins) if coins else "—"
@@ -2435,7 +2483,14 @@ def _empty_positions_html(p: dict, reachable: bool) -> str:
         coin = str(r.get("coin") or _disp(r.get("symbol")) or "").strip()
         if not coin:
             continue
-        px = _opt_num(r.get("price"))
+        # 现价取同源值（N2）：先按 symbol 命中，再按 coin 兜一次，最后才退回本行缓存
+        # （why 行缺这个标的时 _merged_cards 本来就兜到 symbol_state，这里只是双保险）。
+        sym = str(r.get("symbol") or "").strip()
+        px = px_by_sym.get(sym)
+        if px is None:
+            px = px_by_coin.get(coin.upper())
+        if px is None:
+            px = _opt_num(r.get("price"))
         parts = [f"<span class='coin'>{_esc(coin)}</span>"]
         # (标签, 到位文案, 颜色, 所需幅度)：上破绿 / 下破红，与全站方向配色一致
         for label, hit, cls, need in (
@@ -2451,7 +2506,8 @@ def _empty_positions_html(p: dict, reachable: bool) -> str:
                 parts.append(f"<span class='trigger-val {cls}'>{hit}</span>")
             else:
                 parts.append(f"<span class='trigger-val {cls}'>{need:+.1f}%</span>")
-        parts.append(f"<span class='trigger-price muted'>现价 {_fmt(px)}</span>")
+        # 现价不再在引导卡里重复一遍（N3）：三标的大字卡就在下方，同屏出现两个现价
+        # 只是噪音（历史上还因数据源不同打过架）。引导卡只回答「还差多远」。
         items.append("<div class='trigger-item'>" + "".join(parts) + "</div>")
 
     trig_html = ("<div class='empty-triggers'>" + "".join(items) + "</div>"
@@ -2532,6 +2588,65 @@ def _render_body(p: dict) -> str:
     if not reachable:
         o.append(f"<div class='banner'>&#9888;&#65039; 未配置 / 读取失败：{_esc(error or '未知原因')}<br>"
                  f"<span class='muted'>交易所侧数据暂不可用；信号 / 下单 / 成交记录见「记录」页。</span></div>")
+
+    # ---------------- 账户横幅（P1-2：只搬位置 + 换壳）----------------
+    # 位置（用户钉死）：H1 → 状态条 →（不可达横幅）→ 账户横幅 → 仓位 → 曲线 → …
+    # 账户权益是这一页的主语，先给钱、再看监控。整块内容原样搬来：字段、口径、
+    # legend 文案、<details> 资金明细一项不少、一个字不改，只改位置与外层 class。
+    # 横幅样式（.acct-banner）见 DASH_CSS：关键数一行 flex 铺开、窄屏自动换行，零 JS。
+    o.append("<div class='card acct-banner'><div class='sec'>账户</div>")
+    today_txt, today_cls = _sign(acc.get("today_realized"))
+    fees = _opt_num(acc.get("fees_total"))
+    # 可提口径与旧版一致：统一账户且交易所 withdrawable<=0 时按 现货−占用 现算
+    # （手续费说明已按用户要求删除，2026-10-29；口径细节保留在 title 悬停）。
+    wd = _opt_num(acc.get("withdrawable"))
+    if wd is None:
+        # 交易所读不到（reachable=False → account 金额是 None）：可提余额**未知**，
+        # 不是 0。以前 _num 兜成 0 会显示「可用保证金 0.00 U」，用户会以为钱没了。
+        wd_html, wd_title = "—", ""
+    elif acc.get("unified") and wd <= 0:
+        avail = max(_num(acc.get("spot_usdc")) - _num(acc.get("spot_hold")), 0.0)
+        wd_html = f"{_fmt(avail)} U"
+        wd_title = "可用保证金：扣掉持仓与挂单占用后还能用来开新仓的金额"
+    else:
+        wd_html = f"{_fmt(wd)} U"
+        wd_title = ""
+    wd_t = f" title='{_esc(wd_title)}'" if wd_title else ""
+    o.append("<div class='acct-top'>"
+             f"<span>账户权益 <b>{_fmt(acc.get('equity'))} U</b></span>"
+             f"<span{wd_t}>可用保证金 <b>{wd_html}</b></span></div>")
+    o.append("<details class='acct-details'><summary>资金明细</summary>")
+    o.append("<div class='acct-sub'>")
+    # Kraken 期货没有钱包地址（venue_address_free）：这一行整行不画 —— 那里的
+    # address 只是 main 填的占位常量，展示出来等于凭空造了个地址。
+    if not p.get("venue_address_free"):
+        o.append(_asub("钱包地址", _addr_text(acc.get("address"))))
+    if acc.get("unified") and not acc.get("spot_ok", True):
+        # 现货状态读取失败 → equity_total 只剩浮盈，数字完全不可信，必须喊出来
+        o.append("<span class='neg'>⚠️ 现货余额读取失败：总值/可提不可信（只剩浮盈），不是没钱</span>")
+    if acc.get("unified"):
+        # 统一账户：资金分布在「现货」和「合约」两侧 —— 用人话一行说完。
+        # 合约侧占用的就是已用保证金（同一个数），不再单列重复一列。
+        # 衍生品钱包：不拆现货/合约两侧，只报「可用 / 已用保证金」。
+        o.append(_asub("保证金（独立衍生品）",
+                       f"可用 {_fmt(acc.get('spot_usdc'))} U · 已用 {_fmt(acc.get('margin_used'))} U",
+                       title="独立衍生品钱包：多币种抵押统一折算；已用 = 持仓与挂单占用的保证金"))
+    if not acc.get("unified"):
+        o.append(_asub("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
+    o.append(_asub("持仓名义", f"{_fmt(acc.get('notional'))} U"))
+    o.append(_asub("今日已实现", today_txt, today_cls,
+                   title="交易所 closedPnl 口径，未扣手续费与资金费"))
+    if fees is None:
+        o.append(_asub("净手续费（付出）", "—"))
+    else:
+        o.append(_asub("净手续费（付出）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
+    o.append("</div>")
+    o.append("</details>")
+    # 注脚（可见文字，iOS Safari 无 title 悬停）：账户相关数字的口径收口。
+    # 「已实现」两行的 title 保留作桌面增强，这里给出手机唯一能看到的口径。
+    o.append('<div class="legend">已实现为交易所口径，未扣手续费与资金费 · '
+             '可用 = 权益 − 持仓/挂单占用</div>')
+    o.append("</div>")
 
     # ---------------- 仓位 ----------------
     # 窄屏（≤640px）只留 8 个关键列（.hidem 列 display:none，不横向滚动）；被隐藏列
@@ -2640,67 +2755,6 @@ def _render_body(p: dict) -> str:
                  'QQQ 行标注「（价格）」的 % 是价格涨跌幅（无保证金分母，非 ROE）· '
                  '窄屏隐藏列的数值见各仓下方小字行 · '
                  'QQQ(MR) 腿不加止损，按收盘价与 SMA5 判离场</div>')
-
-    # ---------------- 账户卡片（P2：分层 + 消重复；P3 R4/R5：折叠 + 主从）----------------
-    # 分两层：顶层关键数（大字，手机一眼读）＋ 次级项收进 <details>「资金明细」
-    #（默认收起，零 JS）。P3 R5：顶层删「累计已实现」—— 它已并入策略绩效卡
-    #（U 对照行，全页唯一出处），顶层只剩 账户总值 · 可提余额。
-    # 「浮盈浮亏」「资金费（持仓期内）」两行删除：同一数字在仓位表每仓各有一份
-    # （浮盈还带 ROE%，见下），账户级聚合行等于同屏第二遍；空仓时浮盈本来就没有
-    # 可看的，无信息损失。次级项只是搬位置，一项不少、数值口径不变。
-    o.append("<div class='card'><div class='sec'>账户</div>")
-    today_txt, today_cls = _sign(acc.get("today_realized"))
-    fees = _opt_num(acc.get("fees_total"))
-    # 可提口径与旧版一致：统一账户且交易所 withdrawable<=0 时按 现货−占用 现算
-    # （手续费说明已按用户要求删除，2026-10-29；口径细节保留在 title 悬停）。
-    wd = _opt_num(acc.get("withdrawable"))
-    if wd is None:
-        # 交易所读不到（reachable=False → account 金额是 None）：可提余额**未知**，
-        # 不是 0。以前 _num 兜成 0 会显示「可用保证金 0.00 U」，用户会以为钱没了。
-        wd_html, wd_title = "—", ""
-    elif acc.get("unified") and wd <= 0:
-        avail = max(_num(acc.get("spot_usdc")) - _num(acc.get("spot_hold")), 0.0)
-        wd_html = f"{_fmt(avail)} U"
-        wd_title = "可用保证金：扣掉持仓与挂单占用后还能用来开新仓的金额"
-    else:
-        wd_html = f"{_fmt(wd)} U"
-        wd_title = ""
-    wd_t = f" title='{_esc(wd_title)}'" if wd_title else ""
-    o.append("<div class='acct-top'>"
-             f"<span>账户权益 <b>{_fmt(acc.get('equity'))} U</b></span>"
-             f"<span{wd_t}>可用保证金 <b>{wd_html}</b></span></div>")
-    o.append("<details class='acct-details'><summary>资金明细</summary>")
-    o.append("<div class='acct-sub'>")
-    # Kraken 期货没有钱包地址（venue_address_free）：这一行整行不画 —— 那里的
-    # address 只是 main 填的占位常量，展示出来等于凭空造了个地址。
-    if not p.get("venue_address_free"):
-        o.append(_asub("钱包地址", _addr_text(acc.get("address"))))
-    if acc.get("unified") and not acc.get("spot_ok", True):
-        # 现货状态读取失败 → equity_total 只剩浮盈，数字完全不可信，必须喊出来
-        o.append("<span class='neg'>⚠️ 现货余额读取失败：总值/可提不可信（只剩浮盈），不是没钱</span>")
-    if acc.get("unified"):
-        # 统一账户：资金分布在「现货」和「合约」两侧 —— 用人话一行说完。
-        # 合约侧占用的就是已用保证金（同一个数），不再单列重复一列。
-        # 衍生品钱包：不拆现货/合约两侧，只报「可用 / 已用保证金」。
-        o.append(_asub("保证金（独立衍生品）",
-                       f"可用 {_fmt(acc.get('spot_usdc'))} U · 已用 {_fmt(acc.get('margin_used'))} U",
-                       title="独立衍生品钱包：多币种抵押统一折算；已用 = 持仓与挂单占用的保证金"))
-    if not acc.get("unified"):
-        o.append(_asub("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
-    o.append(_asub("持仓名义", f"{_fmt(acc.get('notional'))} U"))
-    o.append(_asub("今日已实现", today_txt, today_cls,
-                   title="交易所 closedPnl 口径，未扣手续费与资金费"))
-    if fees is None:
-        o.append(_asub("净手续费（付出）", "—"))
-    else:
-        o.append(_asub("净手续费（付出）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
-    o.append("</div>")
-    o.append("</details>")
-    # 注脚（可见文字，iOS Safari 无 title 悬停）：账户相关数字的口径收口。
-    # 「已实现」两行的 title 保留作桌面增强，这里给出手机唯一能看到的口径。
-    o.append('<div class="legend">已实现为交易所口径，未扣手续费与资金费 · '
-             '可用 = 权益 − 持仓/挂单占用</div>')
-    o.append("</div>")
 
     # Kraken 期货没有出入金流水端点（KrInfo.flows_supported=False）→ 这张卡整块
     # 不渲染，连 <h2>盈亏曲线</h2> 也不出现：曲线/净入金/TWR/最大回撤全是流水口径，

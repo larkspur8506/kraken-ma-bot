@@ -8,7 +8,7 @@
    非止损单/挂单不可信（fail-open）才渲染。
 2. 系统卡瘦身改名「执行器」：对账/熔断/卡单三行删除（状态条唯一出处）；
    卡单徽章只在 >0 时出现。
-3. API 有效期降级：状态条徽章（唯一常驻出处）+ 总览末尾 <details>（≤14 天 open）。
+3. API 有效期降级：状态条徽章（唯一常驻出处）+ tab=settings 的 <details>（≤14 天 open）。
 4. 账户卡 acct-sub 收进 <details>「资金明细」。
 5. 收益主从：「累计已实现」整页唯一出处=绩效卡 U 对照行；R/U 主从图例。
 6. 记录页锚点导航：六个零 JS 跳转链接，href 与 id 一一配对、无重复 id。
@@ -120,16 +120,19 @@ class BaseCase(unittest.TestCase):
 
     @staticmethod
     def account_seg(html: str) -> str:
-        """账户卡片段（折叠断言只看这块，避免命中仓位表同名列）。"""
-        return html.split("<div class='sec'>账户</div>", 1)[1].split("策略绩效（上线以来）", 1)[0]
+        """账户卡片段（折叠断言只看这块，避免命中仓位表同名列）。
+
+        P1-2 起账户卡在状态条之后、仓位之前 → 段末切在「仓位」标题。
+        """
+        return html.split("<div class='sec'>账户</div>", 1)[1].split("<h2>仓位</h2>", 1)[0]
 
     @staticmethod
     def executor_seg(html: str) -> str:
         """「执行器」卡片段（到下一个 <h2> /「API 有效期」卡 / 页尾为止）。
 
-        2026-10-30：总览页尾新增「管理」卡（含 kill 的「熔断」字样），它跟在
-        「API 有效期」之后 —— 段末必须切在 API 有效期卡之前，否则执行器卡的
-        「卡内 0 处」断言会把后面几张卡的内容算进来。
+        2026-10-30：「管理」卡（含 kill 的「熔断」字样）曾跟在「API 有效期」之后；
+        2026-11-10（P1-3）两张卡都搬到 tab=settings，总览到这里已无后续卡 —— 切在
+        agent-card 处保留为防御（万一将来又往总览追加卡片，也不会把内容算进来）。
         """
         seg = html.split("<h2>执行器</h2>", 1)[1]
         seg = seg.split("<h2>", 1)[0]
@@ -275,7 +278,8 @@ class TestAgentBadgeAndDetails(BaseCase):
 
     def test_details_card_collapsed_by_default_open_when_near(self):
         self._write_state(169)
-        admin_html = self.admin()
+        # 2026-11-10（P1-3）：状态卡在「设置」页，总览不再有
+        admin_html = self.admin(tab="settings")
         self.assertIn("<details class='card agent-card'><summary>API 状态</summary>",
                       admin_html, "默认收起")
         # 四行信息 + 自动清仓开关状态一项不丢（逐项对照）
@@ -283,9 +287,10 @@ class TestAgentBadgeAndDetails(BaseCase):
             self.assertIn(w, admin_html)
         # /hl 端本来就没有这张卡，徽章已覆盖常驻出处
         self.assertNotIn("API 状态</summary>", self.hl())
+        self.assertNotIn("API 状态</summary>", self.admin(), "总览不挂状态卡")
         self._write_state(10, level="near")
         self.assertIn("<details class='card agent-card' open><summary>API 状态</summary>",
-                      self.admin(), "剩余 ≤14 天服务端渲染 open（零 JS 自动展开）")
+                      self.admin(tab="settings"), "剩余 ≤14 天服务端渲染 open（零 JS 自动展开）")
 
 
 # ---------------------------------------------------------------- 功能四：账户卡折叠
@@ -346,15 +351,21 @@ class TestOverviewOrderSmoke(BaseCase):
 
     def test_admin_overview_block_order(self):
         html = self.admin()
-        order = ["<h2>仓位</h2>", "<div class='sec'>账户</div>",
-                 "<h2>盈亏曲线（已剔除出入金）</h2>", "三标的动态", "<h2>执行器</h2>",
-                 "<summary>API 状态</summary>"]
+        # P1-2：账户横幅提到状态条之后、仓位之前（先给钱、再看监控）
+        order = ["<div class='sec'>账户</div>", "<h2>仓位</h2>",
+                 "<h2>盈亏曲线（已剔除出入金）</h2>", "三标的动态", "<h2>执行器</h2>"]
         idx = [html.index(m) for m in order]
         self.assertEqual(idx, sorted(idx), f"总览块序错乱：{order}")
+        # 2026-11-10（P1-3）：API 有效期卡与「管理」卡搬到 tab=settings，总览不再有
+        self.assertNotIn("<summary>API 状态</summary>", html)
+        self.assertNotIn("<div class='sec'>管理</div>", html)
+        settings = self.admin(tab="settings")
+        self.assertIn("<summary>API 状态</summary>", settings)
+        self.assertIn("<div class='sec'>管理</div>", settings)
 
     def test_hl_overview_block_order(self):
         html = self.hl()
-        order = [f"<h1>{PRODUCT}</h1>", "<h2>仓位</h2>", "<div class='sec'>账户</div>",
+        order = [f"<h1>{PRODUCT}</h1>", "<div class='sec'>账户</div>", "<h2>仓位</h2>",
                  "<h2>盈亏曲线（已剔除出入金）</h2>", "三标的动态", "<h2>执行器</h2>"]
         idx = [html.index(m) for m in order]
         self.assertEqual(idx, sorted(idx), f"/hl 块序错乱：{order}")
