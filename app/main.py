@@ -1,0 +1,1154 @@
+"""FastAPI 应用：定时检查 + 合并管理面板 + HL 面板。
+
+面板入口（2026-10-30 面板精简后只剩两个页签，见 docs/ADMIN_MERGE_PLAN.md 第 2 节）：
+    GET /admin?k=<ADMIN_TOKEN>&tab=overview|records
+    POST /admin/switch/kill（拉闸/解除，页面入口在总览「管理」卡）、
+         /admin/hl/kill（同一动作的 curl 口径）、
+         /admin/hl/agent/renew、/admin/hl/agent/fallback/clear（总览「管理」卡）
+旧地址兼容：/hl、/admin/rules、/admin/logs 的 GET 全部 302 到对应 Tab。
+已删除（一律 404，不设兼容层）：POST /admin/rules、/admin/params、
+          /admin/switch/mode、/admin/switch/strategy、/admin/switch/notify、
+          /admin/switch/dd_reset、/admin/hl/mode —— 改参数/开关/模式/回撤基线
+          现在只有「DB 直改」或「改代码走 PR」两条路。
+          GET+POST /c/{pid} 人工确认页与签名链接机制（2026-10-30 PR B）：执行器自动
+          开仓后它再无入口，真实成交一律到面板「记录」页按 hl_fills 核对。
+保留不动：/api/hl/* 四个 JSON 接口、/admin/tick（部署验收 curl 用，页面不渲染按钮）。
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import logging
+import os
+import threading
+import time
+from dataclasses import replace
+from urllib.parse import quote as _urlquote
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import FileResponse, RedirectResponse, Response
+from starlette.middleware.gzip import GZipMiddleware
+
+from app import auth as authn
+from app import engine
+from app.config import Config
+from app.db import DB
+from app.notify import get_notifier
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("cma")
+
+# Kraken 无钱包地址：统一占位值（见 hl_params 注释）
+KR_ADDRESS = "kraken"
+
+DB_PATH = os.environ.get("DB_PATH", "/app/data/crypto_ma.db")
+db = DB(DB_PATH)
+config = Config()
+notifier = get_notifier(config)
+scheduler = None
+
+# gzip 的起压门槛（见 add_middleware 处的理由）。之所以不叫 min_size：Starlette >=0.20
+# 把这个参数从 min_size 改名成 minimum_size（fastapi>=0.110 依赖的版本都是新名字）。
+GZIP_MIN_SIZE = 1024
+
+
+def current_config() -> Config:
+    return config.apply_db(db.get_config())
+
+
+# ---------------------------------------------------------------- HL 执行器装配
+
+def _env(key: str, default: str = "") -> str:
+    return (os.environ.get(key) or default).strip()
+
+
+def hl_mode() -> str:
+    """off / dry / live。DB 值（面板/脚本可写）优先于 env。默认 off。"""
+    raw = str(db.get_config().get("hl_exec_mode", "") or _env("HL_EXEC_MODE", "off")).strip().strip('"')
+    return raw if raw in ("off", "dry", "live") else "off"
+
+
+def hl_private_key() -> str:
+    """执行器用的 agent 私钥：**DB（面板「更新 API」写入）优先，其次 env**。
+
+    这是全仓唯一读私钥明文的入口 —— 调用方只许把它交给 HlExchange 的构造函数，
+    绝不许写进日志、事件、alert_logs 或 HTTP 响应。
+    """
+    try:
+        db_key = str(db.get_config_str("hl_private_key", "") or "").strip()
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("读 DB 私钥失败（回落 env）：%s", type(e).__name__)
+        db_key = ""
+    return db_key or _env("HL_PRIVATE_KEY")
+
+
+def hl_params():
+    """从 env + DB 组装 ExecParams。私钥 DB > env（面板可热切换），其余读 env/配置。"""
+    from app.hl.executor import (DEFAULT_COIN_MAP, SIGNAL_AGE_DEFAULT_MIN, ExecParams,
+                                 parse_max_signal_age_min)
+    try:
+        coin_map = json.loads(_env("HL_COIN_MAP", "")) or dict(DEFAULT_COIN_MAP)
+    except ValueError:
+        coin_map = dict(DEFAULT_COIN_MAP)
+
+    def f(key: str, default: float) -> float:
+        try:
+            return float(_env(key, str(default)))
+        except ValueError:
+            return default
+
+    cfg = current_config()
+    base = hl_info_base()
+    return ExecParams(
+        mode=hl_mode(),
+        # Kraken 没有「钱包地址」概念：占位值保证下游 address 门卫（面板快照、MR 腿
+        # 的 HL_ADDRESS 空值检查）不再把功能整体跳过（对抗审查 P0：MR 腿曾因空地址
+        # 直接返回 error，永远不下单）。KrInfo 的所有方法都忽略这个参数。
+        account_address=_env("HL_ACCOUNT_ADDRESS") or KR_ADDRESS,
+        private_key=hl_private_key(),
+        base_url=base,
+        coin_map=coin_map,
+        leverage=cfg.leverage,
+        risk_pct=cfg.risk_pct,
+        # 空单风险减半：DB > env > 默认关（Config 已解析好布尔位，缺键/脏值都退回
+        # 「关」= 现状）。与 pnl_from_fills / fill_close 同一种「从面板配置读布尔」
+        # 的装配模式，只是默认方向相反：这是新增的风险政策，默认必须维持原行为。
+        short_risk_half=bool(getattr(cfg, "short_risk_half", False)),
+        equity=cfg.equity,
+        # 口径 DB > env > 代码默认：Config 已解析好，不要再单独读 env（否则 DB 值会被 env 压掉）
+        equity_mode=str(getattr(cfg, "equity_mode", "follow") or "follow"),
+        equity_min=float(getattr(cfg, "equity_min", 20.0) or 0.0),
+        notify_fills=push_on("fill_push"),
+        # 净 PnL 口径（PR-3）：默认关。DB > env（Config.apply_db 已解析好），
+        # 与 fill_push 同一种「从面板配置读布尔」的模式。
+        pnl_from_fills=bool(getattr(cfg, "hl_pnl_from_fills", False)),
+        # 交易所侧已平仓 → 对账按成交价关账（2026-10-22 事故修复）：DB > env > 默认开。
+        # 缺键/脏值一律按「开」（这正是修复本身；关掉它等于回到误 kill 的旧行为），
+        # 与 pnl_from_fills 同一种「从面板配置读布尔」的装配模式。
+        fill_close=bool(getattr(cfg, "hl_fill_close", True)),
+        # 对账失败自动消化（宽限期 + 窄口径自解 kill）：与 fill_close 同一种装配模式。
+        # 脏值/缺键 → 按开（这是修复本身；关掉等于回到「没证据就 kill」的旧行为）。
+        close_grace=bool(getattr(cfg, "hl_close_grace", True)),
+        close_grace_s=_grace_seconds(cfg),
+        kill_autoclear=bool(getattr(cfg, "hl_kill_autoclear", True)),
+        # churn 熔断阈值（PR-4）：DB > env > 默认（Config 已解析好，不再单独读 env）。
+        # 与 fill_push / pnl_from_fills 同一种装配模式；脏值/缺键退回 5（不静默关保护）。
+        churn_max=_churn_max(cfg),
+        # 出入金流水同步间隔（秒）：DB > env > 默认 1800。盈亏曲线要剔除出入金，
+        # 数据源是交易所账本；**只有参数、没有面板开关**（用户要求）。
+        # 脏值/缺键退回 1800（不退回 300：调接口不必比账本事件还勤）。
+        flow_sync_s=_flow_sync_s(cfg),
+        # 回撤熔断（DD Guard）：DB > env > 默认（Config 已解析好）。缺键按「开」，
+        # 阈值 0 = 按 risk_pct 档位自动（1.5%→25/30、2.5%→30/40、3%→40/50）。
+        # 与 fill_close/kill_autoclear 同一种「从面板配置读布尔」的装配模式。
+        dd_guard=bool(getattr(cfg, "hl_dd_guard", True)),
+        dd_warn_pct=_dd_pct(cfg, "hl_dd_warn_pct"),
+        dd_kill_pct=_dd_pct(cfg, "hl_dd_kill_pct"),
+        # 死手开关默认关闭：识别不了的值也按「关」处理（安全侧默认，与推送开关的 fail-open 相反）
+        use_schedule_cancel=str(db.get_config_str(
+            "hl_use_schedule_cancel", _env("HL_USE_SCHEDULE_CANCEL", "0")) or "0"
+        ).strip().lower() in ("1", "true", "yes", "on"),
+        max_slippage_pct=f("HL_MAX_SLIPPAGE_PCT", 0.003),
+        # 名义上限默认 0 = 不设限（用户拍板）；要给暴露度加护栏就把 env 设回正数
+        max_notional_mult=f("HL_MAX_NOTIONAL_MULT", 0.0),
+        max_total_notional_mult=f("HL_MAX_TOTAL_NOTIONAL_MULT", 0.0),
+        max_orders_per_day=int(f("HL_MAX_ORDERS_PER_DAY", 4)),
+        # 信号时效闸（与 Lighter 侧对齐）：空/脏值/负数 → 30（不静默关保护），0 = 关闭。
+        # 解析在 executor.parse_max_signal_age_min 里，和 _churn_max 同一个理由。
+        max_signal_age_min=parse_max_signal_age_min(
+            _env("HL_MAX_SIGNAL_AGE_MIN", str(SIGNAL_AGE_DEFAULT_MIN))),
+        max_fail_streak=int(f("HL_MAX_FAIL_STREAK", 3)),
+        max_daily_loss_pct=f("HL_MAX_DAILY_LOSS_PCT", 0.05),
+        deadman_minutes=int(f("HL_DEADMAN_MINUTES", 30)),
+        # Kraken 无最小名义金额（HL 的 10 USDC 下限在 Kraken 会真拒单）：
+        # 下单只看合约数量精度步长（contractValueTradePrecision），所以这里写死 0.0
+        # = 不设名义闸门。**不**新增 env/面板旋钮（参数面刻意最小化）。
+        # 不重用 HL_MIN_NOTIONAL：那是 HL 口径，留着只会让人以为还能调。
+        min_notional=0.0,
+        code_rev=_env("HL_CODE_REV", os.environ.get("CODE_REV", "")),
+    )
+
+
+_hl_info = None
+
+
+def _churn_max(cfg) -> int:
+    """churn 熔断阈值（PR-4）。脏值/缺键一律退回 5（默认保护），**不**退回 0 ——
+    0 的语义是「关闭熔断」，一个读坏的字符串不该悄悄把保护关掉（fail-closed）。"""
+    raw = getattr(cfg, "hl_churn_max", None)
+    try:
+        n = int(float(str(raw).strip().strip('"').strip("'")))
+    except (TypeError, ValueError):
+        return 5
+    return n if n >= 0 else 5
+
+
+GRACE_DEFAULT_S = 900.0
+
+
+def _grace_seconds(cfg) -> float:
+    """平仓宽限秒数。脏值/缺键/越界一律退回 900（15 分钟）。
+
+    与 `_churn_max` 同一个理由：读坏的字符串不该把宽限关成 0 秒（= 第一轮没证据
+    就 kill，回到要修的那个行为），也不该放大成一天（期间该标的禁止开新仓）。
+    """
+    raw = getattr(cfg, "hl_close_grace_s", None)
+    try:
+        v = float(str(raw).strip().strip('"').strip("'"))
+    except (TypeError, ValueError):
+        return GRACE_DEFAULT_S
+    lo, hi = 300.0, 3600.0
+    return v if lo <= v <= hi else GRACE_DEFAULT_S
+
+
+def _flow_sync_s(cfg) -> int:
+    """出入金流水同步间隔（秒）。脏值/缺键退回 1800；出界值收敛到 300~86400
+    （与 Config._RANGES 同一区间：读侧不该绕过配置校验自己放行一个越界值）。"""
+    raw = getattr(cfg, "hl_flow_sync_s", None)
+    try:
+        n = int(float(str(raw).strip().strip('"').strip("'")))
+    except (TypeError, ValueError):
+        return 1800
+    return min(86400, max(300, n))
+
+
+def _dd_pct(cfg, key: str) -> float:
+    """回撤阈值覆盖（0 = 按 risk_pct 档位自动）。脏值/缺键/越界一律退回 0（自动）。
+
+    规则**不在这里**：范围和「不符合就退回自动」的唯一真相是
+    `app/hl/dd.py:norm_override`（规格 §6 低4）。这里只是装配时的一个读入口。
+    为什么不退回一个具体数字：档位是「跟着 risk_pct 走」的，抄一个 0.30 进这里
+    等于把 3% 档的账户钉在 2.5% 档的线上（那档 P(DD>30%)=96%，必然误触发）。
+    越界值退回 0 而不是钳到边界：钳值会造出一个用户没写过的阈值。
+    """
+    from app.hl import dd as hl_dd
+    return hl_dd.norm_override(getattr(cfg, key, None))
+
+
+
+def hl_info_base() -> str:
+    """只读客户端的 base_url。独立成函数：hl_params() 装配执行器时也要用它，
+    但私钥/模式的变动不该触发只读客户端重建。
+
+    Kraken 版（PR-1）：默认生产 futures.kraken.com，HL_TESTNET 开关复用为沙盒。
+    """
+    if _env("HL_TESTNET", "0") in ("1", "true"):
+        return "https://demo-futures.kraken.com"
+    return _env("KR_BASE_URL", "https://futures.kraken.com")
+
+
+def kr_api_key() -> str:
+    """Kraken API key：DB（面板可写，键 kr_api_key）优先，其次 env。"""
+    try:
+        db_key = str(db.get_config_str("kr_api_key", "") or "").strip()
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("读 DB api key 失败（回落 env）：%s", type(e).__name__)
+        db_key = ""
+    return db_key or _env("KRAKEN_API_KEY")
+
+
+def kr_secret() -> str:
+    """Kraken API secret（base64）：env KRAKEN_API_SECRET → DB kr_api_secret →
+    兼容回落 hl_private_key()（迁移期同一个 DB 键，PR-3 决定不改名）。
+
+    与 hl_private_key 同级纪律：明文只进 KrClient 构造，不进日志/响应/事件。
+    """
+    env_s = _env("KRAKEN_API_SECRET")
+    if env_s:
+        return env_s
+    try:
+        db_s = str(db.get_config_str("kr_api_secret", "") or "").strip()
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("读 DB kr secret 失败（回落）：%s", type(e).__name__)
+        db_s = ""
+    return db_s or hl_private_key()
+
+
+def get_hl_info():
+    """只读客户端（面板/看护/执行器共用）。
+
+    Kraken 版（PR-1）：KrInfo 带凭据（fills/持仓等私有端点需要）；
+    无凭据时也能构造（公开端点可用，私有读取会 fail-closed）。
+
+    **不带缓存**：执行器、tick、对账、看护消费的必须是实时读数（fail-closed 的前提）。
+    面板要省请求请用 `panel_hl_info()` —— 它是本函数返回值的一层 TTL 包装，只存在于面板依赖里。
+    """
+    global _hl_info
+    if _hl_info is None:
+        from app.kr.info import KrInfo
+        _cfg = current_config()
+        _hl_info = KrInfo(api_key=kr_api_key(), secret_b64=kr_secret(),
+                          base_url=hl_info_base(),
+                          # 计费口径：Kraken 的 /fills 不带 fee，只能按账号费率档配
+                          taker_fee=float(getattr(_cfg, "kr_taker_fee", 0.000275)),
+                          maker_fee=float(getattr(_cfg, "kr_maker_fee", 0.000075)))
+    return _hl_info
+
+
+_panel_info = None
+
+
+def panel_hl_info():
+    """面板专用的只读客户端包装（`snapshot`/`all_mids` 带 10s TTL 缓存）。
+
+    只被 `_admin_deps()` 使用，`/api/hl/*` 与执行器仍走 `get_hl_info()` 的实时值。
+    真身被换掉（测试 reload / 地址切换重建）时自动重建包装，避免拿旧对象的缓存回答新问题。
+    """
+    global _panel_info
+    from app.panel_cache import PanelInfo
+    raw = get_hl_info()
+    if _panel_info is None or getattr(_panel_info, "raw", None) is not raw:
+        _panel_info = PanelInfo(raw)
+    return _panel_info
+
+
+def invalidate_panel_cache() -> None:
+    """面板写操作（参数/模式/kill）成功后调用：下一次渲染重新取真值。"""
+    global _panel_info, _panel_invalidated_at
+    _panel_invalidated_at = time.time()
+    if _panel_info is not None:
+        _panel_info.invalidate()
+    # 阶段 B：快照里的六步解释/读数也可能被这次写操作改变（阈值、模式、kill），
+    # 所以同时让「下一位访问者」绕过快照走一次实时，别让人刚改完参数就看到旧解释。
+    if _snapshot_info is not None:
+        _snapshot_info.invalidate()
+
+
+# 最近一次面板写操作的时刻：/why 在写后 5 秒内强制现算（见 _why_rows）。
+_panel_invalidated_at = 0.0
+
+
+# ---------------------------------------------------------------- 面板快照（阶段 B）
+# 调度器每轮把面板要显示的读数写进 `panel_snapshots`，面板只读库、零网络零重算。
+# 细节与取舍见 app/panel_store.py 的模块头。
+
+_snapshot_store = None
+_snapshot_info = None
+
+_PANEL_SNAPSHOT_OFF = ("0", "false", "no", "off")
+
+
+def panel_snapshot_on() -> bool:
+    """快照开关，默认**开**（PANEL_SNAPSHOT=0 时退回 A1 的 10s 进程内缓存）。"""
+    return (os.environ.get("PANEL_SNAPSHOT", "1") or "1").strip().lower() not in _PANEL_SNAPSHOT_OFF
+
+
+def panel_snapshot_store():
+    """快照表门面（按 db 实例缓存；测试换库时自动重建）。"""
+    global _snapshot_store
+    from app.panel_store import PanelSnapshotStore
+    if _snapshot_store is None or getattr(_snapshot_store, "db", None) is not db:
+        _snapshot_store = PanelSnapshotStore(db)
+    return _snapshot_store
+
+
+def panel_snapshot_info():
+    """面板专用的快照读取器：先读库，过期/缺失回落 `panel_hl_info()`（实时 + 10s）。"""
+    global _snapshot_info
+    from app.panel_store import SnapshotInfo
+    raw = get_hl_info()
+    fallback = panel_hl_info()
+    if (_snapshot_info is None or getattr(_snapshot_info, "fallback", None) is not fallback
+            or getattr(_snapshot_info, "store", None) is not panel_snapshot_store()):
+        _snapshot_info = SnapshotInfo(panel_snapshot_store(), fallback)
+    return _snapshot_info
+
+
+def capture_panel_snapshot(source: str = "", with_why: bool = False) -> bool:
+    """把「面板这一轮要显示的数据」写进快照表（**只读交易所，绝不下单**）。
+
+    调用点只有两个：tick 之后（带六步结论）与 hl_monitor 之后（纯读数刷新）。
+    `with_why=False` 时沿用上一条 why（六步结论只在 4h bar 收盘后才会变，每 5 分钟重算
+    3 个标的 × 5000 根 K 线纯属浪费）。
+
+    任何异常都只记日志并返回 False —— 面板会在快照缺失时回落实时读取，交易不受影响。
+    """
+    try:
+        address = hl_params().account_address
+        if not address:
+            logger.info("[panel] 快照跳过：未配置钱包地址（面板会回落实时读取）")
+            return False
+        info = get_hl_info()
+        # 面板状态条的「HL 延迟」本该是「请求交易所不花多少时间」。阶段 B 之后面板渲染不再
+        # 访问交易所，那一次耗时就不存在了 —— 与其显示成「—」或者一个测量不到的 1 ms，
+        # 不如把调度器**这一轮真实读数**的耗时记下来，面板标成「上一轮（N 分钟前）的耗时」。
+        # 范围 = allMids + 账户快照（共 4~5 个只读请求），与旧口径的单次 snapshot 略有出入，
+        # 但同样是「服务器 → Hyperliquid」的真实往返，不含任何渲染开销。
+        t0 = time.time()
+        mids = info.all_mids()
+        snapshot = info.snapshot(address, mids=mids)
+        if isinstance(snapshot, dict):
+            snapshot["panel_net"] = {
+                "latency_ms": round((time.time() - t0) * 1000.0, 1),
+                "ts": t0,                       # 采样时刻：面板据此说「几分钟前那一轮」
+                "source": source or "scheduler",
+            }
+        why_rows = None
+        if with_why:
+            from app import why as why_mod
+            try:
+                why_rows = why_mod.build_rows(db, current_config())
+            except Exception as e:                                # noqa: BLE001
+                # 六步算不出来不该让整条快照作废：读数（权益/挂单/现价）仍然有效
+                logger.warning("[panel] 快照的六步结论生成失败（沿用上一条）：%s", e)
+                why_rows = None
+        if why_rows is None:
+            try:
+                why_rows = panel_snapshot_store().latest_why()
+            except Exception:                                     # noqa: BLE001
+                why_rows = None
+        store = panel_snapshot_store()
+        store.write(snapshot=snapshot, mids=mids, why=why_rows, source=source or "scheduler")
+        store.prune()
+        # 统一账户下 `equity`（永续口径）恒为 0，账户总值在 `equity_total` —— 日志里取后者，
+        # 否则运维看到「equity=0.0」会以为读坏了（面板本身两个字段都拿到，不受影响）。
+        shown_equity = snapshot.get("equity_total") or snapshot.get("equity")
+        logger.info("[panel] 快照已写入（%s）：equity=%s 持仓=%d 挂单=%d 现价=%d why=%s",
+                    source or "scheduler", shown_equity,
+                    len(snapshot.get("positions") or []), len(snapshot.get("open_orders") or []),
+                    len(mids or {}), "有" if why_rows else "沿用")
+        return True
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[panel] 快照写入失败（面板会回落实时读取）：%s", e)
+        return False
+
+
+def build_executor():
+    """mode=off 时返回 None（纯提醒模式）。任何装配失败都退回 None 并记日志。"""
+    p = hl_params()
+    if p.mode == "off":
+        return None
+    p.mr_margin_fn = _mr_margin_used          # 定仓基数剔除 MR 占用
+    try:
+        from app.kr.exchange import KrExchange
+        from app.hl.executor import Executor
+        info = get_hl_info()
+        ex = KrExchange(api_key=kr_api_key(), secret_b64=kr_secret(),
+                        base_url=p.base_url, dry_run=(p.mode == "dry"),
+                        max_slippage_pct=p.max_slippage_pct, info=info)
+        return Executor(db, p, info, ex, notifier=notifier)
+    except Exception as e:                                           # noqa: BLE001
+        logger.exception("装配 Kraken 执行器失败，退回纯提醒模式: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------- 推送开关
+# report_push / fill_push 是新键（首次从面板保存才落库）；缺省值决定「老库」的行为，
+# 所以缺省必须是 1（开），否则升级后周报会突然静默。
+_PUSH_ON = ("1", "true", "yes", "on")
+_PUSH_OFF = ("0", "false", "no", "off")
+
+
+def push_on(key: str, default: str = "1") -> bool:
+    """读推送开关：DB 值优先，缺省为 default；识别不了的值按「开」处理（宁可多推一条）。"""
+    try:
+        raw = str(db.get_config_str(key, default) or default).strip().lower()
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("读推送开关 %s 失败：%s", key, e)
+        return True
+    return raw not in _PUSH_OFF
+
+
+# ---------------------------------------------------------------- 调度
+
+def _job_tick() -> None:
+    try:
+        sent = _tick_locked()
+        if sent:
+            logger.info("tick 发送 %d 条提醒", len(sent))
+        _retry_failed_alerts()
+        # 阶段 B：tick 刚算过六步、也刚读过行情 —— 顺手把面板快照写掉（含 why）。
+        # 放在锁外：写快照是纯读操作 + 一次 INSERT，不该延长交易路径的持锁时间。
+        capture_panel_snapshot("tick", with_why=True)
+    except Exception as e:                                    # noqa: BLE001
+        logger.exception("tick 异常: %s", e)
+
+
+# 进程内 tick 互斥：/admin/tick 与调度器并发跑同一轮会重复推送/竞争 set_last_bar
+# （APScheduler 的 max_instances 只约束它自己起的 job，管不了 HTTP 线程）。
+import threading as _threading
+
+_tick_lock = _threading.Lock()
+
+
+def _tick_locked() -> list:
+    with _tick_lock:
+        return engine.tick(db, current_config(), notifier, executor=build_executor())
+
+
+def _retry_failed_alerts(max_age_h: float = 24.0, limit: int = 5) -> None:
+    """补推近 24h 内发送失败的提醒（最多 limit 条/轮）。
+
+    背景：_emit 失败不标记幂等，但 set_last_bar 已推进 —— 旧行为下那条 entry/exit
+    提醒永久丢失（离场提醒丢 = 闷亏）。这里按 alert_logs 里的失败记录补推，成功后
+    更新 sent_successfully（下次不再推）。
+    """
+    try:
+        import time as _time
+        rows = db.failed_alerts_since(_time.time() - max_age_h * 3600)
+        retry = [r for r in rows if (r["kind"] or "") not in ("heartbeat", "heartbeat_local",
+                                                              "weekly", "weekly_local",
+                                                              "exec_alert_fills",
+                                                              # 观察中的数据源告警：故意不发，
+                                                              # 不是发送失败，不得补推
+                                                              "data_error_pending")]
+        # bar_ms=NULL 的行不受 UNIQUE 约束（NULL 互不相等），同一故障可能累积多条
+        # 失败行 —— 按 (symbol, kind) 只补推最新一条，避免同一告警被连发 N 次。
+        _seen: set = set()
+        _dedup = []
+        for r in retry:
+            key = (r["symbol"], r["kind"], r["bar_ms"])
+            if key in _seen:
+                continue
+            _seen.add(key)
+            _dedup.append(r)
+        retry = _dedup
+        for r in retry[:limit]:
+            text = r["message"] or ""
+            if not text:
+                continue
+            ok = bool(notifier and notifier.send_message(text))
+            if ok:
+                db.mark_alert_sent(int(r["id"]))
+                logger.info("补推失败提醒成功：id=%s kind=%s", r["id"], r["kind"])
+    except Exception as e:                                    # noqa: BLE001
+        logger.exception("补推失败提醒异常: %s", e)
+
+
+def _run_agent_cleanup(reason: str = "") -> dict:
+    """到期保护清仓（**持 _tick_lock**，与 tick 互斥）。
+
+    互斥设计（M2 修正后的事实）：
+    1. 清仓全程持进程内 ``_tick_lock`` —— 与 tick / /admin/tick / hl_monitor（同锁）
+       串行，进程里不可能有第二个写路径在跑；
+    2. 执行器内部再用**进程级** ``_op_lock``（class 属性，所有 Executor 实例共用）
+       兜底 run/on_entry/on_exit；
+    3. 清仓期间置 `agent.cleanup_session()` 标记，让「有仓没止损 → 自动补挂」
+       这类顺手动交易所的路径主动让路（它同时也不再在 kill 态下动手）。
+    """
+    with _tick_lock:
+        ex = build_executor()
+        if ex is None:
+            # 纯提醒模式（off）或装配失败：没有执行器能平仓。返 ok=False 让上层喊人，
+            # 绝不假装「已清仓」。
+            return {"ok": False, "error": "执行器未启用或装配失败（模式=off？），无法自动清仓",
+                    "closed": [], "dry": False}
+        return ex.flatten_for_expiry(reason or "agent 到期保护")
+
+
+def _agent_check(now_ms=None) -> dict:
+    """跑一轮到期检查（拆出来便于 /admin 触发与单测直接调）。
+
+    Kraken 版（PR-1）：Derivatives API key 无有效期、也没有代理钱包授权，
+    到期保护整体不存在——固定返回 ok，仅保留失败告警重试。"""
+    state = {"level": "ok", "source": "kraken-key-no-expiry", "days_left": None}
+    logger.info("[agent] 到期检查：level=%s source=%s（Kraken key 无有效期）",
+                state.get("level"), state.get("source"))
+    _retry_failed_alerts()
+    return state
+
+
+def _job_agent_expiry() -> None:
+    """每小时第 11 分：检查 API 钱包有效期（≤3 天且开关开 → 清仓）。"""
+    try:
+        _agent_check()
+        _retry_failed_alerts()
+    except Exception as e:                                    # noqa: BLE001
+        logger.exception("agent 到期检查异常: %s", e)
+
+
+def _job_hl_monitor() -> None:
+    """每 5 分钟：快照 + 对账 + 死手开关 + 心跳（与信号 tick 解耦，便于看守判活）。
+
+    **持 _tick_lock**：与 tick / /admin/tick / 到期清仓串行。以前这里不持锁，清仓
+    （持锁）与 monitor（不持锁、自己新建 Executor、自己的实例锁）能同时跑，
+    「清仓撤完单 → monitor 又补挂回去」来回打架（M2）。
+    """
+    with _tick_lock:
+        ex = build_executor()
+        if ex is not None:
+            try:
+                ex.run(force_snapshot=True)
+            except Exception as e:                                    # noqa: BLE001
+                logger.exception("HL 执行器监控轮异常: %s", e)
+    # 阶段 B：读数刷新（5 分钟一轮）。放在锁外，且**无论执行器是否启用**都要刷新 ——
+    # 面板在 mode=off/无凭据时也该能看到账户读数（只读，不碰下单路径）。
+    capture_panel_snapshot("monitor", with_why=False)
+
+
+#: MR 腿（feat/mr-leg）：最近一次 tick 的状态块（/api/hl/status 的 `mr` 字段来源）。
+#: **只整体重新绑定、永不原地 clear/update**（P2-1）：读方不持 `_tick_lock`，原地清空
+#: 会让它们在两步之间看到空 dict；重新绑定在 CPython 里是单条 STORE_GLOBAL，原子。
+_MR_STATUS: Dict[str, Any] = {}
+_mr_leg: Optional[Any] = None
+#: 装配 MR 腿时的身份（模式/地址/密钥指纹/端点）；任一项变了就重建 —— 否则轮换
+#: API key 或切 dry/off 之后 MR 仍在用旧实例下单（2026-11-02 复核 P2）。
+_MR_IDENTITY: tuple = ()
+
+
+def _mr_margin_used() -> float:
+    """MR 腿当前占用（xyz dex 保证金 + uPnL），供 crypto 腿定仓剔除。读不到按 0。"""
+    try:
+        return max(float(_MR_STATUS.get("margin_used") or 0.0), 0.0)
+    except Exception:                                                 # noqa: BLE001
+        return 0.0
+
+
+def _mr_status_snapshot() -> Optional[Dict[str, Any]]:
+    """`_MR_STATUS` 的快照（`/api/hl/status` 的 `mr` 字段 / 面板 `mr_fn` 的唯一入口）。
+
+    **先取一次模块全局再复制**：`dict(_MR_STATUS) if _MR_STATUS else None` 会连读两次
+    全局名，理论上两次之间可能被换掉（虽然换后的值也都非空）。这里改成单次取值 ——
+    读方拿到的永远是某一个完整版本的拷贝，不会是半截。
+    """
+    snap = _MR_STATUS
+    return dict(snap) if snap else None
+
+
+def _mr_identity() -> tuple:
+    """MR 腿的装配指纹：**模式 / base_url / Kraken 凭据变了就重建**。
+
+    之前用 `sha256(private_key)` —— Kraken 版里 `hl_private_key` 是**遗留**入口
+    （只在 kr_secret 回落时读），把执行器的 HL 私钥塞进指纹意味着：换 Kraken key
+    不会重建腿（旧凭据继续用），而改动一个与 MR 无关的 HL 私钥却会重建。
+    改成 `(mode, base_url, sha256(kr_api_key:kr_secret))`：两者正是 MR 腿真正用的凭据，
+    且只留哈希前缀（明文不进内存指纹/日志）。地址不进指纹：Kraken 侧它是占位常量
+    （见 `KR_ADDRESS`），换地址不会换账户。
+    """
+    p = hl_params()
+    secret = f"{kr_api_key()}:{kr_secret()}"
+    fp = hashlib.sha256(secret.encode()).hexdigest()[:12]
+    return (p.mode, p.base_url, fp)
+
+
+def _build_mr_leg() -> Optional[Any]:
+    """装配 MR 腿。mode=off / 装配失败 → None（纯提醒模式不跑 MR）。"""
+    p = hl_params()
+    if p.mode == "off":
+        return None
+    try:
+        from app.kr.exchange import KrExchange
+        from app.hl.mr import HlMrConfig, HlMrLeg
+        info = get_hl_info()
+        ex = KrExchange(api_key=kr_api_key(), secret_b64=kr_secret(),
+                        base_url=p.base_url, dry_run=(p.mode == "dry"),
+                        max_slippage_pct=p.max_slippage_pct, info=info)
+        # Kraken 侧无 dex 限定名：coin 直接用 display coin「QQQ」（registry/specs/
+        # fills 全按 QQQ 口径）。复用 HlMrLeg 全部逻辑（唯一 1005 行 MR 执行器，
+        # 双线硬化不再分叉）；cross 语义由 KrExchange.update_leverage no-op +
+        # flex 全仓现实兜底（futures 钱包隔离替代逐仓）。
+        # 手续费口径必须跟随配置（KR_TAKER_FEE）：`HlMrConfig.taker_fee_rate` 的默认值是
+        # 模块常量（写死的档位），改账号费率档时只改 env/配置不会生效 —— 显式传，让
+        # fee_est / funding 门槛与实际扣费同源。用关键字参数传（不动 dataclass 字段顺序，
+        # 位置参数不会错位）。
+        cfg = HlMrConfig(coin="QQQ", dex="kr",
+                         taker_fee_rate=float(getattr(current_config(), "kr_taker_fee", 0.000275)))
+        return HlMrLeg(db=db, info=info, exchange=ex, config=cfg,
+                       address_fn=lambda: hl_params().account_address,
+                       notifier=notifier)
+    except Exception as e:                                            # noqa: BLE001
+        logger.exception("装配 MR 腿失败: %s", e)
+        return None
+
+
+def _job_mr_tick() -> None:
+    """每 5 分钟：MR 腿 tick（挂 _tick_lock 与主策略串行；异常只记状态不外抛）。
+
+    **状态块整体重新绑定，不原地 clear/update**（P2-1，2026-11-09）：读方
+    （`/api/hl/status`、面板 `mr_fn`、定仓用的 `_mr_margin_used`）不持 `_tick_lock`，
+    旧的 `clear()` + `update(...)` 在两步之间露出空 dict —— `_mr_leg.tick()` 实测
+    0.7~0.9s，窗口就有这么长，于是 `mr: null` → 探针 `off:?` → 值班模型无效唤醒。
+    现在先把结果算完（`payload`），再一次性赋值给模块全局：CPython 的 STORE_GLOBAL
+    对读方是原子的，读方要么看到旧的完整状态、要么看到新的完整状态，绝不为空
+    （除非从未 tick 过）。三条路径（mode_off / 正常 tick / 异常）同此口径。
+    """
+    global _mr_leg, _MR_IDENTITY, _MR_STATUS
+    with _tick_lock:
+        try:
+            ident = _mr_identity()
+            if _mr_leg is None or ident != _MR_IDENTITY:
+                _mr_leg = _build_mr_leg()
+                _MR_IDENTITY = ident
+            if _mr_leg is None:
+                _MR_STATUS = {"enabled": False, "state": "mode_off",
+                              "recon": "unknown", "error": ""}
+                return
+            payload = dict(_mr_leg.tick() or {})
+            if not payload:
+                # tick 返回空块时不能把状态块置空（读方又会看到 mr:null），按异常态落。
+                payload = {"state": "error", "recon": "unknown",
+                           "error": "mr tick 返回空状态"}
+            _MR_STATUS = payload
+        except Exception as e:                                        # noqa: BLE001
+            logger.exception("MR 腿 tick 异常: %s", e)
+            _MR_STATUS = {"state": "error", "recon": "unknown",
+                          "error": f"{type(e).__name__}: {e}"}
+
+
+def _job_heartbeat() -> None:
+    cfg = current_config()
+    text = engine.heartbeat_text(db, cfg)
+    if cfg.heartbeat_push:
+        ok = bool(notifier and notifier.send_message(text))
+        db.log_alert(None, None, "heartbeat", text, ok)
+    else:
+        # 静默信标：只落库不推送（每日巡检已把同样信息汇总给用户）。
+        # kind='heartbeat_local' 仅供 cma_watch.py / cma_status.py 判断调度器存活。
+        db.log_alert(None, None, "heartbeat_local", text, True)
+        logger.info("心跳（未推送，仅落库）:\n%s", text)
+    _prune_alert_logs()
+
+
+def _prune_alert_logs(keep_days: float = 60.0, keep_rows: int = 5000) -> None:
+    """alert_logs 里 bar_ms=NULL 的行（心跳/周报/数据错误）不受 UNIQUE 幂等约束，
+    会无限增长 —— 每天清一次超期的，保留最近 keep_rows 行兜底。失败只记日志。
+
+    走 DB 的 @_locked 方法（不裸用共享连接）：这里是全仓唯一一处绕过 RLock 的
+    DB 访问，跨线程 commit 会打乱其它线程的事务边界。
+    """
+    try:
+        db.prune_alert_logs(keep_days=keep_days, keep_rows=keep_rows)
+        db.prune_hl_telemetry()
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("alert_logs 清理失败（忽略）：%s", e)
+
+
+def _job_weekly() -> None:
+    text = engine.weekly_text(db, current_config())
+    if push_on("report_push"):
+        ok = bool(notifier and notifier.send_message(text))
+        db.log_alert(None, None, "weekly", text, ok)
+        return
+    # 开关关了：只落库（kind=weekly_local，与心跳的静默信标同一套约定）
+    db.log_alert(None, None, "weekly_local", text, True)
+    logger.info("周报（未推送，仅落库）:\n%s", text)
+
+
+# ---------------------------------------------------------------- K 线预热（阶段 A2）
+# /why 的 K 线缓存（app/why.py::FEED_TTL_S=900）过期后，第一个访问者要自己等 10–12s
+# 现取三标的行情。启动后先在后台把这个缓存填好，首个访问者直接命中。
+# 与 ENABLE_SCHEDULER 分开开关：预热只影响首屏快慢，跟「要不要跑定时任务」是两件事。
+
+_WHY_PREHEAT_OFF = ("0", "false", "no", "off")
+
+
+def _why_preheat_on() -> bool:
+    """预热开关，默认**开**（只有离线测试/无网络环境才该关）。"""
+    return (os.environ.get("WHY_PREHEAT", "1") or "1").strip().lower() not in _WHY_PREHEAT_OFF
+
+
+def _job_why_preheat() -> None:
+    """后台线程里跑：只填 K 线缓存，失败只记日志（服务照常跑，首屏退回现取）。"""
+    try:
+        from app import why as why_mod
+        bad = why_mod.preheat(current_config())
+        if bad:
+            logger.warning("K 线预热部分失败（首屏会现取，不影响交易与提醒）：%s", "；".join(bad))
+        else:
+            logger.info("K 线预热完成：三标的已进 /why 缓存，首个访问者不再等现取")
+    except Exception as e:                                          # noqa: BLE001
+        logger.warning("K 线预热失败（不影响服务）：%s", e)
+
+
+def _start_why_preheat() -> Optional[threading.Thread]:
+    """起守护线程预热，**绝不阻塞 startup**：首屏慢几秒可以等，服务起不来不行。"""
+    if not _why_preheat_on():
+        logger.info("K 线预热已关闭（WHY_PREHEAT=0）")
+        return None
+    th = threading.Thread(target=_job_why_preheat, name="why-preheat", daemon=True)
+    th.start()
+    return th
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global scheduler
+    if os.environ.get("ENABLE_SCHEDULER", "true").lower() in ("1", "true", "yes"):
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        scheduler = BackgroundScheduler(timezone="UTC")
+        scheduler.add_job(_job_tick, CronTrigger(minute="3,33"), id="tick",
+                          max_instances=1, coalesce=True)
+        scheduler.add_job(_job_heartbeat, CronTrigger(hour=config.heartbeat_hour, minute=0), id="heartbeat")
+        scheduler.add_job(_job_weekly, CronTrigger(day_of_week="mon", hour=config.heartbeat_hour, minute=5), id="weekly")
+        scheduler.add_job(_job_hl_monitor, CronTrigger(minute="*/5"), id="hl_monitor",
+                          max_instances=1, coalesce=True)
+        # MR 腿（feat/mr-leg）：5 分钟一轮，错开 hl_monitor 30 秒避免同刻抢 CPU/锁
+        scheduler.add_job(_job_mr_tick, CronTrigger(minute="2-59/5"), id="mr_tick",
+                          max_instances=1, coalesce=True)
+        # API 钱包到期检查：每小时第 11 分（错开 tick 的 :03/:33 与 hl_monitor 的 5 分整）
+        scheduler.add_job(_job_agent_expiry, CronTrigger(minute=11), id="agent_expiry",
+                          max_instances=1, coalesce=True)
+        scheduler.start()
+        logger.info("调度器已启动：tick 每小时 :03/:33（UTC 时刻）；心跳 %02d:00 UTC；周报周一；"
+                    "HL 监控每 5 分钟（模式=%s）；API 有效期检查每小时 :11", config.heartbeat_hour, hl_mode())
+    # 预热放在 scheduler 判断之外：只提醒模式（ENABLE_SCHEDULER=false）也需要它，
+    # 而且它是后台线程，起到这一步不会拖慢 startup。
+    _start_why_preheat()
+    yield
+    if scheduler:
+        scheduler.shutdown(wait=False)
+
+
+app = FastAPI(title="crypto-ma-alert", lifespan=lifespan)
+
+# ---------------------------------------------------------------- gzip（阶段 A3）
+# 面板 HTML 实测 ~60KB 未压缩，手机流量/首屏都要多背 ~59KB 的重复 CSS 与表格标记。
+# 1024 字节起压：小 JSON（/health、/api/hl/*）压了省不了几字节，反而多一次 CPU 与
+# 一层 content-encoding；面板 HTML/CSV 导出都远超这个门槛。
+# 流式端点（CSV 导出）由 middleware 自己按 chunk 增量压缩；text/event-stream 在 Starlette
+# 1.x 的默认排除表里，本服务也没有 SSE 端点，不会破坏长连接。
+app.add_middleware(GZipMiddleware, minimum_size=GZIP_MIN_SIZE)
+
+
+
+# ---------------------------------------------------------------- 鉴权
+# 统一口径：Authorization Bearer 认证；旧的 ?k= 与 cma_admin Cookie 保留
+# （旧书签 / runbook 的 curl / 面板零 JS 链接都还在用，见 app/auth.py）。
+
+_AUTH_HINT = "需要 ADMIN_TOKEN：?k= 参数，或 Authorization: Bearer 请求头"
+
+
+def _require_admin(request: Request, k: Optional[str] = None) -> None:
+    token = config.admin_token
+    if not token:
+        raise HTTPException(500, "ADMIN_TOKEN 未配置")
+    if not authn.is_admin(request, token, k):
+        raise HTTPException(401, _AUTH_HINT)
+
+
+def _admin_url(tab: str, k: str = "") -> str:
+    """回面板的跳转地址：k 为空就不带 ``&k=``（Bearer/Cookie 会话不需要它）。"""
+    url = f"/admin?tab={tab}"
+    if k:
+        url += f"&k={_urlquote(str(k))}"
+    return url
+
+
+def _k_out(request: Request, k: Optional[str]) -> str:
+    """跳转里还要不要回显 k：**永远不要**（P1-C 收口，token 不写进 Location）。
+
+    凭据来自 URL 时由 ``authn.set_session_cookie`` 在同一个响应上种 Cookie，
+    所以跳转目标不需要 k —— 这也顺带让 token 不再进浏览器历史/反代日志。
+    """
+    return ""
+
+
+@app.get("/health")
+def health(request: Request = None, k: Optional[str] = None):
+    # 基本字段公开（看守/巡检脚本只读 status+scheduler）；带有效凭据才给 hl_mode/hl_kill
+    # （站点是公网的，无 token 不该暴露执行模式与熔断状态）。
+    # request 的默认值只为兼容 `health()` 直接调用（测试/脚本），FastAPI 照常注入。
+    payload: Dict[str, Any] = {"status": "ok", "symbols": config.symbols,
+                               "scheduler": bool(scheduler), "dry_run": config.dry_run}
+    if k or authn.bearer_token(request):
+        if authn.is_admin(request, config.admin_token, k):
+            payload["hl_mode"] = hl_mode()
+            payload["hl_kill"] = db.hl_kill()
+    return payload
+
+
+@app.get("/")
+def root():
+    return RedirectResponse("/admin")
+
+
+# ---------------------------------------------------------------- 主屏图标 / favicon
+# 手机「添加到主屏」用的静态资源。路径从模块位置推导（app/static/），
+# 不写死部署目录 —— CI 与容器里 app 包位置不同，写死会在测试/构建时炸。
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# 图标一周内不会变；带 immutable 的 ETag 交给浏览器缓存，反代不参与。
+_ICON_CACHE = "public, max-age=604800"
+
+
+def _static_response(name: str, media_type: str) -> FileResponse:
+    """返回 app/static/ 下的文件。存在性在**请求时**才看（import 时不碰磁盘）。"""
+    path = os.path.join(STATIC_DIR, name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"静态资源缺失：{name}")
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": _ICON_CACHE})
+
+
+@app.get("/apple-touch-icon.png")
+def apple_touch_icon():
+    return _static_response("apple-touch-icon.png", "image/png")
+
+
+@app.get("/icon-192.png")
+def icon_192():
+    return _static_response("icon-192.png", "image/png")
+
+
+@app.get("/icon-512.png")
+def icon_512():
+    return _static_response("icon-512.png", "image/png")
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return _static_response("favicon.ico", "image/x-icon")
+
+
+@app.get("/site.webmanifest")
+def site_webmanifest():
+    return _static_response("site.webmanifest", "application/manifest+json")
+
+
+# ---------------------------------------------------------------- HL 面板与控制
+
+def hl_guard(request: Request, response: Response, k: Optional[str] = None) -> None:
+    """面板与 JSON API 的鉴权：Bearer 头 / ?k= 查询参数 / cma_admin Cookie；带 k 时写 Cookie。"""
+    token = config.admin_token
+    if not token:
+        raise HTTPException(500, "ADMIN_TOKEN 未配置")
+    src = authn.auth_source(request, token, k)
+    if src is None:
+        raise HTTPException(401, _AUTH_HINT)
+    if src == authn.SRC_QUERY and k:
+        # 只有「凭据来自 URL」时才回写 Cookie（Bearer 会话每次自带凭据，不需要）。
+        # Secure 只在 https（含反代 X-Forwarded-Proto）时加：本地 http 调试不受影响
+        https_ = request.url.scheme == "https" or \
+            str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
+        response.set_cookie("cma_admin", k, httponly=True, max_age=30 * 86400,
+                            secure=https_, samesite="lax")
+
+
+def _hl_deps():
+    from app.hl.views import DashboardDeps
+    return DashboardDeps(
+        db=db,
+        config_fn=current_config,
+        info=get_hl_info(),
+        address_fn=lambda: hl_params().account_address,
+        mode_fn=hl_mode,
+        base_url_fn=lambda: hl_params().base_url,
+        mr_fn=_mr_status_snapshot,
+        snapshot_info_fn=lambda: panel_snapshot_info() if panel_snapshot_on() else None,
+    )
+
+
+def _mount_hl_views() -> None:
+    try:
+        from app.hl.views import build_router
+        app.include_router(build_router(_hl_deps()), dependencies=[Depends(hl_guard)])
+        logger.info("已挂载 /hl 监控面板（模式=%s）", hl_mode())
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("挂载 /hl 面板失败（不影响提醒与执行器）：%s", e)
+
+
+def _mount_hl_keyform() -> None:
+    """【已退役】一次性私钥录入页（原给「手机连不上 oracle1:22」时用 HTTPS 通道）。
+
+    **Kraken 构建不挂载**（2026-11-08 审核 B10）：这个页面写的是 **HL 代理钱包私钥**
+    （`HL_PRIVATE_KEY` / env 文件）。切到 Kraken 后 `kr_secret()` 的兜底链是
+    「env KRAKEN_API_SECRET → DB kr_api_secret → **hl_private_key()**」，于是从这个页面
+    录进去的 HL 私钥会变成 Kraken 的 API secret：签名全错（每张单都以鉴权失败告终），
+    而页面还显示「✅ 已写入」。Kraken key 的唯一入口是面板「更新 API」（`_kr_renew`，
+    写 DB + 校验 base64），它没有 env 文件回退，也不需要这条隧道。
+
+    保留这个函数（而不是删掉装配调用）只为让装配层有一处显式开关与日志：将来若回到
+    HL 形态，恢复 include_router 那两行即可（`app/hl/keyform.py` 本身未改动）。
+    """
+    logger.info("跳过 /admin/hl/key 私钥录入页：Kraken 构建下该页会污染 kr_secret 回落链")
+
+
+# ---------------------------------------------------------------- 合并管理面板
+def _panel_write(fn):
+    """把面板写操作包一层：**写成功之后**立刻让面板读数缓存失效。
+
+    为什么要失效：面板读数（账户快照/现价）本身不依赖配置，但写操作会改变页面上其它区块
+    （模式、kill 状态、参数生效值），如果刚写完的那次跳转还渲染着 10s 前的快照，用户会怀疑
+    「点了没生效」。代价只是写操作后多取一次快照，一次点击一次，可以接受。
+    """
+    if fn is None:
+        return None
+
+    def wrapped(*args, **kwargs):
+        out = fn(*args, **kwargs)
+        invalidate_panel_cache()
+        return out
+
+    return wrapped
+
+
+def _admin_deps():
+    """装配合并面板的依赖（全部走可替换函数，测试里可换成假实现）。"""
+    from app.admin_ui import AdminDeps
+    hl = _hl_deps()
+    # 面板侧的只读客户端（阶段 A1/A2 + B）：
+    #   默认 = 读快照表（零网络零重算），快照缺失/过期时回落 PanelInfo（实时 + 10s TTL）；
+    #   PANEL_SNAPSHOT=0 时退回 A1 的纯 TTL 包装。
+    # 只换**这一份** AdminDeps 的 info（dataclasses.replace 产生新对象），
+    # `_hl_deps()` 自身、`/api/hl/*`、执行器、看护仍拿 get_hl_info() 的实时客户端。
+    pinfo = panel_snapshot_info() if panel_snapshot_on() else panel_hl_info()
+    hl = replace(hl, info=pinfo)
+    return AdminDeps(
+        db=db,
+        config_fn=current_config,
+        hl_deps=hl,
+        mode_fn=hl_mode,
+        token_fn=lambda: config.admin_token,
+        address_fn=lambda: hl_params().account_address,
+        private_key_fn=lambda: kr_secret(),
+        mids_fn=pinfo.all_mids,                        # 与 snapshot 里的现价共用同一份快照
+        # 写路径（参数/模式/开关/kill）成功后失效面板缓存
+        set_config=_panel_write(getattr(db, "set_config", None)),
+        hl_set_kill=_panel_write(getattr(db, "hl_set_kill", None)),
+        # 到期检查（agent_state_fn）固定 ok：Kraken key 无有效期；
+        # 「更新 API」写 kr_api_key/kr_api_secret（_kr_renew），HL agent 体系退役
+        agent_state_fn=lambda: _agent_state(),
+        # Kraken 版「更新 API」：写 kr_api_key/kr_api_secret（_kr_renew）；
+        # HL 的 agent renew_key 与到期检查整体退役（到期检查固定 ok）
+        renew_fn=lambda k, s: _kr_renew(k, s),
+        cleanup_enabled_fn=lambda: _cleanup_on(),
+        # /why 诊断（只读）：阶段 B 起优先读快照里的六步结论，缺失才现取
+        why_rows_fn=lambda: _why_rows(),
+        # MR 腿运行态（开关本身由面板读 DB `mr_enabled`；这里只给「状态/对账/持仓」一行）
+        mr_fn=_mr_status_snapshot,
+        # 取不到现价时预览降级成「无法取价」，不硬编一个假价格
+        price_fallback=0.0,
+    )
+
+
+def _why_rows(live: bool = False) -> list:
+    """面板「为什么没开仓」的数据源（只读；异常一律退回空列表，别弄挂总览）。
+
+    阶段 B：默认读快照里的六步结论（tick 后写入，最多滞后一个 tick 周期）；
+    快照过期/没带 why 时才现取 K 线重算（那一下约 1.2s，且只在快照断档时发生）。
+    """
+    if not live and panel_snapshot_on():
+        # 面板写操作（参数/模式/kill）后 5 秒内的渲染一律现算：改完阈值立刻要看到新解释，
+        # 不能等下一轮 tick 才刷新（这一点与 A1 的 10s 缓存同一取舍，只是从 10s 收到 5s）。
+        if (time.time() - _panel_invalidated_at) < 5.0:
+            live = True
+    if not live and panel_snapshot_on():
+        try:
+            info = panel_snapshot_info()
+            row = info.stored_row()                   # 同一套「过期就不用」的判据
+            if row is not None and row.get("why"):
+                return copy.deepcopy(row["why"])
+        except Exception as e:                                  # noqa: BLE001
+            logger.warning("/why 快照读取失败（改现取）：%s", e)
+    try:
+        from app import why as why_mod
+        return why_mod.build_rows(db, current_config())
+    except Exception as e:                                          # noqa: BLE001
+        logger.warning("/why 诊断失败（面板区块略去）：%s", e)
+        return []
+
+
+def _agent_state() -> dict:
+    """面板用：Kraken key 无有效期、无代理钱包授权体系——固定返回该形状，
+    不再读 ``hl_agent_state``（那是 HL agent 授权体系的缓存，Kraken 版无人写入）。"""
+    return {"level": "ok", "source": "kraken-key-no-expiry", "days_left": None}
+
+
+def _cleanup_on() -> bool:
+    from app.hl import agent as agent_mod
+    return agent_mod.cleanup_switch(db, current_config())
+
+
+def _kr_renew(api_key: str, api_secret: str) -> tuple:
+    """面板「更新 API」（Kraken 版）：格式校验 + 写 DB + 失效只读客户端缓存。
+
+    真实有效性不在这里验（Kraken 无「预演签名」端点）：签错 = 下一轮全部私有
+    读数报错、执行器 fail-closed 停手——不会错单，面板会把错误如实显示。
+    返回 (ok, 人话文案)；响应/日志不含凭据任何片段。
+    """
+    key = str(api_key or "").strip()
+    sec = str(api_secret or "").strip()
+    if not key or not sec:
+        return False, "两个输入框都要填：API Key 和 API Secret（Kraken 网页上分开的两条）"
+    if "\n" in key or "\n" in sec or "\r" in key or "\r" in sec:
+        return False, "凭据中间含换行——请分别只粘贴那一串，一次一条"
+    import base64 as _b64
+    try:
+        _b64.b64decode(sec, validate=True)
+    except Exception:                                             # noqa: BLE001
+        return False, "API Secret 不是合法 base64——Kraken 网页上那串要原样完整复制"
+    db.set_config("kr_api_key", key)
+    db.set_config("kr_api_secret", sec)
+    global _hl_info
+    _hl_info = None                     # 只读客户端带凭据，必须重建
+    try:
+        db.hl_log_event("agent_renew", "Kraken API 凭据已更新（面板保存）")
+    except Exception:                                             # noqa: BLE001
+        pass
+    return True, "Kraken API 凭据已保存，下一轮生效"
+
+
+def _mount_admin_ui() -> None:
+    """先挂合并面板，再挂 /hl：让 /hl 的 302 覆盖 views 里的原路由。"""
+    from app.admin_ui import build_admin_router
+    try:
+        app.include_router(build_admin_router(_admin_deps()))
+        logger.info("已挂载管理面板 /admin（总览 + 记录）")
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("挂载合并管理面板失败：%s", e)
+
+
+# 顺序有讲究：/admin 系列先注册，/hl 的旧路由被 302 覆盖，/api/hl/* 原样保留。
+_mount_admin_ui()
+_mount_hl_views()
+_mount_hl_keyform()
+
+
+@app.post("/admin/tick")
+def admin_tick(request: Request, k: Optional[str] = None):
+    _require_admin(request, k)
+    sent = _tick_locked()
+    return {"sent": len(sent), "messages": sent}
+
+
+# ---------------------------------------------------------------- kill（runbook 的 curl 在用）
+# 2026-10-30 面板精简：同段的 /admin/hl/mode（切模式）已删除 —— 切模式只剩
+# DB 直改（docs/HL_RUNBOOK.md 的应急条目）。kill 这条 curl 口径保留。
+
+@app.post("/admin/hl/kill")
+def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
+    """kill switch：off=恢复正常，on=暂停自动交易（仍允许人工平仓/撤单）。
+
+    origin 显式写 'manual'：这是**人**按的按钮，绝不能被「连续 N 轮对账干净」自动解除
+    —— 人按下去通常正因为它看到了机器看不出的东西（见 Executor._maintain_kill_autoclear）。
+
+    【v2·高2】解除**回撤熔断**（origin=='dd'）时，必须在本请求内把回撤基线（peak_index）
+    重置为当前 index：否则下一轮 DD 仍是 31% → 立刻又置 kill，「人工解」形同虚设。
+    这条 curl 入口与面板 `/admin/switch/kill` 同一口径（runbook 用的是这条；
+    面板上的按钮在总览页尾「管理」卡）。
+    """
+    _require_admin(request, k or None)
+    want = on in ("1", "true", "on")
+    if not want and db.hl_kill_origin() == "dd":
+        from app.hl import dd as hl_dd
+        try:
+            new = hl_dd.reset_peak(db)
+            db.hl_log_event("kill", "解除回撤熔断 → 回撤基线已重置"
+                            + (f"（当前指数 {new['index']:.2f}）" if new else "（失败：状态不可用）"))
+        except Exception as e:                                       # noqa: BLE001
+            # 重置失败不能挡住解锁：宁可由下一轮重新熔断（用户会看到提示），也不要
+            # 让一次 DB 写失败把 kill 卡死。
+            db.hl_log_event("kill", f"解除回撤熔断时重置基线失败：{type(e).__name__}: {e}")
+    db.hl_set_kill(want, "人工" if want else "", origin="manual")
+    db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
+    resp = RedirectResponse(_admin_url("overview", _k_out(request, k)), status_code=303)
+    return authn.set_session_cookie(resp, request, config.admin_token, k or None)
+
+
+@app.post("/admin/hl/mr")
+def admin_hl_mr(request: Request, on: str = Form("0"), k: str = Form("")):
+    """MR 腿开关（feat/mr-leg）。只挡新入场；持仓照常按信号离场。
+
+    默认停用（configuration `mr_enabled` 无值 = 停用）——首笔真单在人工核对
+    之前，这个开关就是 MR 腿的上线闸门。与 /admin/hl/kill 的关系：kill 挡
+    所有腿的新开仓（包括 MR）；本开关只管 MR 自己。
+    """
+    _require_admin(request, k or None)
+    want = on in ("1", "true", "on")
+    db.set_config("mr_enabled", "1" if want else "0")
+    db.hl_log_event("mr_admin", f"MR 腿人工{'启用' if want else '停用'}")
+    resp = RedirectResponse(_admin_url("overview", _k_out(request, k)), status_code=303)
+    return authn.set_session_cookie(resp, request, config.admin_token, k or None)
