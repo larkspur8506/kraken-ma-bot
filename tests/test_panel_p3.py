@@ -242,7 +242,7 @@ class TestExecutorCard(BaseCase):
                              (NOW - 600, oid))          # 600s > 180s 阈值 → 卡单
         self.db.conn.commit()
         for html in self.both():
-            self.assertIn("卡单 <b>1 笔</b>", html)
+            self.assertIn("卡单 1 笔", html)          # P0-2：并入「系统」健康徽章
             self.assertIn("持续 3 分钟未推进才计入", html, "口径随迁到徽章 title")
 
 

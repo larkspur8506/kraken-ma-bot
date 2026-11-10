@@ -120,7 +120,7 @@ class TestSinglePrice(PanelMergeBase):
         html = self.render(payload)
         self.assertEqual(html.count("81,516.00"), 1, "现价全页只能出现一次")
         self.assertNotIn("81,504", html, "缓存里的旧价不允许再出现在同一屏")
-        self.assertIn('<span class="px">81,516.00</span>', _card(html, "BTC"))
+        self.assertIn('<span class="px-large">81,516.00</span>', _card(html, "BTC"))
 
     def test_reason_wording_matches_state_word(self):
         """2026-10-29 精简后密集拦截只报「带宽 X% · 门槛 Y%」两个数；strategy 的原文

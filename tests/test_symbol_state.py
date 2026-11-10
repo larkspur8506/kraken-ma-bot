@@ -205,7 +205,7 @@ class TestRenderBlock(unittest.TestCase):
         self.assertIn('<span class="st hot" title="6 均线已连续 4 根密集，满 6 根后收盘突破即入场">'
                       "密集酝酿 4/6</span>", card)
         self.assertIn('class="nm">BTC</span>', card)
-        self.assertIn('<span class="px">100,000.00</span>', card)
+        self.assertIn('<span class="px-large">100,000.00</span>', card)
 
     def test_dense_capped_at_six_in_html(self):
         html = self.render([self.row(dense_cnt=9)])
@@ -317,10 +317,10 @@ class TestRenderBlock(unittest.TestCase):
                          long_trigger=None, short_trigger=None, dense_cnt=None)]
         html = self.render(rows)
         eth = sym_card(html, "ETH")
-        self.assertIn('<span class="px">—</span>', eth)
+        self.assertIn('<span class="px-large">—</span>', eth)
         self.assertNotIn('class="kv"', eth, "缺字段的标的不能渲染距离子行")
         sol = sym_card(html, "SOL")
-        self.assertIn('<span class="px">150.00</span>', sol)
+        self.assertIn('<span class="px-large">150.00</span>', sol)
         self.assertNotIn('class="kv"', sol, "触发线 NULL → 子行整体不渲染")
         # 其余标的不受影响
         btc = sym_card(html, "BTC")
@@ -587,7 +587,7 @@ class TestPayloadSymbolState(unittest.TestCase):
         self.assertTrue(all(r["price"] is None for r in p["symbol_state"]))
         html = render_dashboard(p)
         self.assertIn("三标的动态", html)
-        self.assertEqual(html.count('class="px">—</span>'), 3)
+        self.assertEqual(html.count('class="px-large">—</span>'), 3)
 
     def test_values_and_position_side(self):
         self.db.set_symbol_state("BTC_USDT", price=100_000.0, sma20=96_000.0,

@@ -51,7 +51,8 @@ from app.hl import funding as hl_funding
 from app.hl.pnl import QUOTE_FEE_TOKENS   # M3：费用未折算/老数据缺手续费的判据同源
 from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _fill_bs,
                         _ST_TXT, _agent_badge_html, _disp, _disp_text, _fee_quoted,
-                        _fmt_sz, _kv, _render_body, _stuck_badge_html, normalize_span,
+                        _fmt_sz, _health_badge_html, _kv, _positions_badge_html,
+                        _render_body, normalize_span,
                         _signals_html, normalize_rows, status_payload)
 from app.ui_theme import (ICON_LINKS, THEME_COOKIE, DEFAULT_THEME, H1_BLOCK, PRODUCT_NAME,
                           normalize_theme, theme_attr,
@@ -317,9 +318,12 @@ def _rows(deps: "AdminDeps", name: str, limit: int = 50) -> List[Dict[str, Any]]
     return [_rowd(r) for r in out]
 
 
-def _badge(dot_cls: str, label: str, value: str, title: str = "") -> str:
+def _badge(dot_cls: str, label: str, value: str, title: str = "",
+           extra_cls: str = "") -> str:
+    """状态条徽章。extra_cls：分层后的 badge-status（核心）/ badge-small（辅助）。"""
     t = f" title='{_esc(title)}'" if title else ""
-    return (f"<span class='badge'{t}><span class='{dot_cls}'>&#9679;</span> "
+    extra = f" {extra_cls}" if extra_cls else ""
+    return (f"<span class='badge{extra}'{t}><span class='{dot_cls}'>&#9679;</span> "
             f"{label} <b>{value}</b></span>")
 
 
@@ -1412,15 +1416,19 @@ def _panel_age_badge(age: Any) -> str:
         return ""
     return _badge("muted" if f < 600 else "warn", "数据", _age_txt(f),
                   "面板读数是调度器最近一轮的读数（每 5 分钟刷新一次），不是此刻的实时值；"
-                  "下单/对账/熔断走的始终是实时读数")
+                  "下单/对账/熔断走的始终是实时读数", "badge-small")
 
 
 def _status_strip(p: dict) -> str:
-    """顶部常显状态条：执行模式 / 熔断 / 对账 / 卡单(>0) / Kraken 延迟 / API 有效期 / 更新时间。
+    """顶部常显状态条（P0-2 分层）：第一层 3 个核心结论，第二层辅助读数。
 
-    P3 R2/R3：卡单与 API 有效期两个徽章从这里唯一常驻（原「系统」卡的卡单行、
-    原「API 有效期」卡的常驻整卡均已删）—— 徽章渲染与 /hl 状态条共用 views 的
-    同一个函数（同一事实一种写法）。
+    第一层：模式 / 系统健康（熔断+对账+卡单 已合并成一句）/ 持仓。
+    第二层（字号更小）：Kraken 延迟 / API 有效期 / 数据新鲜度 / 更新时间。
+
+    合并的理由：熔断、对账、卡单回答的是同一个问题（系统现在能不能放心跑），
+    平铺三枚圆点只是刷屏；正常态合成一枚绿点「系统 正常」（细节在 title），
+    异常时把出问题的那一项写进值里。持仓是「手里有没有东西」，属核心结论。
+    两层都是 width:100% 的 flex 容器，靠父 .bar 的 flex-wrap 各占一行（纯 CSS，零 JS）。
     """
     mode = str(p.get("mode") or "off")
     if mode not in _MODE_TXT:
@@ -1428,7 +1436,6 @@ def _status_strip(p: dict) -> str:
     kill = bool(p.get("kill"))
     system = p.get("system") or {}
     net = p.get("network") or {}
-    mismatch = bool(system.get("mismatch"))
     # 读数来自调度器快照时，本次渲染**没有访问交易所** ⇒ 渲染时测到的耗时（毫秒级的 SQLite 读）
     # 绝不能当成网络延迟显示（曾显示成「1 ms」）。快照里带了调度器那一轮实测的耗时就用它，
     # 老快照（没有 `panel_net`）则显「—」。
@@ -1444,27 +1451,27 @@ def _status_strip(p: dict) -> str:
     else:
         lat_title = "服务器请求 Kraken 的耗时，与你到面板的延迟无关"
     kill_reason = str(p.get("kill_reason") or "").strip()
-    # 熔断触发且原因非空 → 值里带上原因（可见文字）；iOS Safari 无 title 悬停，
-    # 原先原因只在 title 里、手机上读不到。未触发时值不变，title 保留。
-    kill_val = "未触发"
-    if kill:
-        kill_val = f"已触发 · {_esc(kill_reason)}" if kill_reason else "已触发"
-    items = [
-        _badge(_MODE_CLS[mode], "模式", _MODE_TXT[mode]),
-        _badge("neg" if kill else "pos", "熔断", kill_val, kill_reason),
-        _badge("pos" if not mismatch else "neg", "对账", "一致" if not mismatch else "不一致"),
-        # 卡单徽章（P3 R2）：>0 才出现（琥珀），正常态状态条不出现「卡单」字样。
-        _stuck_badge_html(system),
+    # 第一层：3 个核心结论（模式 / 系统健康 / 持仓），与 /hl 状态条同一套徽章函数。
+    primary = [
+        _badge(_MODE_CLS[mode], "模式", _MODE_TXT[mode], "", "badge-status"),
+        _health_badge_html(system, kill, kill_reason),
+        _positions_badge_html(p.get("positions"), p.get("mr")),
+    ]
+    # 第二层：辅助读数，字号更小（badge-small）—— 出问题要看得到，但不是第一眼。
+    secondary = [
         _badge("pos" if lat is not None else "muted", "Kraken 延迟",
-               f"{lat:.0f} ms" if lat is not None else "—", lat_title),
+               f"{lat:.0f} ms" if lat is not None else "—", lat_title, "badge-small"),
         # API 有效期徽章（P3 R3）：唯一常驻出处，≤14 天琥珀、≤7 天红、已清仓红。
-        _agent_badge_html(p.get("agent")),
+        _agent_badge_html(p.get("agent"), "badge-small"),
         # 数据新鲜度（阶段 B）：读数来自调度器快照时标出「几秒/几分钟前」，
         # 实时读取时不渲染（避免正常态多一个恒为「0 秒」的噪音徽章）。
         _panel_age_badge(p.get("panel_age_s")),
-        _badge("muted", "更新", _ts(p.get("ts"))),
+        _badge("muted", "更新", _ts(p.get("ts")), "", "badge-small"),
     ]
-    return "<div class='bar'>" + "".join(items) + "</div>"
+    return ("<div class='bar'>"
+            + "<span class='bar-primary'>" + "".join(primary) + "</span>"
+            + "<span class='bar-secondary'>" + "".join(secondary) + "</span>"
+            + "</div>")
 
 
 def _tabs_html(tab: str, k: str) -> str:

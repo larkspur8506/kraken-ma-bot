@@ -120,12 +120,27 @@ html[data-theme='dark']{--bg:#0f1115;--fg:#e6e6e6;--card:#171a21;--card2:#14171e
 # 黑白两套主题下自动跟随（**不写死任何色值**）。由 hl/views.DASH_CSS 拼进页面。
 # .st.hot 的琥珀 = 变量 --warn；其余靠 --muted/--fg，与面板其它区块同色系。
 SYMBOL_CSS = """
-.sym-h{display:flex;align-items:baseline;gap:8px;margin-bottom:2px}
+.sym-h{display:flex;align-items:baseline;gap:8px;margin-bottom:4px;flex-wrap:wrap}
 .nm{font-weight:600;color:var(--fg)}
 .st{font-size:12px;color:var(--muted)}
 .st.hot{color:var(--warn)}
 .px{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums}
+/* 现价大字（P0-1）：三标的卡最该一眼看到的就是现价 —— 14px 正文与「还差 x%」
+   同重量时，扫视三个数字比扫视距离行还慢。24px 数字靠右贴住同一行（margin-left:auto），
+   标的名/状态词/24h 涨跌幅留在左侧基线对齐；窄屏降到 20px 仍保持一行。 */
+.px-large{font-size:24px;font-weight:700;line-height:1.15;margin-left:auto;
+          color:var(--fg);font-variant-numeric:tabular-nums;letter-spacing:-.3px}
+/* 24h 涨跌幅（P0-1）：现价左侧的小胶囊，颜色只借语义变量（pos/neg/muted），
+   底色/描边用 --card2 / --line —— 黑白两套主题都不写死色值，深色下描边保证
+   胶囊形状看得出来（只靠 --card2 与卡底几乎同色）。 */
+.chg{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;
+     padding:1px 6px;border-radius:6px;background:var(--card2);
+     border:1px solid var(--line)}
+.chg.pos{color:var(--pos)}
+.chg.neg{color:var(--neg)}
+.chg.muted{color:var(--muted)}
 .fn{font-size:11px;color:var(--muted)}
+@media (max-width:640px){.px-large{font-size:20px}.chg{font-size:11px;padding:1px 5px}}
 .sym-legend,.legend{margin-top:8px;font-size:11px;color:var(--muted);line-height:1.6}
 .msgdetails summary{cursor:pointer;color:var(--muted)}
 .msgdetails .fullmsg{white-space:pre-wrap;font-size:12px;padding:4px 0;line-height:1.5}
