@@ -57,7 +57,7 @@ __all__ = [
     "status_payload", "render_dashboard", "build_router",
     "DASH_CSS", "_render_body", "THEME_CSS",
     "ROW_CHOICES", "DEFAULT_ROWS", "ROWS_COOKIE", "normalize_rows", "_signals_html",
-    "_stuck_badge_html", "_agent_badge_html",
+    "_agent_badge_html",
 ]
 
 # 长表每页行数（手机优先）：默认 20，面板上可切 10/20/50，选择存 cookie `cma_rows`。
@@ -274,53 +274,121 @@ def _asub(label: str, value: str, cls: str = "", title: str = "") -> str:
     return f"<span{t}>{label} <b{c}>{value}</b></span>"
 
 
-def _badge(dot_cls: str, label: str, value_html: str) -> str:
-    return (f"<span class='badge'><span class='{dot_cls}'>&#9679;</span> "
+def _badge(dot_cls: str, label: str, value_html: str, extra_cls: str = "") -> str:
+    """状态条徽章（HTML 值）。extra_cls 用于分层：badge-status（核心）/ badge-small（辅助）。"""
+    extra = f" {extra_cls}" if extra_cls else ""
+    return (f"<span class='badge{extra}'><span class='{dot_cls}'>&#9679;</span> "
             f"{label} <b>{value_html}</b></span>")
 
 
-def _strip_badge(dot_cls: str, label: str, value: str, title: str = "") -> str:
+def _strip_badge(dot_cls: str, label: str, value: str, title: str = "",
+                 extra_cls: str = "") -> str:
     """状态条徽章（/hl 与 /admin 两条状态条共用一种写法；admin_ui._status_strip 也用它）。"""
     t = f" title='{_esc(title)}'" if title else ""
-    return (f"<span class='badge'{t}><span class='{dot_cls}'>&#9679;</span> "
+    extra = f" {extra_cls}" if extra_cls else ""
+    return (f"<span class='badge{extra}'{t}><span class='{dot_cls}'>&#9679;</span> "
             f"{label} <b>{value}</b></span>")
 
 
-def _stuck_badge_html(system: Any) -> str:
-    """卡单徽章（P3 R2）：只在 >0 时出现在状态条（琥珀）。
+def _health_badge_html(system: Any, kill: bool = False, kill_reason: str = "") -> str:
+    """系统健康徽章（P0-2 第一层）：熔断 + 对账 + 卡单 合成一个结论。
 
-    从「系统」卡搬来 —— 口径（持续 3 分钟未推进才计入）随迁进 title（桌面增强，
-    规格 R2 明确允许）；正常态状态条不出现「卡单」字样。
+    三件事回答的是同一个问题（「系统现在能不能放心跑」），平铺三枚圆点只是刷屏：
+    正常态收成一枚绿点「系统 正常」，异常时把出问题的那几项写进值里，红色优先于
+    琥珀（熔断/对账不一致是真停手，卡单/无法核对只是需要注意）。正常态与异常态的
+    口径细节都落在 title（桌面可悬停；手机上值里已经写清了出问题的那一项）。
+
+    正常态**不出现「卡单」字样**（沿用 P3 R2 的降噪规则：正常时不该让人去猜
+    「卡单」是什么）—— 卡单只在真的 >0 时才出现在文字里（值 + title）。
+    对账仍保留三态：None（快照没读到）=「无法核对」琥珀，不是「一致」—— 把
+    「不知道」说成「没问题」比不说更糟（审核 C1 口径不变）。
     """
-    n = _opt_int(_as_dict(system).get("stuck_orders"))
-    if not n or n <= 0:
-        return ""
-    return _strip_badge("warn", "卡单", f"{n} 笔",
-                        "卡在 intent/sent 的下单：持续 3 分钟未推进才计入")
+    s = _as_dict(system)
+    mismatch = s.get("mismatch")
+    stuck = _opt_int(s.get("stuck_orders")) or 0
+    reason = str(kill_reason or "").strip()
+    parts: List[str] = []
+    notes: List[str] = []
+    dot = "pos"
+    if kill:
+        parts.append("熔断中" + (f" · {reason}" if reason else ""))
+        notes.append("熔断：已实现亏损熔断已触发，自动开仓暂停，人工确认后解除")
+        dot = "neg"
+    else:
+        notes.append("熔断：未触发")
+    if mismatch is True:
+        parts.append("对账不一致")
+        notes.append("对账：本地账与交易所快照不一致")
+        dot = "neg"
+    elif mismatch is None:
+        parts.append("对账无法核对")
+        notes.append("对账：交易所数据没读到，账实是否一致无从判断")
+        dot = "warn" if dot != "neg" else dot
+    else:
+        notes.append("对账：一致")
+    if stuck > 0:
+        parts.append(f"卡单 {stuck} 笔")
+        notes.append("卡单：持续 3 分钟未推进才计入")
+        dot = "warn" if dot != "neg" else dot
+    if not parts:
+        return _strip_badge("pos", "系统", "正常", " · ".join(notes), "badge-status")
+    return _strip_badge(dot, "系统", " · ".join(_esc(x) for x in parts),
+                        " · ".join(notes), "badge-status")
 
 
-def _agent_badge_html(agent: Any) -> str:
+def _positions_badge_html(positions: Any, mr: Any = None) -> str:
+    """持仓徽章（P0-2 第一层）：几仓、什么方向。
+
+    只做汇总：逐仓细节在「仓位」表里（那是唯一出处）。空仓给灰点「空仓」，
+    有仓给绿点「N 仓 · 多/空」—— 一眼能看出「现在手里有没有东西」。
+
+    QQQ 超跌腿（MR）与交易所仓位同一张表，所以它必须计入，否则会出现
+    「徽章说空仓、表里有一行 QQQ」的自相矛盾。MR 腿单独标出（不同策略、不同离场口径），
+    不混进「多/空」计数。
+    """
+    rows = [_as_dict(x) for x in _as_list(positions)]
+    mr_v = _mr_view({"mr": mr}) if mr else None
+    mr_hold = bool(mr_v and mr_v.get("holding"))
+    if not rows and not mr_hold:
+        return _strip_badge("muted", "持仓", "空仓", "当前没有任何持仓", "badge-status")
+    bits = ""
+    if rows:
+        longs = sum(1 for r in rows if _num(r.get("side"), 1) >= 0)
+        shorts = len(rows) - longs
+        mix = f"多{longs} · 空{shorts}" if (longs and shorts) else ("多" if longs else "空")
+        bits = f"{len(rows)} 仓 <span class='muted'>· {mix}</span>"
+    if mr_hold:
+        bits = (bits + " · " if bits else "") + "<span class='muted'>QQQ(MR)</span>"
+    return _strip_badge("pos", "持仓", bits,
+                        "当前持仓数与方向（QQQ 为超跌 MR 腿，单列）；逐仓细节见「仓位」表",
+                        "badge-status")
+
+
+def _agent_badge_html(agent: Any, extra_cls: str = "") -> str:
     """API 有效期徽章（P3 R3）：状态条是唯一常驻出处。
 
     ≤14 天琥珀、≤7 天红、已触发自动清仓红；不限期绿；读不到到期灰（如实显示，
     下一个整点会自动检查）。数字来自 hl_agent_state（DB 缓存，零网络调用）。
+    extra_cls：分层后它落在辅助层，调用方传 badge-small。
     """
     a = _as_dict(agent)
     level = str(a.get("level") or "")
     cleanup = str(a.get("cleanup") or "none")
     days = _opt_int(a.get("days_left"))
     if cleanup == "done":
-        return _strip_badge("neg", "API", "已清仓", "API 授权已到期并触发自动清仓")
+        return _strip_badge("neg", "API", "已清仓", "API 授权已到期并触发自动清仓", extra_cls)
     if str(a.get("source") or "") == "kraken-key-no-expiry":
         # Kraken Derivatives key 无有效期（PR-1），也无代理钱包授权体系
-        return _strip_badge("pos", "API", "不限期", "Kraken API key 无有效期")
+        return _strip_badge("pos", "API", "不限期", "Kraken API key 无有效期", extra_cls)
     if level == "no_expiry":
-        return _strip_badge("pos", "API", "不限期", "API 授权未设到期时间")
+        return _strip_badge("pos", "API", "不限期", "API 授权未设到期时间", extra_cls)
     if days is None:
-        return _strip_badge("muted", "API", "—", "API 授权有效期未知（每个整点自动检查）")
+        return _strip_badge("muted", "API", "—", "API 授权有效期未知（每个整点自动检查）",
+                            extra_cls)
     cls = "neg" if days <= 7 else ("warn" if days <= 14 else "pos")
     return _strip_badge(cls, "API", f"{days} 天",
-                        "API 授权剩余有效期；≤3 天且有仓位时自动清仓（关闭走 runbook §6.H 的 DB 直改）")
+                        "API 授权剩余有效期；≤3 天且有仓位时自动清仓（关闭走 runbook §6.H 的 DB 直改）",
+                        extra_cls)
 
 
 def _orders_normal(positions: List[dict], orders: List[dict]) -> bool:
@@ -1426,6 +1494,16 @@ h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
 .badge{display:inline-flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);
        border-radius:999px;padding:6px 12px;font-size:12px;white-space:nowrap}
 .badge b{font-size:13px;font-weight:600}
+/* 状态条分层（P0-2）：第一层 = 模式 / 系统健康 / 持仓 三个核心结论（.badge-status，
+   字号与常规徽章同、描边加重）；第二层 = 延迟 / API / 更新时间（.badge-small，更小更淡）。
+   两层都是 width:100% 的 flex 容器，父 .bar 的 flex-wrap 让它们各占一行 —— 不重定义
+   .bar 本身（/hl 与 /admin 共用），也不引入任何 JS。 */
+.bar-primary,.bar-secondary{display:flex;flex-wrap:wrap;gap:8px;align-items:center;width:100%}
+.bar-secondary{gap:6px 8px;padding-top:2px}
+.badge-status{border-color:var(--line)}
+.badge-small{padding:2px 9px;font-size:11px;gap:5px;color:var(--muted)}
+.badge-small b{font-size:11.5px;color:var(--fg)}
+.badge-small .muted{font-size:11px}
 .sec{font-size:11px;color:var(--muted);letter-spacing:1.5px;margin-bottom:8px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:2px 20px}
 .mrline{grid-column:1/-1;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line2);
@@ -1505,9 +1583,30 @@ details.card>summary{font-size:12px;color:var(--h2)}
 tr.subm{display:none}
 tr.subm td{white-space:normal;font-size:11px;line-height:1.4;color:var(--muted);
             overflow-wrap:anywhere}
+/* 空仓引导卡（P0-3）：空仓时替代表格 —— 说清「在等什么、离触发线还差多远」。
+   有仓时整块不渲染，所以这些规则不会影响仓位表。 */
+.card-empty-state{text-align:center;padding:24px}
+.card-empty-state h3{font-size:15px;margin:0;font-weight:600}
+.empty-icon{font-size:48px;margin-bottom:12px;line-height:1}
+.empty-desc{font-size:13px;color:var(--muted);margin:12px 0}
+.empty-desc p{margin:2px 0}
+.empty-desc b{color:var(--fg)}
+.empty-triggers{display:flex;gap:12px;justify-content:center;margin-top:16px;flex-wrap:wrap}
+.trigger-item{display:flex;flex-direction:column;gap:2px;padding:8px 12px;
+              background:var(--card2);border-radius:6px;min-width:100px}
+.trigger-item .coin{font-size:13px;font-weight:600}
+.trigger-label{font-size:11px;color:var(--muted)}
+.trigger-val{font-size:16px;font-weight:600;margin:4px 0;font-variant-numeric:tabular-nums}
+.trigger-price{font-size:11px}
 @media (max-width:640px){body{padding:9px;font-size:13px}h1{font-size:17px}
     .badge{padding:5px 10px;font-size:11px}.grid{grid-template-columns:1fr}
-    .hidem{display:none}tr.subm{display:table-row}}
+    .bar-primary,.bar-secondary{gap:6px}
+    .badge-small{padding:2px 8px}
+    .hidem{display:none}tr.subm{display:table-row}
+    .card-empty-state{padding:18px 12px}.empty-icon{font-size:40px}
+    .empty-triggers{gap:8px}
+    .trigger-item{flex:1 1 96px;min-width:88px;padding:8px 10px}
+    .trigger-val{font-size:15px}}
 """ + SYMBOL_CSS + "</style>"
 
 
@@ -1778,10 +1877,16 @@ def _merge_one(w: Dict[str, Any], st: Dict[str, Any]) -> Dict[str, Any]:
             # ③ 琥珀要「现价 < MA200」；regime_val 只在看空方向时算过，且窗口可配
             ma200 = _opt_num(vals.get("regime_val"))
     sym = str(w.get("symbol") or st.get("symbol") or "")
+    # 24h 涨跌幅（P0-1）：why 行（build_rows 现算）为主源；老快照/降级路径没有就取
+    # symbol_state（目前不带此字段 → None，卡片不渲染胶囊，绝不编数字）。
+    chg_24h = _opt_num(w.get("chg_24h"))
+    if chg_24h is None:
+        chg_24h = _opt_num(st.get("chg_24h"))
     return {
         "symbol": sym,
         "coin": str(w.get("coin") or st.get("coin") or "") or _disp(sym),
         "price": price, "sma20": sma20, "sma200": ma200,
+        "chg_24h": chg_24h,
         "long_trigger": long_trig, "short_trigger": short_trig,
         "dense_cnt": dense,
         "band_cur": _opt_num(w.get("band_cur")),
@@ -1838,10 +1943,22 @@ def _sym_card(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]] = None,
     st_txt, st_cls, st_title = _sym_state(r)
     title_attr = f" title=\"{_esc(st_title)}\"" if st_title else ""
     name = _esc(r.get("coin") or _disp(r.get("symbol")) or "—")
-    o = [("<div class=\"sym\"><div class=\"sym-h\">"
-          f"<span class=\"nm\">{name}</span>"
-          f"<span class=\"st {st_cls}\"{title_attr}>{st_txt}</span>"
-          f"<span class=\"px\">{_fmt(price)}</span></div>")]
+    # 24h 涨跌幅（P0-1）：有值才渲染胶囊 —— 数据缺失时宁可少一块，也不写「—%」
+    # 让人以为「涨跌幅是 0」。颜色只借语义变量：正 pos / 负 neg / 平 muted。
+    chg = _opt_num(r.get("chg_24h"))
+    if chg is None:
+        chg_html = ""
+    else:
+        ccls = "pos" if chg > 0 else ("neg" if chg < 0 else "muted")
+        chg_html = (f'<span class="chg {ccls}" title="近 24 小时涨跌幅'
+                    f'（4h 收盘口径：现价 vs 24h 前那根收盘）">{chg:+.1f}%</span>')
+    # 现价与标的名**同一行**（flex，现价 margin-left:auto 贴右）：24px 大字是全卡
+    # 第一眼锚点（P0-1），状态词/涨跌幅留在左侧与名字同基线。
+    o = [(f'<div class="sym"><div class="sym-h">'
+          f'<span class="nm">{name}</span>'
+          f'<span class="st {st_cls}"{title_attr}>{st_txt}</span>'
+          f'{chg_html}'
+          f'<span class="px-large">{_fmt(price)}</span></div>')]
     if price is not None and price > 0:
         if status == "pending":
             # pending 占着仓位槽：确认前根本不会评估新入场，距离行是假信息
@@ -2287,6 +2404,73 @@ def _dd_line_html(meta: Dict[str, Any]) -> str:
 
 
 
+def _empty_positions_html(p: dict, reachable: bool) -> str:
+    """空仓引导卡（P0-3）：空仓时回答「在等什么、还差多远」。
+
+    只在**确实没有仓**（无交易所仓位、也无 QQQ MR 腿）时渲染；有仓时表格自己说话，
+    本卡整块不出现 —— 同一屏不出现两套「现在什么状态」。
+
+    reachable=False → 简化版：交易所读不到就**不知道**有没有仓，绝不能写「交易所无持仓」
+    （把「不知道」说成「没有」）；此时 symbol_state 缓存也可能过期，距离一概不展示。
+
+    距离口径复用 ``_need_pct``（上破 = (线−现价)/现价、下破 = (现价−线)/现价），
+    与「三标的动态」卡里的 ②③ 两行同一套算法，不做第二套算术。
+    """
+    if not reachable:
+        return ("<div class='card card-empty-state'>"
+                "<div class='empty-icon'>&#128225;</div>"
+                "<h3>交易所数据暂不可读</h3>"
+                "<div class='empty-desc'>"
+                "<p>当前持仓 <b>无法确认</b>（不是「已确认空仓」）</p>"
+                "<p>恢复读取后本卡自动换成实时状态 · 信号 / 下单 / 成交见「记录」页</p>"
+                "</div></div>")
+
+    rows = [_as_dict(x) for x in _as_list(p.get("symbol_state"))]
+    coins = [str(r.get("coin") or _disp(r.get("symbol")) or "").strip() for r in rows]
+    coins = [c for c in coins if c]
+    watch = " / ".join(coins) if coins else "—"
+
+    items: List[str] = []
+    for r in rows:
+        coin = str(r.get("coin") or _disp(r.get("symbol")) or "").strip()
+        if not coin:
+            continue
+        px = _opt_num(r.get("price"))
+        parts = [f"<span class='coin'>{_esc(coin)}</span>"]
+        # (标签, 到位文案, 颜色, 所需幅度)：上破绿 / 下破红，与全站方向配色一致
+        for label, hit, cls, need in (
+                ("上破还差", "已上破", "pos",
+                 _need_pct("break_up", px, r.get("long_trigger"))),
+                ("下破还差", "已下破", "neg",
+                 _need_pct("break_down", px, r.get("short_trigger")))):
+            parts.append(f"<span class='trigger-label'>{label}</span>")
+            if need is None:
+                # 触发线没算/没缓存：如实「—」，不拿 0 代替
+                parts.append("<span class='trigger-val muted'>—</span>")
+            elif need <= 0:
+                parts.append(f"<span class='trigger-val {cls}'>{hit}</span>")
+            else:
+                parts.append(f"<span class='trigger-val {cls}'>{need:+.1f}%</span>")
+        parts.append(f"<span class='trigger-price muted'>现价 {_fmt(px)}</span>")
+        items.append("<div class='trigger-item'>" + "".join(parts) + "</div>")
+
+    trig_html = ("<div class='empty-triggers'>" + "".join(items) + "</div>"
+                 if items else
+                 "<div class='empty-triggers'><span class='muted'>"
+                 "行情缓存暂无记录，下一轮 tick 后显示距离</span></div>")
+    return ("<div class='card card-empty-state'>"
+            "<div class='empty-icon'>&#128269;</div>"
+            f"<h3>正在监控 {_esc(watch)}</h3>"
+            "<div class='empty-desc'>"
+            "<p>策略：4h 密集突破自动开仓</p>"
+            "<p>等待：6 均线密集满 6 根 + 收盘突破触发线</p>"
+            "</div>"
+            + trig_html +
+            "<div class='empty-desc'><p>"
+            "<span class='muted'>信号 / 下单 / 成交见「记录」页</span></p></div>"
+            "</div>")
+
+
 def _render_body(p: dict) -> str:
     mode = str(p.get("mode") or "off")
     # 该 venue 有没有出入金流水端点（Kraken 期货 = 没有）。面板据此整块不画
@@ -2304,10 +2488,8 @@ def _render_body(p: dict) -> str:
     reachable = bool(net.get("reachable"))
     latency = _opt_num(net.get("latency_ms"))
     error = str(net.get("error") or "")
-    # 对账三态（审核 C1）：True 不一致 / False 一致 / None 无法核对（快照没读到）。
-    # 以前 None 被 bool() 折成 False，顶部状态条会打「对账 一致」——把「不知道」
-    # 说成「没问题」。现在如实说「无法核对」（琥珀点，不是红色：没有证据说明出事）。
-    mismatch = system.get("mismatch")
+    # 对账三态（审核 C1：True 不一致 / False 一致 / None 无法核对）的展示口径已搬进
+    # _health_badge_html —— 状态条合并成一枚「系统」徽章后，本函数不再直接判对账。
     pnl_all = _curve_points(curve.get("pnl"))
     twr_all = _curve_points(curve.get("twr"))
     # 时间窗（P1）：GET span ∈ 7/30/all，缺参/非法值回落 7（normalize_span 白名单）。
@@ -2317,23 +2499,19 @@ def _render_body(p: dict) -> str:
     o: List[str] = []
     o.append(H1_BLOCK)
 
-    # ---------------- 顶部状态条 ----------------
+    # ---------------- 顶部状态条（P0-2：两层） ----------------
+    # 第一层 3 个核心结论：模式 / 系统健康（熔断+对账+卡单 已合并成一句）/ 持仓。
+    # 第二层辅助读数（字号更小）：Kraken 延迟 / API 有效期 / 更新时间。
+    # 两层都是 width:100% 的 flex 容器，靠父 .bar 的 flex-wrap 各占一行 —— .bar 本身
+    # 的规则不动（/hl 与 /admin 共用同一份 CSS，admin 的状态条也是同一个结构）。
     o.append("<div class='bar'>")
-    o.append(_badge(_MODE_CLS.get(mode, "muted"), "模式", _esc(_MODE_TXT.get(mode, mode))))
-    if kill:
-        extra = f" <span class='muted'>{_esc(kill_reason)}</span>" if kill_reason else ""
-        o.append(f"<span class='badge'><span class='neg'>&#9679;</span> 熔断 <b>已触发</b>{extra}</span>")
-    else:
-        o.append(_badge("pos", "熔断", "未触发"))
-    if mismatch is None:
-        o.append("<span class='badge' title='交易所数据没读到，账实是否一致无从判断'>"
-                 "<span class='warn'>&#9679;</span> 对账 <b>无法核对</b></span>")
-    elif mismatch:
-        o.append("<span class='badge'><span class='neg'>&#9679;</span> 对账 <b>不一致</b></span>")
-    else:
-        o.append("<span class='badge'><span class='pos'>&#9679;</span> 对账 <b>一致</b></span>")
-    # 卡单徽章（P3 R2）：只在 >0 时出现，正常态状态条不出现「卡单」字样。
-    o.append(_stuck_badge_html(system))
+    o.append("<span class='bar-primary'>")
+    o.append(_badge(_MODE_CLS.get(mode, "muted"), "模式", _esc(_MODE_TXT.get(mode, mode)),
+                    "badge-status"))
+    o.append(_health_badge_html(system, kill, kill_reason))
+    o.append(_positions_badge_html(positions, p.get("mr")))
+    o.append("</span>")
+    o.append("<span class='bar-secondary'>")
     lat_txt = f"{latency:.0f} ms" if latency is not None else "—"
     # 这是「服务器 → Kraken」的耗时（容器每次拉账户快照的开销），不是你到面板的网络延迟。
     # 快照模式（阶段 B）下本次渲染没访交易所，数字来自调度器上一轮的实测，标题必须说清。
@@ -2342,13 +2520,13 @@ def _render_body(p: dict) -> str:
     else:
         lat_title = ("oracle1 上的容器请求 Kraken /derivatives 的耗时（含失败重试）；"
                      "与你的浏览器到本站的延迟无关")
-    o.append(f"<span class='badge' title='{_esc(lat_title)}'>"
-             f"<span class='{('pos' if latency is not None else 'muted')}'>&#9679;</span>"
-             f" Kraken 延迟 <b>{lat_txt}</b></span>")
+    o.append(_strip_badge("pos" if latency is not None else "muted", "Kraken 延迟", lat_txt,
+                          lat_title, "badge-small"))
     # API 有效期徽章（P3 R3）：唯一常驻出处（原「API 有效期」卡降级为总览末尾的 details）。
-    o.append(_agent_badge_html(p.get("agent")))
-    o.append(f"<span class='badge'><span class='muted'>&#9679;</span> 更新 "
-             f"<b>{_fmt_dt(p.get('ts'))}</b></span>")
+    o.append(_agent_badge_html(p.get("agent"), "badge-small"))
+    o.append(_strip_badge("muted", "更新", _fmt_dt(p.get("ts")),
+                          "本页数据的生成时刻（北京时间）", "badge-small"))
+    o.append("</span>")
     o.append("</div>")
 
     if not reachable:
@@ -2362,104 +2540,106 @@ def _render_body(p: dict) -> str:
     # 不复制第二套「手机版表」。
     # 「本单资金费」列：数据源是交易所资金费流水；Kraken 期货 `user_funding_history`
     # 恒空 → 整列不渲染（表头 / 单元格 / 小字行 / colspan 四处同步，不留空列错位）。
-    show_fund_col = not no_flows
-    ncol = 13 if show_fund_col else 12
-    o.append("<h2>仓位</h2>")
-    o.append("<div class='tscroll'><div class='tablewrap'><table><thead><tr>"
-             "<th>币种</th><th>方向</th><th class='num hidem'>数量</th><th class='num'>入场</th>"
-             "<th class='num'>标记</th><th class='num'>浮盈浮亏</th><th class='num'>R</th>"
-             "<th class='num'>止损</th><th class='num'>止损距离</th><th class='num hidem'>杠杆</th>"
-             "<th class='num hidem'>保证金</th><th class='num hidem'>强平价</th>"
-             + ("<th class='num hidem'>本单资金费</th>" if show_fund_col else "")
-             + "</tr></thead><tbody>")
-    for pos in (_as_dict(x) for x in positions):
-        upnl_txt, upnl_cls = _sign(pos.get("unrealized_pnl"))
-        side_txt = "多" if _num(pos.get("side"), 1) >= 0 else "空"
-        dist = _opt_num(pos.get("stop_dist_pct"))
-        r_txt, r_cls = _sign(pos.get("r_unrealized"), "R")
-        # 本单资金费（正=收入）：交易所 cumFunding.sinceOpen 已在 status_payload
-        # 换算成收入视角；交易所没给（老快照）就如实显示「—」，不猜 0。
-        # Kraken 期货没有资金费流水 → 该列整列不渲染（fund_txt 仍算，仅小字行用）。
-        fund_txt, fund_cls = _sign(pos.get("funding_income"))
-        # ROE%（对齐 HL 网页习惯）＝ 浮盈 ÷ 本仓保证金。保证金 0/取不到时只显 U
-        # 不显 % —— 除数都没有，百分比是编出来的。
-        margin_v = _opt_num(pos.get("margin_used"))
-        upnl_v = _opt_num(pos.get("unrealized_pnl"))
-        roe_txt = (f" · {upnl_v / margin_v * 100.0:+.2f}%"
-                   if margin_v and upnl_v is not None else "")
-        if pos.get("has_stop"):
-            stop_cell = f"<span class='pos'>&#10004;&#65039; {_fmt(pos.get('stop_px'))}</span>"
-        elif pos.get("stop_unknown"):
-            stop_cell = "<span class='muted'>? 无法确认</span>"
-        else:
-            stop_cell = "<span class='neg'>&#10060; 无</span>"
-        o.append("<tr>"
-                 + _td(f"<b>{_esc(pos.get('coin') or '—')}</b>")
-                 + _td(f"<b>{side_txt}</b>")
-                 + _td(_fmt_sz(pos.get("size")), "num hidem")
-                 + _td(_fmt(pos.get("entry_px")), "num")
-                 + _td(_fmt(pos.get("mark_px")), "num")
-                 + _td(upnl_txt + roe_txt, f"num {upnl_cls}".strip())
-                 + _td(r_txt, f"num {r_cls}".strip())
-                 + _td(stop_cell, "num")
-                 + _td(f"{dist * 100:.2f}%" if dist is not None else "—", "num")
-                 + _td(_lev_text(pos)
-                       + (" <span class='muted'>逐</span>" if pos.get("isolated") else ""),
-                       "num hidem")
-                 + _td(_fmt(pos.get("margin_used")), "num hidem")
-                 + _td(_fmt(pos.get("liq_px")) if _opt_num(pos.get("liq_px")) else "—",
-                       "num hidem")
-                 + (_td(fund_txt, f"num hidem {fund_cls}".strip()) if show_fund_col else "")
-                 + "</tr>")
-        # 小字行：与表格同一份 payload 数值、同一套格式化函数（同一事实一种写法），
-        # 只是载体不同 —— 窄屏隐藏列时由它补足，宽屏整个 <tr> 被 CSS 藏掉。
-        subm_fund = f" · 本单资金费 {fund_txt}" if show_fund_col else ""
-        o.append(f"<tr class='subm'><td colspan='{ncol}'>"
-                 f"数量 {_fmt_sz(pos.get('size'))} · "
-                 f"{_lev_text(pos, long=True)}"
-                 f"{' 逐' if pos.get('isolated') else ''} · "
-                 f"保证金 {_fmt(pos.get('margin_used'))} U · "
-                 f"强平 {_fmt(pos.get('liq_px')) if _opt_num(pos.get('liq_px')) else '—'}"
-                 f"{subm_fund}</td></tr>")
+    # QQQ MR 腿与交易所仓位同一张表：先取视图，供「有没有仓」判定与表格行共用。
     mr = _mr_view(p)
-    if mr is not None and mr["holding"]:
-            upnl_txt, upnl_cls = _sign(mr["upnl"])
-            pct = mr["upnl_pct"]
-            # MR 腿的 upnl_pct 是「价格涨跌幅」口径（mr.py 按 (mark-entry)/entry 算），
-            # 没有「浮盈 ÷ 保证金」的 ROE 分母 —— 不标注会被下面的 ROE 图例带偏（2026-11-07）。
-            pct_txt = (f" · {pct:+.2f}%（价格）" if pct is not None else "")
-            dist_txt = (f"{mr['dist_to_exit_pct']:+.2f}%"
-                        if mr["dist_to_exit_pct"] is not None else "—")
+    has_pos = bool(positions) or (mr is not None and mr["holding"])
+    o.append("<h2>仓位</h2>")
+    if not has_pos:
+        # 空仓：一张只有表头的空表说不出任何事 —— 换成引导卡（在等什么、还差多远）。
+        o.append(_empty_positions_html(p, reachable))
+    else:
+        show_fund_col = not no_flows
+        ncol = 13 if show_fund_col else 12
+        o.append("<div class='tscroll'><div class='tablewrap'><table><thead><tr>"
+                 "<th>币种</th><th>方向</th><th class='num hidem'>数量</th><th class='num'>入场</th>"
+                 "<th class='num'>标记</th><th class='num'>浮盈浮亏</th><th class='num'>R</th>"
+                 "<th class='num'>止损</th><th class='num'>止损距离</th><th class='num hidem'>杠杆</th>"
+                 "<th class='num hidem'>保证金</th><th class='num hidem'>强平价</th>"
+                 + ("<th class='num hidem'>本单资金费</th>" if show_fund_col else "")
+                 + "</tr></thead><tbody>")
+        for pos in (_as_dict(x) for x in positions):
+            upnl_txt, upnl_cls = _sign(pos.get("unrealized_pnl"))
+            side_txt = "多" if _num(pos.get("side"), 1) >= 0 else "空"
+            dist = _opt_num(pos.get("stop_dist_pct"))
+            r_txt, r_cls = _sign(pos.get("r_unrealized"), "R")
+            # 本单资金费（正=收入）：交易所 cumFunding.sinceOpen 已在 status_payload
+            # 换算成收入视角；交易所没给（老快照）就如实显示「—」，不猜 0。
+            # Kraken 期货没有资金费流水 → 该列整列不渲染（fund_txt 仍算，仅小字行用）。
+            fund_txt, fund_cls = _sign(pos.get("funding_income"))
+            # ROE%（对齐 HL 网页习惯）＝ 浮盈 ÷ 本仓保证金。保证金 0/取不到时只显 U
+            # 不显 % —— 除数都没有，百分比是编出来的。
+            margin_v = _opt_num(pos.get("margin_used"))
+            upnl_v = _opt_num(pos.get("unrealized_pnl"))
+            roe_txt = (f" · {upnl_v / margin_v * 100.0:+.2f}%"
+                       if margin_v and upnl_v is not None else "")
+            if pos.get("has_stop"):
+                stop_cell = f"<span class='pos'>&#10004;&#65039; {_fmt(pos.get('stop_px'))}</span>"
+            elif pos.get("stop_unknown"):
+                stop_cell = "<span class='muted'>? 无法确认</span>"
+            else:
+                stop_cell = "<span class='neg'>&#10060; 无</span>"
             o.append("<tr>"
-                     + _td("<b>QQQ</b> <span class='muted'>MR</span>")
-                     + _td("<b>多</b>")
-                     + _td(_fmt_sz(mr.get("qty")), "num hidem")
-                     + _td(_fmt(mr.get("entry")), "num")
-                     + _td(_fmt(mr.get("mark")), "num")
-                     + _td(upnl_txt + pct_txt, f"num {upnl_cls}".strip())
-                     + _td("—", "num")
-                     + _td("<span class='muted'>—</span>", "num")
-                     + _td("—", "num")
-                     + _td(_lev_text({"leverage": mr.get("leverage")}),
+                     + _td(f"<b>{_esc(pos.get('coin') or '—')}</b>")
+                     + _td(f"<b>{side_txt}</b>")
+                     + _td(_fmt_sz(pos.get("size")), "num hidem")
+                     + _td(_fmt(pos.get("entry_px")), "num")
+                     + _td(_fmt(pos.get("mark_px")), "num")
+                     + _td(upnl_txt + roe_txt, f"num {upnl_cls}".strip())
+                     + _td(r_txt, f"num {r_cls}".strip())
+                     + _td(stop_cell, "num")
+                     + _td(f"{dist * 100:.2f}%" if dist is not None else "—", "num")
+                     + _td(_lev_text(pos)
+                           + (" <span class='muted'>逐</span>" if pos.get("isolated") else ""),
                            "num hidem")
-                     + _td(_fmt(mr.get("margin")), "num hidem")
-                     + _td("—", "num hidem")
-                     + (_td("—", "num hidem") if show_fund_col else "")
+                     + _td(_fmt(pos.get("margin_used")), "num hidem")
+                     + _td(_fmt(pos.get("liq_px")) if _opt_num(pos.get("liq_px")) else "—",
+                           "num hidem")
+                     + (_td(fund_txt, f"num hidem {fund_cls}".strip()) if show_fund_col else "")
                      + "</tr>")
+            # 小字行：与表格同一份 payload 数值、同一套格式化函数（同一事实一种写法），
+            # 只是载体不同 —— 窄屏隐藏列时由它补足，宽屏整个 <tr> 被 CSS 藏掉。
+            subm_fund = f" · 本单资金费 {fund_txt}" if show_fund_col else ""
             o.append(f"<tr class='subm'><td colspan='{ncol}'>"
-                     f"离场线(SMA5) {_fmt(mr.get('exit_line'))} · 距离场 {dist_txt} · "
-                     f"数量 {_fmt_sz(mr.get('qty'))} · 保证金 {_fmt(mr.get('margin'))} U · "
-                     f"下一次评估 {_et_iso_local(mr.get('next_eval_et'))}</td></tr>")
-    if not positions and not (mr is not None and mr["holding"]):
-        o.append(f"<tr><td colspan='{ncol}' class='muted'>"
-                 f"{'交易所无持仓' if reachable else '交易所数据暂不可读'}"
-                 f"（信号 / 下单 / 成交见「记录」页）</td></tr>")
-    o.append("</tbody></table></div></div>")
-    # 图例（可见文字，iOS 无悬停）：ROE 口径收口 + 窄屏小字行的存在说明。
-    o.append('<div class="legend">浮盈 % = 浮盈 ÷ 保证金（ROE）· '
-             'QQQ 行标注「（价格）」的 % 是价格涨跌幅（无保证金分母，非 ROE）· '
-             '窄屏隐藏列的数值见各仓下方小字行 · '
-             'QQQ(MR) 腿不加止损，按收盘价与 SMA5 判离场</div>')
+                     f"数量 {_fmt_sz(pos.get('size'))} · "
+                     f"{_lev_text(pos, long=True)}"
+                     f"{' 逐' if pos.get('isolated') else ''} · "
+                     f"保证金 {_fmt(pos.get('margin_used'))} U · "
+                     f"强平 {_fmt(pos.get('liq_px')) if _opt_num(pos.get('liq_px')) else '—'}"
+                     f"{subm_fund}</td></tr>")
+        if mr is not None and mr["holding"]:
+                upnl_txt, upnl_cls = _sign(mr["upnl"])
+                pct = mr["upnl_pct"]
+                # MR 腿的 upnl_pct 是「价格涨跌幅」口径（mr.py 按 (mark-entry)/entry 算），
+                # 没有「浮盈 ÷ 保证金」的 ROE 分母 —— 不标注会被下面的 ROE 图例带偏（2026-11-07）。
+                pct_txt = (f" · {pct:+.2f}%（价格）" if pct is not None else "")
+                dist_txt = (f"{mr['dist_to_exit_pct']:+.2f}%"
+                            if mr["dist_to_exit_pct"] is not None else "—")
+                o.append("<tr>"
+                         + _td("<b>QQQ</b> <span class='muted'>MR</span>")
+                         + _td("<b>多</b>")
+                         + _td(_fmt_sz(mr.get("qty")), "num hidem")
+                         + _td(_fmt(mr.get("entry")), "num")
+                         + _td(_fmt(mr.get("mark")), "num")
+                         + _td(upnl_txt + pct_txt, f"num {upnl_cls}".strip())
+                         + _td("—", "num")
+                         + _td("<span class='muted'>—</span>", "num")
+                         + _td("—", "num")
+                         + _td(_lev_text({"leverage": mr.get("leverage")}),
+                               "num hidem")
+                         + _td(_fmt(mr.get("margin")), "num hidem")
+                         + _td("—", "num hidem")
+                         + (_td("—", "num hidem") if show_fund_col else "")
+                         + "</tr>")
+                o.append(f"<tr class='subm'><td colspan='{ncol}'>"
+                         f"离场线(SMA5) {_fmt(mr.get('exit_line'))} · 距离场 {dist_txt} · "
+                         f"数量 {_fmt_sz(mr.get('qty'))} · 保证金 {_fmt(mr.get('margin'))} U · "
+                         f"下一次评估 {_et_iso_local(mr.get('next_eval_et'))}</td></tr>")
+        o.append("</tbody></table></div></div>")
+        # 图例（可见文字，iOS 无悬停）：ROE 口径收口 + 窄屏小字行的存在说明。
+        o.append('<div class="legend">浮盈 % = 浮盈 ÷ 保证金（ROE）· '
+                 'QQQ 行标注「（价格）」的 % 是价格涨跌幅（无保证金分母，非 ROE）· '
+                 '窄屏隐藏列的数值见各仓下方小字行 · '
+                 'QQQ(MR) 腿不加止损，按收盘价与 SMA5 判离场</div>')
 
     # ---------------- 账户卡片（P2：分层 + 消重复；P3 R4/R5：折叠 + 主从）----------------
     # 分两层：顶层关键数（大字，手机一眼读）＋ 次级项收进 <details>「资金明细」

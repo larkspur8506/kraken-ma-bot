@@ -193,19 +193,26 @@ class TestKillBadge(unittest.TestCase):
 
     def test_kill_triggered_reason_visible(self):
         html = self._strip(True, "当日亏损熔断")
-        self.assertIn("熔断 <b>已触发 · 当日亏损熔断</b>", html)
-        # title 保留（桌面增强）
-        self.assertIn("title='当日亏损熔断'", html)
+        # P0-2：熔断/对账/卡单合成「系统」结论，原因写进值里（手机上也可见），
+        # 不再只在 title。title 保留完整的口径说明（桌面增强）。
+        self.assertIn("系统 <b>熔断中 · 当日亏损熔断", html)
+        self.assertIn("title='熔断：已实现亏损熔断已触发", html)
 
     def test_kill_triggered_without_reason(self):
         html = self._strip(True, "")
-        self.assertIn("熔断 <b>已触发</b>", html)
-        self.assertNotIn("已触发 ·", html)
+        self.assertIn("系统 <b>熔断中", html)
+        # 无原因时不能留下空段或把上一个用例的原因带出来
+        self.assertNotIn("当日亏损熔断", html)
+        self.assertNotIn(" ·  · ", html)
 
     def test_kill_not_triggered_unchanged(self):
         html = self._strip(False, "旧原因")
-        self.assertIn("熔断 <b>未触发</b>", html)
+        # 未触发：值里不出现「熔断中/已触发」，旧 reason 不泄漏；
+        # 口径在 title 里写「熔断：未触发」。
+        self.assertNotIn("熔断中", html)
         self.assertNotIn("已触发", html)
+        self.assertNotIn("旧原因", html)
+        self.assertIn("熔断：未触发", html)
 
 
 if __name__ == "__main__":                                   # pragma: no cover

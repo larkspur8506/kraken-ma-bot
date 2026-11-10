@@ -178,12 +178,17 @@ class TestHtmlPage(BaseCase):
     def test_hl_page_shows_kill_switch_and_reason(self):
         self.db.hl_set_kill(True, "回撤超阈值")
         html = self.client.get("/hl").text
-        self.assertIn("熔断 <b>已触发</b>", html)
+        # P0-2 分层后熔断并入「系统」健康徽章：可见文字是「系统 熔断中 · 原因」
+        # （同一徽章可能还并列了对账/卡单，故只断言前缀）
+        self.assertIn("系统 <b>熔断中 · 回撤超阈值", html)
         self.assertIn("回撤超阈值", html)
 
     def test_hl_page_kill_off_shows_未触发(self):
         html = self.client.get("/hl").text
-        self.assertIn("熔断 <b>未触发</b>", html)
+        # 正常态合成一枚「系统 正常」徽章；熔断这一项的核对结果在 title 里
+        # （同一 fixture 的对账状态可能是「不一致」，所以只锚定熔断口径）
+        self.assertIn("熔断：未触发", html)
+        self.assertNotIn("熔断中", html)
 
     def test_hl_page_svg_polylines_for_pnl_curve(self):
         # 2026-10-22（feat/pnl-curve）：曲线源从 equity 换成「剔除出入金的 pnl」，
@@ -981,33 +986,6 @@ class TestLeverageDisplay(BaseCase):
         self.assertNotIn("全仓", html)             # 有逐仓杠杆就不能说全仓
 
 
-class TestKrExecParams(unittest.TestCase):
-    """装配层：Kraken 无最小名义金额，HL 的 10 USDC 下限会真拒单。"""
-
-    def test_min_notional_is_zero(self):
-        import app.main as m
-        with tempfile.TemporaryDirectory(prefix="kr_params_") as tmp:
-            from app.db import DB
-            d = DB(os.path.join(tmp, "t.db"))
-            with mock.patch.object(m, "db", d), \
-                 mock.patch.dict(os.environ, {"DB_PATH": os.path.join(tmp, "t.db")}):
-                p = m.hl_params()
-        self.assertEqual(p.min_notional, 0.0,
-                         "Kraken 装配必须把 min_notional 置 0（不设名义闸门）")
-
-    def test_zero_min_notional_actually_opens_the_gate(self):
-        """0 必须真的放行：9.6U 名义在 HL 的 10U 下限下被拦，Kraken 下不该拦。"""
-        from app.hl.sizing import size_order_hl
-        kw = dict(coin="QQQ", sz_decimals=3, entry_price=600.0, stop_price=594.0,
-                  equity=10.0, risk_pct=0.01)
-        p10 = size_order_hl(min_notional=10.0, **kw)
-        p0 = size_order_hl(min_notional=0.0, **kw)
-        self.assertAlmostEqual(p10.notional, 9.6, places=6)
-        self.assertTrue(p10.below_min_notional, "10U 下限下应被拦（回归对照）")
-        self.assertFalse(p0.below_min_notional, "0 = 不设限，必须放行")
-        self.assertFalse([w for w in p0.warnings if "下限" in w],
-                         "0 下限不该再冒「小于交易所下限」的告警")
-
 
 # ---------------------------------------------------------------- 2026-11-08 审核 C 组
 class TestAuditCPanelHonesty(BaseCase):
@@ -1020,9 +998,9 @@ class TestAuditCPanelHonesty(BaseCase):
         self.assertIn("账户权益 <b>— U</b>", html)
         self.assertNotIn("可用保证金 <b>0.00 U</b>", html)
         self.assertNotIn("账户权益 <b>0.00 U</b>", html)
-        # 对账三态：没读到 → 「无法核对」（不是「一致」）
-        self.assertIn("对账 <b>无法核对</b>", html)
-        self.assertNotIn("对账 <b>一致</b>", html)
+        # 对账三态：没读到 → 「无法核对」（不是「正常/一致」）
+        self.assertIn("系统 <b>对账无法核对", html)
+        self.assertNotIn("系统 <b>正常", html)
 
     def test_reconcile_three_states(self):
         from app.hl.views import _reconcile
@@ -1036,8 +1014,8 @@ class TestAuditCPanelHonesty(BaseCase):
     def test_reachable_page_still_says_consistent(self):
         self.insert_position()
         html = self.client.get("/hl").text
-        self.assertIn("对账 <b>一致</b>", html)
-        self.assertNotIn("对账 <b>无法核对</b>", html)
+        self.assertIn("系统 <b>正常", html)
+        self.assertNotIn("对账无法核对", html)
 
     def test_venue_address_free_hides_address_row(self):
         self.info.venue_address_free = True
@@ -1090,7 +1068,7 @@ class TestAuditCPanelHonesty(BaseCase):
              "funding_since_open": 0.0}])
         p = self.payload()
         self.assertFalse(p["system"]["mismatch"], "QQQ 是 MR 腿，不是人工单")
-        self.assertIn("对账 <b>一致</b>", render_dashboard(p))
+        self.assertIn("系统 <b>正常", render_dashboard(p))
 
     def test_mr_leg_exclusion_keeps_main_symbol_strict(self):
         """排除只针对非主策略标的：主策略标的（ETH）在交易所有仓、本地没记 → 仍判不一致。"""

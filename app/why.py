@@ -129,6 +129,35 @@ def _position_part(db: Any, symbol: str) -> Tuple[Optional[Dict[str, Any]], str]
     return pos, note
 
 
+def _chg_24h(bars: Sequence[strategy.Bar]) -> Optional[float]:
+    """近 24 小时涨跌幅（%，最新价 vs 24h 前那根 4h 收盘）。
+
+    面板三标的卡要显示「这一根 4h 之外的 24h 视角」（P0-1），而 symbol_state 只存
+    现价/触发线，没有历史收盘 —— 唯一现成的历史就在 build_rows 已经抓到的 bars 里，
+    所以在这里补一个**纯展示字段**：不参与任何判定，也不改 strategy 的口径。
+
+    口径：取 open_ms ≤ 最新一根 open_ms − 24h 的**最后一根**收盘作分母（4h 网格上即
+    倒数第 7 根）。根数不足 / 分母非正 / 解析失败 → None（面板宁可不显示，也不编一个数）。
+    """
+    if not bars or len(bars) < 2:
+        return None
+    try:
+        last = float(bars[-1].close)
+        last_ms = int(bars[-1].open_ms)
+        cutoff = last_ms - 24 * 3600 * 1000
+        prev: Optional[float] = None
+        for b in bars:
+            if int(b.open_ms) <= cutoff:
+                prev = float(b.close)
+            else:
+                break
+        if prev is None or prev <= 0 or last <= 0:
+            return None
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return (last - prev) / prev * 100.0
+
+
 def why_row(db: Any, cfg: Any, symbol: str, bars: Sequence[strategy.Bar]) -> Dict[str, Any]:
     """单个标的的诊断行（纯计算 + 只读 DB 查询；行情由调用方给，便于测试与复用）。
 
@@ -183,6 +212,7 @@ def why_row(db: Any, cfg: Any, symbol: str, bars: Sequence[strategy.Bar]) -> Dic
         "price": float(bars[-1].close) if bars else None,
         "bars": len(bars),
         "sma20": sma20,
+        "chg_24h": _chg_24h(bars),
         "band_cur": band_cur,
         "thr_cur": thr_cur,
         "min_squeeze_bars": int(cfg.min_squeeze_bars),
@@ -272,7 +302,8 @@ def build_rows(db: Any, cfg: Any, symbols: Optional[Sequence[str]] = None,
             e = bars if isinstance(bars, Exception) else RuntimeError("未取到行情")
             logger.warning("[why] %s 取行情失败：%s", symbol, e)
             rows.append({"symbol": symbol, "coin": coin, "price": None, "bars": 0,
-                         "sma20": None, "why": None, "position": None, "note": "",
+                         "sma20": None, "chg_24h": None,
+                         "why": None, "position": None, "note": "",
                          "error": f"{type(e).__name__}: {e}",
                          "gates": gates_for(db, cfg, coin), "gate_side": 0, "gate": None})
             continue
@@ -291,14 +322,17 @@ def build_rows(db: Any, cfg: Any, symbols: Optional[Sequence[str]] = None,
             # 一起冻 4 小时，面板会显示一个几小时前的价格，而去查看盘面却对不上。
             # 现价取本轮 feeds 的最新一根（它有自己的 900s TTL），六步结论仍走缓存。
             row["price"] = float(bars[-1].close)
+            # 24h 涨跌幅同理现读：缓存键是最后一根已收盘 bar（一根 4h），但涨跌幅是
+            # 滚动 24h 窗口，冻 4 小时会显示成「几小时前的涨跌幅」。
+            row["chg_24h"] = _chg_24h(bars)
         else:
             try:
                 row = why_row(db, cfg, symbol, bars)
             except Exception as e:                                # noqa: BLE001
                 logger.exception("[why] %s 诊断计算失败：%s", symbol, e)
                 rows.append({"symbol": symbol, "coin": coin, "price": None,
-                             "bars": len(bars), "sma20": None, "why": None,
-                             "position": None, "note": "",
+                             "bars": len(bars), "sma20": None, "chg_24h": None,
+                             "why": None, "position": None, "note": "",
                              "error": f"{type(e).__name__}: {e}",
                              "gates": {}, "gate_side": 0, "gate": None})
                 continue
