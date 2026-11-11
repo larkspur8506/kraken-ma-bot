@@ -763,6 +763,29 @@ def _start_why_preheat() -> Optional[threading.Thread]:
     return th
 
 
+def _start_mr_startup_tick() -> Optional[threading.Thread]:
+    """启动即跑一轮 MR tick，消除「首次排程 tick 之前 mr 状态为空」的冷启动窗口。
+
+    为什么需要（2026-11-11 取证）：`_MR_STATUS` 初始化是空 dict（585 行），只有
+    `_job_mr_tick` 跑完才整体重绑；而排程是 `CronTrigger(minute="2-59/5")`，
+    重启落在窗口外就要**等到下一个 ≡2 mod 5 的分钟**。实测 03:36:23 起容器、
+    03:37:23 起调度器、03:42:00 才首次 tick 完成 —— 窗口 4m39s，最坏接近 5 分钟。
+    这期间：
+
+      * `/api/hl/status` 的 `mr` 是 null → 探针 `d.get("mr") or {}` 读成
+        `off:?`（稳态是 `on:flat`）→ monitor 写一次假 pending，每次重启都白
+        唤醒一次值班；
+      * `_mr_margin_used()` 恒 0 → 主策略定仓不扣 MR 占用（略超配）。
+
+    线程而非同步：tick 要读账户与行情（实测 0.8~2.3s），不能拖住 startup；
+    它自己会拿 `_tick_lock`，与主策略 tick / hl_monitor 串行，不会并发下单。
+    只在调度器启用时调用（`ENABLE_SCHEDULER=false` 的隔离冒烟绝不触网）。
+    """
+    th = threading.Thread(target=_job_mr_tick, name="mr-startup-tick", daemon=True)
+    th.start()
+    return th
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scheduler
@@ -785,6 +808,9 @@ async def lifespan(app: FastAPI):
         scheduler.start()
         logger.info("调度器已启动：tick 每小时 :03/:33（UTC 时刻）；心跳 %02d:00 UTC；周报周一；"
                     "HL 监控每 5 分钟（模式=%s）；API 有效期检查每小时 :11", config.heartbeat_hour, hl_mode())
+        # 启动即补一轮 MR tick：否则首次排程 tick 之前 /api/hl/status 的 mr 是 null，
+        # 探针会读成 off:?（每次重启白唤醒一次值班，且定仓漏扣 MR 占用）。
+        _start_mr_startup_tick()
     # 预热放在 scheduler 判断之外：只提醒模式（ENABLE_SCHEDULER=false）也需要它，
     # 而且它是后台线程，起到这一步不会拖慢 startup。
     _start_why_preheat()
