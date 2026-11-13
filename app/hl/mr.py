@@ -497,18 +497,46 @@ class HlMrLeg:
         qty = float(open_row["qty"] or 0.0)
         entry_price = float(open_row["entry_price"] or 0.0)
         notional = float(open_row["notional"] or 0.0)
-        fee_est = float(getattr(self.config, "taker_fee_rate", TAKER_FEE_RATE)) * (notional + qty * mark)
-        net_pnl = (mark - entry_price) * qty - fee_est
+        # 2026-11-13 第六轮：补账必须带上已记录的部分平仓片段（与 _maybe_exit 的
+        # 决算同口径）。旧实现忽略 raw.partial_exits、按原 qty 整笔结算：
+        # 先平掉那一截的盈亏被算成「按 mark 重算」，且 raw 被整体覆盖 → 片段永久丢失。
+        partials = _partial_exits(open_row)
+        partial_qty = sum(abs(float(p.get("qty") or 0.0)) for p in partials)
+        partial_notional = sum(abs(float(p.get("qty") or 0.0))
+                               * float(p.get("price") or 0.0) for p in partials)
+        partial_pnl = sum((float(p.get("price") or 0.0) - entry_price)
+                          * float(p.get("qty") or 0.0) for p in partials)
+        remaining = qty - partial_qty
+        reconciliation = None
+        if remaining < -1e-9:
+            reconciliation = {"ledger_qty": qty, "partial_qty": partial_qty,
+                              "reason": "partial_exits exceed ledger qty",
+                              "remaining_clamped_to": 0.0}
+            logger.warning("mr: 补账时片段数量 %.10g > 台账 qty %.10g（#%s），剩余量按 0 计",
+                           partial_qty, qty, open_row["id"])
+            remaining = 0.0
+        fee_est = float(getattr(self.config, "taker_fee_rate", TAKER_FEE_RATE)) * (
+            notional + remaining * mark + partial_notional)
+        net_pnl = partial_pnl + (mark - entry_price) * remaining - fee_est
+        raw = _raw_dict(open_row)
+        raw.update({"adopted": True, "price_source": "all_mids", "intent_ts": ts,
+                    "ref_price": mark, "partial_exits": partials,
+                    "partial_pnl": partial_pnl, "partial_notional": partial_notional,
+                    "remaining_qty": remaining, "fee_est": fee_est,
+                    "net_pnl": net_pnl})
+        if reconciliation is not None:
+            raw["reconciliation"] = reconciliation
         self.db.mr_close_trade(
             int(open_row["id"]), exit_price=mark, exit_order_id="",
             exit_ts=now / 1000.0, exit_reason="sma5_adopted",
             exit_signal_date=(str(payload.get("exit_signal_date") or "") or None),
             funding_pct=None, fee_quote=fee_est, net_pnl=net_pnl,
-            raw={"adopted": True, "price_source": "all_mids", "intent_ts": ts})
+            raw=raw)
         status["state"] = "exited"
         status["adopted"] = "exit"
         self._alert(f"MR 离场确认丢失，交易所已空仓 → 按当前 mid {mark:.2f} 补记 CLOSED"
-                    f"（台账 #{open_row['id']}，净 {net_pnl:+.2f} USDC，价格为估算）")
+                    f"（台账 #{open_row['id']}，净 {net_pnl:+.2f} USDC，价格为估算"
+                    + (f"，含已记录部分平仓 {partial_qty:g}" if partials else "") + "）")
         return True
 
     def _venue_px(self, px: float, sz_decimals: int) -> float:
@@ -659,16 +687,25 @@ class HlMrLeg:
         全部在这里算完（tick 本来就要 sessions/signals），面板零重算、零网络。
         离场线 = **最近 4 个已完成会话收盘均值** —— `close > SMA5`（SMA5 含当日）等价于
         `close > mean(前 4 个收盘)`，面板显示的数可直接和收盘价比。
+
+        2026-11-13 第六轮：只认**已收盘完成**的会话（`completed_upto`：末根 bar 开盘 +
+        1h <= now）。盘中调到 15:30 ET 时 `sessions[-1]` 是还没走完的当天会话，直接拿它
+        算 RSI2/离场线 = 用未收盘的假收盘价出信号，面板会先把「信号已出」显示出来。
+        一个已完成会话都没有时整块 signal 不生成（保持原「空行为」）。
         """
+        k = mr_signal.completed_upto(sessions, now_ms)
+        if k <= 0:
+            return
+        done = list(sessions[:k])
         try:
-            sigs = mr_signal.session_signals(sessions)
+            sigs = mr_signal.session_signals(done)
         except Exception:                                     # noqa: BLE001
             return
         if not sigs:
             return
-        last = sessions[-1]
+        last = done[-1]
         sig = sigs[-1]
-        closes = [s.close for s in sessions]
+        closes = [s.close for s in done]
         try:
             status["mark"] = float(rows[-1].get("c")) if rows else None
         except (TypeError, ValueError, AttributeError):
@@ -1061,10 +1098,12 @@ class HlMrLeg:
             return 0.0
 
 
-def _partial_exits(row: Any) -> List[dict]:
-    """台账 `raw.partial_exits`（部分成交片段）→ list；解析失败返回 []。
+def _raw_dict(row: Any) -> Dict[str, Any]:
+    """台账 `raw` 列（JSON 字符串或 dict）→ dict；解析失败返回 {}。
 
     注意行可能是 `sqlite3.Row`（不是 Mapping，没有 `.get`）—— 统一走下标。
+    补账写回时必须基于它**合并**：`mr_close_trade` 用 `raw=COALESCE(?, raw)`
+    整体覆盖，直接给一个新 dict 会把 `partial_exits` 等历史字段抹掉。
     """
     if isinstance(row, Mapping):
         raw = row.get("raw")
@@ -1077,9 +1116,18 @@ def _partial_exits(row: Any) -> List[dict]:
         try:
             raw = json.loads(raw)
         except ValueError:
-            return []
+            return {}
     if not isinstance(raw, Mapping):
-        return []
+        return {}
+    return dict(raw)
+
+
+def _partial_exits(row: Any) -> List[dict]:
+    """台账 `raw.partial_exits`（部分成交片段）→ list；解析失败返回 []。
+
+    注意行可能是 `sqlite3.Row`（不是 Mapping，没有 `.get`）—— 统一走下标。
+    """
+    raw = _raw_dict(row)
     parts = raw.get("partial_exits")
     if not isinstance(parts, list):
         return []
