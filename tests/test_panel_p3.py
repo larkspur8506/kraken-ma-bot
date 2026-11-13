@@ -68,11 +68,15 @@ def held_position(coin="BTC", margin=155.72, upnl=7.51, entry=100_000.0, mark=10
             "unrealized_pnl": upnl, "funding_since_open": funding}
 
 
-def stop_order(coin="BTC", trigger=97_000.0):
-    """该仓的 reduce-only 触发止损单（正常态的构成件）。"""
+def stop_order(coin="BTC", trigger=103_000.0):
+    """该仓的 reduce-only 触发止损单（正常态的构成件）。
+
+    空头（side=-1）的保护止损必须在入场价**上方**：早期 fixture 写 97,000（盈利侧），
+    面板严格判据会正确地判成「不是止损」（2026-11-13 P2-1），这里改成 103,000。
+    """
     return {"coin": coin, "oid": 7, "is_buy": True, "sz": 0.00905, "limit_px": 0.0,
             "reduce_only": True, "trigger_px": trigger, "is_trigger": True,
-            "timestamp": int(NOW * 1000)}
+            "order_type": "stop_loss", "timestamp": int(NOW * 1000)}
 
 
 class BaseCase(unittest.TestCase):
@@ -186,7 +190,7 @@ class TestOrdersOnDemand(BaseCase):
         for html in self.both():
             self.assertNotIn("交易所挂单", html, "正常态挂单表不该渲染（P3 R1）")
             self.assertIn("&#10004;&#65039;", html, "止损信息由仓位表「止损 ✔️」列唯一表达")
-            self.assertIn("97,000.00", html)
+            self.assertIn("103,000.00", html)
 
     def test_empty_state_renders_no_orders_table(self):
         """空仓 + 无挂单 = 一致 → 也不渲染（旧版渲染「交易所无挂单」空表行）。"""

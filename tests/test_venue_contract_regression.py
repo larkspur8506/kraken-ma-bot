@@ -468,7 +468,11 @@ class TestExitPriceFallback(Base):
         self.assertNotEqual(orders[0][4], 70000.0)
 
     def test_exit_refuses_to_send_without_mark_px(self):
-        """连标记价都没有 → 这轮不发单（止损已撤，宁可喊人也不拿旧价乱发）。"""
+        """连标记价都没有 → 这轮不发**平仓单**（止损已撤，宁可喊人也不拿旧价乱发）。
+
+        2026-11-13 P1-2 起：这里允许（且要求）重挂止损 —— 挂回用的是仓位里存着的止损价，
+        不依赖标记价；不允许的是拿旧价/猜价发平仓单。
+        """
         pid, _bar = self.open_position()
         self.ex.calls.clear()
 
@@ -477,7 +481,11 @@ class TestExitPriceFallback(Base):
         self.ex.slippage_limit = boom
         self.info._snap = _snap(positions=[])        # 快照里也没有该 coin
         self.assertTrue(self.executor().on_exit(pid, "ma20", ref_price=70000.0))
-        self.assertEqual([c for c in self.ex.calls if c[0] == "order"], [])
+        orders = [c for c in self.ex.calls if c[0] == "order"]
+        closes = [c for c in orders if c[6] is None]      # trigger_px=None ⇒ 平仓单
+        self.assertEqual(closes, [], "拿不到标记价时绝不许发平仓单")
+        self.assertTrue([c for c in orders if c[6] is not None],
+                        "但必须立刻把止损挂回去（保护不依赖标记价）")
         self.assertTrue(any("未下平仓单" in str(m) for m in self.notifier.messages))
 
 
