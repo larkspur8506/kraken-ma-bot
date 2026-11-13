@@ -40,11 +40,17 @@ def stop_order(**kw):
     return o
 
 
-def snap_with(orders, trusted=True):
-    """无止损的基线快照 + 指定挂单列表（BTC 多仓 0.05 @ 100000，标记 101000）。"""
+def snap_with(orders, trusted=True, sz_ticks=None):
+    """无止损的基线快照 + 指定挂单列表（BTC 多仓 0.05 @ 100000，标记 101000）。
+
+    ``sz_ticks`` = 调度器随快照落库的数量精度（第七轮：面板渲染零网络，
+    精度从快照读，不再调 specs()）。默认 None = 老快照/精度未知。
+    """
     snap = fake_snapshot(with_stop=False)
     snap["open_orders"] = list(orders)
     snap["orders_trusted"] = trusted
+    if sz_ticks is not None:
+        snap["sz_ticks"] = dict(sz_ticks)
     return snap
 
 
@@ -91,7 +97,8 @@ class PanelStopCase(BaseCase):
         return btc[0]
 
     def check(self, orders, trusted=True, sz_decimals=5):
-        snap = snap_with(orders, trusted=trusted)
+        snap = snap_with(orders, trusted=trusted,
+                         sz_ticks={"BTC": 10.0 ** (-sz_decimals)})
         self.wire(snap, SpecInfo(snap, sz_decimals=sz_decimals))
         return self.pos()
 
@@ -156,13 +163,16 @@ class TestCoveringStop(PanelStopCase):
         self.assertIn("has_stop", p)
 
     def test_sz_tick_comes_from_specs(self):
-        # 交易所精度 1e-5：0.049995 张与持仓 0.05 张只差半个 tick → 算覆盖。
-        p = self.check([stop_order(sz=0.049995)], sz_decimals=5)
+        # 交易所精度 1e-5：0.0499975 张与持仓 0.05 张差 2.5e-6（小于半格 5e-6）
+        # → 算覆盖。整整差一个 tick（0.04999，差 1e-5）按第七轮 A1 属真实缺口，不算覆盖。
+        p = self.check([stop_order(sz=0.0499975)], sz_decimals=5)
         self.assertTrue(p["has_stop"])
+        p2 = self.check([stop_order(sz=0.04999)], sz_decimals=5)
+        self.assertFalse(p2["has_stop"])
 
     def test_sz_tick_falls_back_when_specs_missing(self):
-        # 同一个张数、精度查不到 ⇒ 相对容差 5e-8，差 5e-6 就不算覆盖（判据更严，不 fail-open）。
-        snap = snap_with([stop_order(sz=0.049995)])
+        # 同一个小于半格的张数、精度查不到 ⇒ 相对容差 5e-8，差 2.5e-6 就不算覆盖（判据更严，不 fail-open）。
+        snap = snap_with([stop_order(sz=0.0499975)])
         self.wire(snap, NoSpecInfo(snap))
         p = self.pos()
         self.assertFalse(p["has_stop"])
