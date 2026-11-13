@@ -26,7 +26,7 @@ import time
 from dataclasses import replace
 from urllib.parse import quote as _urlquote
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse, Response
@@ -240,31 +240,86 @@ def hl_info_base() -> str:
     return _env("KR_BASE_URL", "https://futures.kraken.com")
 
 
-def kr_api_key() -> str:
-    """Kraken API key：DB（面板可写，键 kr_api_key）优先，其次 env。"""
+#: 凭据来源标记（面板「API 状态」三态用；空串 = 未配置）
+CRED_SRC_DB = "db"
+CRED_SRC_ENV = "env"
+CRED_SRC_NONE = ""
+
+#: 最近一次「私有读」的证据（验证凭据真的能签名）：ok / ts / error(类型名，绝不含凭据)
+_CRED_PROBE: dict = {}
+#: 证据的有效期：与面板快照同口径（连丢 3 轮 monitor 就降级成「未验证」）
+CRED_VERIFY_TTL_S = 900.0
+
+
+def kr_credentials() -> tuple:
+    """**成对**解析 Kraken API key/secret：``(key, secret, source)``，DB 优先于 env。
+
+    为什么必须成对（第七轮审核 F3）：旧版 ``kr_api_key`` 是 DB→env，``kr_secret`` 是
+    env→DB —— 两源都非空且只轮换一侧时（这正是两种轮换方式的形状），会拿 **A 源的 key
+    配 B 源的 secret** 去签名：所有私有读 401、执行器 fail-closed 停手，而面板还写着
+    「已配置」。现在两侧从**同一个来源**一起取，任何一边缺就当整对不可用。
+
+    半对（只配了 key 或只配了 secret）**绝不**拿另一半源补齐：那等于把两个不同
+    key 的凭据拼在一起，结果必然是 authenticationError，却让人以为配好了。
+
+    来历不明的 ``hl_private_key()`` 也**不再**兜底：那是 HL 代理钱包私钥，喂给
+    Kraken 签名只会全灭（Kraken key 的唯一入口是面板「更新 API」）。
+    """
+    db_key = db_sec = ""
     try:
-        db_key = str(db.get_config_str("kr_api_key", "") or "").strip()
+        # Read both halves under one DB lock; rotation must not mix generations.
+        stored = db.get_config()
+        def _credential_value(name: str) -> str:
+            raw = stored.get(name, "")
+            try:
+                value = json.loads(raw)
+            except (TypeError, ValueError):
+                value = raw
+            return str(value or "").strip()
+        db_key = _credential_value("kr_api_key")
+        db_sec = _credential_value("kr_api_secret")
     except Exception as e:                                           # noqa: BLE001
-        logger.warning("读 DB api key 失败（回落 env）：%s", type(e).__name__)
-        db_key = ""
-    return db_key or _env("KRAKEN_API_KEY")
+        logger.warning("读 DB Kraken 凭据失败（整对作废）：%s", type(e).__name__)
+        db_key = db_sec = ""
+    if db_key and db_sec:
+        return db_key, db_sec, CRED_SRC_DB
+    env_key = _env("KRAKEN_API_KEY")
+    env_sec = _env("KRAKEN_API_SECRET")
+    if env_key and env_sec:
+        return env_key, env_sec, CRED_SRC_ENV
+    if db_key or db_sec or env_key or env_sec:
+        # 只记「哪一侧有值」，不记值与长度：半对是配置错误，不是凭据泄露。
+        logger.warning("[cred] Kraken 凭据不成对（db key=%s secret=%s · env key=%s secret=%s）"
+                       "→ 按未配置处理（绝不混搭两个来源）",
+                       bool(db_key), bool(db_sec), bool(env_key), bool(env_sec))
+    return "", "", CRED_SRC_NONE
+
+
+def kr_api_key() -> str:
+    """Kraken API key（与 secret 同源：DB 优先，其次 env）。"""
+    return kr_credentials()[0]
 
 
 def kr_secret() -> str:
-    """Kraken API secret（base64）：env KRAKEN_API_SECRET → DB kr_api_secret →
-    兼容回落 hl_private_key()（迁移期同一个 DB 键，PR-3 决定不改名）。
+    """Kraken API secret（base64；与 key 同源，绝不跨源拼对）。
 
     与 hl_private_key 同级纪律：明文只进 KrClient 构造，不进日志/响应/事件。
     """
-    env_s = _env("KRAKEN_API_SECRET")
-    if env_s:
-        return env_s
-    try:
-        db_s = str(db.get_config_str("kr_api_secret", "") or "").strip()
-    except Exception as e:                                           # noqa: BLE001
-        logger.warning("读 DB kr secret 失败（回落）：%s", type(e).__name__)
-        db_s = ""
-    return db_s or hl_private_key()
+    return kr_credentials()[1]
+
+
+def _note_cred_probe(ok: Optional[bool], error: str = "") -> None:
+    """记录一次「私有读是否成功」的证据（面板 API 卡的三态里「已验证」只用它）。
+
+    只存布尔/时间/异常**类型名**：错误原文可能带上接口地址或参数，不进面板。
+    ``ok=None`` = 证据作废（刚保存了新凭据，下一轮才有答案）。
+    """
+    global _CRED_PROBE
+    if ok is None:
+        _CRED_PROBE = {"ok": None, "ts": time.time(), "error": ""}
+        return
+    _CRED_PROBE = {"ok": bool(ok), "ts": time.time(),
+                   "error": "" if ok else (str(error or "")[:120])}
 
 
 def get_hl_info():
@@ -357,6 +412,46 @@ def panel_snapshot_info():
     return _snapshot_info
 
 
+def _panel_sz_ticks(info: Any, snapshot: Any) -> dict:
+    """把持仓币种的数量步长随快照写下去 → ``{coin: tick}``；取不到返回 ``{}``。
+
+    **只在调度线程调用**（tick / hl_monitor 之后），所以这里允许打一次
+    ``/instruments``（KrInfo 侧还有 1h 缓存）。面板渲染期一律读快照里的这份数，
+    不再自己调 ``specs()`` —— PR21 的 ``views._sz_tick`` 直接问 specs，冷缓存时会让
+    ``/admin`` 与 ``/api/hl/status`` 各多打一次公开 GET，破坏「面板渲染零网络」。
+
+    取不到（老桩、接口失败、未登记合约）就**不写这个币**：面板按「精度未知」处理，
+    退化成严格的相对容差（判据更严，绝不因为不知道精度就把「未覆盖」说成「已覆盖」）。
+    """
+    coins: List[str] = []
+    for p in ((snapshot or {}).get("positions") or []):
+        try:
+            coin = str((p or {}).get("coin") or "").strip()
+        except AttributeError:
+            coin = ""
+        if coin and coin not in coins:
+            coins.append(coin)
+    if not coins:
+        return {}
+    try:
+        specs = info.specs(coins) or {}
+    except Exception as e:                                       # noqa: BLE001
+        logger.warning("[panel] 读合约规格失败（快照不带数量精度）：%s", e)
+        return {}
+    out: Dict[str, float] = {}
+    for coin in coins:
+        try:
+            dec = (specs.get(coin) or {}).get("sz_decimals")
+            if dec is None:
+                dec = (specs.get(coin) or {}).get("szDecimals")
+            dec = int(dec)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if 0 <= dec <= 12:
+            out[coin] = 10.0 ** (-dec)
+    return out
+
+
 def capture_panel_snapshot(source: str = "", with_why: bool = False) -> bool:
     """把「面板这一轮要显示的数据」写进快照表（**只读交易所，绝不下单**）。
 
@@ -380,12 +475,18 @@ def capture_panel_snapshot(source: str = "", with_why: bool = False) -> bool:
         t0 = time.time()
         mids = info.all_mids()
         snapshot = info.snapshot(address, mids=mids)
+        # 私有读真的成功了 —— 这是「API 凭据已验证」的唯一证据（面板不再靠「key 非空」
+        # 猜「能交易」）。失败分支在下面的 except 里记反证。
+        _note_cred_probe(True)
         if isinstance(snapshot, dict):
             snapshot["panel_net"] = {
                 "latency_ms": round((time.time() - t0) * 1000.0, 1),
                 "ts": t0,                       # 采样时刻：面板据此说「几分钟前那一轮」
                 "source": source or "scheduler",
             }
+            # 数量精度随快照一起落库：面板渲染期一律不再查 specs（零网络约定）。
+            # 老快照没有这个键 → 面板按「精度未知」的严格相对容差判（fail-closed）。
+            snapshot["sz_ticks"] = _panel_sz_ticks(info, snapshot)
         why_rows = None
         if with_why:
             from app import why as why_mod
@@ -413,6 +514,12 @@ def capture_panel_snapshot(source: str = "", with_why: bool = False) -> bool:
         return True
     except Exception as e:                                        # noqa: BLE001
         logger.warning("[panel] 快照写入失败（面板会回落实时读取）：%s", e)
+        # 只有「凭据存在但读数失败」才算反证；没配凭据时这里也会失败，但那时
+        # _agent_state 走 missing 分支，不会读这条证据。
+        try:
+            _note_cred_probe(False, type(e).__name__)
+        except Exception:                                         # noqa: BLE001
+            pass
         return False
 
 
@@ -830,12 +937,58 @@ app = FastAPI(title="crypto-ma-alert", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=GZIP_MIN_SIZE)
 
 
+class SecurityHeadersMiddleware:
+    """给已鉴权的管理页 / JSON 响应补 ``no-store`` + 禁 iframe 嵌入。
+
+    为什么 ``no-store``：这些响应里有账户金额、持仓、事件与凭据状态，浏览器回退缓存
+    或中间缓存把「上一次的真相」再放出来，比一片空白更危险（而且面板零外部资源，
+    不发缓存头也换不来什么性能）。CSV 导出同理 —— 一份交易流水不该留在共享缓存里。
+
+    为什么禁 frame：``cma_admin`` 是 SameSite=Lax，iframe 里的跨站 POST 本来拿不到
+    Cookie（写操作已不可达），这里补的是**点击劫持**那一层 —— 不许任何站点把面板
+    嵌进自己的页面骗点击（拉闸/改凭据按钮就在设置页）。
+
+    纯 ASGI 实现（不包 BaseHTTPMiddleware）：不缓冲响应体，CSV 流式导出与异常传播
+    的行为不变。
+    """
+
+    _PREFIXES = ("/admin", "/hl", "/api/hl")
+    _HEADERS = ((b"cache-control", b"no-store"),
+                (b"x-frame-options", b"DENY"),
+                (b"content-security-policy", b"frame-ancestors 'none'"),
+                (b"referrer-policy", b"same-origin"))
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    def __call__(self, scope: Any, receive: Any, send: Any) -> Any:
+        path = str(scope.get("path") or "") if scope.get("type") == "http" else ""
+        # 精确匹配或「前缀 + /」：`/admin` / `/admin/...` / `/hl` / `/api/hl/...`。
+        # 不用裸 startswith(p)：那会把 `/hl-something` 这类兄弟路径也算进来。
+        if not path or not any(path == p or path.startswith(p + "/") for p in self._PREFIXES):
+            return self.app(scope, receive, send)
+
+        async def _send(message: Any) -> None:
+            if message.get("type") == "http.response.start":
+                headers = message.setdefault("headers", [])
+                have = {bytes(k).lower() for k, _ in headers}
+                for name, value in self._HEADERS:
+                    if name not in have:
+                        headers.append((name, value))
+            await send(message)
+
+        return self.app(scope, receive, _send)
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+
 
 # ---------------------------------------------------------------- 鉴权
 # 统一口径：Authorization Bearer 认证；旧的 ?k= 与 cma_admin Cookie 保留
 # （旧书签 / runbook 的 curl / 面板零 JS 链接都还在用，见 app/auth.py）。
 
-_AUTH_HINT = "需要 ADMIN_TOKEN：?k= 参数，或 Authorization: Bearer 请求头"
+_AUTH_HINT = "需要 ADMIN_TOKEN：?k= 参数，或 Authorization 头（Bearer 方案）"
 
 
 def _require_admin(request: Request, k: Optional[str] = None) -> None:
@@ -844,6 +997,26 @@ def _require_admin(request: Request, k: Optional[str] = None) -> None:
         raise HTTPException(500, "ADMIN_TOKEN 未配置")
     if not authn.is_admin(request, token, k):
         raise HTTPException(401, _AUTH_HINT)
+
+
+def _admin_write_guard(request: Request, k: Optional[str],
+                       csrf: Optional[str] = None) -> str:
+    """写操作统一前置：鉴权（401）+ Cookie 会话的同源/CSRF 防护（403）。返回 token。
+
+    顺序刻意如此：**先认人、再判来源**。未认证一律 401（与旧行为一致）；认证通过后
+    才看是不是「浏览器带着环境凭据来的跨源请求」。Bearer / ``?k=`` 这类显式凭据
+    不受 Origin 限制（runbook 的 curl 与自动化脚本继续可用）。
+    """
+    _require_admin(request, k)          # 401 / 500（未配置 token）
+    token = config.admin_token
+    denied = authn.write_denied(request, token, k, csrf)
+    if denied:
+        raise HTTPException(403, "写操作被拒：" + denied)
+    return token
+
+
+#: ``on`` 表单字段的解析**只有一份**（app/auth.py）：缺失或未知值 → None（调用方 400）。
+parse_on_flag = authn.parse_on_flag
 
 
 def _admin_url(tab: str, k: str = "") -> str:
@@ -954,6 +1127,8 @@ def _hl_deps():
         base_url_fn=lambda: hl_params().base_url,
         mr_fn=_mr_status_snapshot,
         snapshot_info_fn=lambda: panel_snapshot_info() if panel_snapshot_on() else None,
+        # 凭据三态的唯一生产者：/api/hl/status 的 agent 块与面板卡片同源
+        agent_state_fn=lambda: _agent_state(),
     )
 
 
@@ -1102,9 +1277,45 @@ def _why_rows(live: bool = False) -> list:
 
 
 def _agent_state() -> dict:
-    """面板用：Kraken key 无有效期、无代理钱包授权体系——固定返回该形状，
-    不再读 ``hl_agent_state``（那是 HL agent 授权体系的缓存，Kraken 版无人写入）。"""
-    return {"level": "ok", "source": "kraken-key-no-expiry", "days_left": None}
+    """面板「API 状态」：Kraken key 无有效期，但**凭据是否可用必须如实三态**。
+
+    旧版无条件返回 ``level=ok``，于是 key/secret 被清空、写错、或半对时卡片永远写
+    「已配置 · 无到期」—— 面板上唯一能看凭据状态的地方给了假阳性（第七轮审核 B2）。
+
+    三态（都是**实测/可证伪**的，不是「配置项非空」推断）：
+
+    - ``missing``：key/secret 不成对或为空 → 卡上红字「未配置」；
+    - ``configured``：成对存在，但还没有成功私有读的证据（或证据过期）→「已配置 · 未验证」；
+    - 已验证：最近一次调度轮私有读成功（``verified=True`` + ``verify_age_s``）；
+      最近一次失败则 ``last_read_ok=False`` + ``verify_error``（异常类型名，不含凭据）。
+
+    仍不读 ``hl_agent_state``（HL agent 授权体系的缓存，Kraken 版无人写入）。
+    """
+    key, sec, src = kr_credentials()
+    st: Dict[str, Any] = {
+        "level": "ok", "source": "kraken-key-no-expiry", "days_left": None,
+        "configured": bool(key and sec), "cred_source": src,
+        "verified": False, "verify_age_s": None, "last_read_ok": None, "verify_error": "",
+    }
+    if not st["configured"]:
+        st["level"] = "missing"
+        return st
+    probe = _CRED_PROBE
+    if not probe:
+        return st                      # 还没有任何一轮证据：已配置 / 未验证
+    ok = probe.get("ok")
+    ts = float(probe.get("ts") or 0.0)
+    age = round(max(0.0, time.time() - ts), 1) if ts > 0 else None
+    st["verify_age_s"] = age
+    if ok is None:
+        return st                      # 刚保存凭据：等下一轮
+    st["last_read_ok"] = bool(ok)
+    if ok:
+        st["verified"] = bool(age is not None and age <= CRED_VERIFY_TTL_S)
+    else:
+        st["level"] = "read_failed"
+        st["verify_error"] = str(probe.get("error") or "")
+    return st
 
 
 def _cleanup_on() -> bool:
@@ -1130,15 +1341,19 @@ def _kr_renew(api_key: str, api_secret: str) -> tuple:
         _b64.b64decode(sec, validate=True)
     except Exception:                                             # noqa: BLE001
         return False, "API Secret 不是合法 base64——Kraken 网页上那串要原样完整复制"
-    db.set_config("kr_api_key", key)
-    db.set_config("kr_api_secret", sec)
-    global _hl_info
+    db.set_config_many([("kr_api_key", key), ("kr_api_secret", sec)])
+    global _hl_info, _panel_info
     _hl_info = None                     # 只读客户端带凭据，必须重建
+    # 面板侧包装/快照也得跟着换：否则下一次渲染还拿旧 wrapper 的 10s 缓存与
+    # 5 分钟前的快照说话（「保存了但页面没变」）。
+    _panel_info = None
+    _note_cred_probe(None)              # 新凭据还没有成功读数的证据
+    invalidate_panel_cache()
     try:
         db.hl_log_event("agent_renew", "Kraken API 凭据已更新（面板保存）")
     except Exception:                                             # noqa: BLE001
         pass
-    return True, "Kraken API 凭据已保存，下一轮生效"
+    return True, "Kraken API 凭据已保存（DB 一对），下一轮私有读取成功后转「已验证」"
 
 
 def _mount_admin_ui() -> None:
@@ -1158,8 +1373,10 @@ _mount_hl_keyform()
 
 
 @app.post("/admin/tick")
-def admin_tick(request: Request, k: Optional[str] = None):
-    _require_admin(request, k)
+def admin_tick(request: Request, k: Optional[str] = None,
+               csrf: Optional[str] = Form(None)):
+    # 触发一轮 tick 会推消息/写库 —— 同样按写操作防护（Cookie 会话要求同源）。
+    _admin_write_guard(request, k, csrf)
     sent = _tick_locked()
     return {"sent": len(sent), "messages": sent}
 
@@ -1169,7 +1386,8 @@ def admin_tick(request: Request, k: Optional[str] = None):
 # DB 直改（docs/HL_RUNBOOK.md 的应急条目）。kill 这条 curl 口径保留。
 
 @app.post("/admin/hl/kill")
-def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
+def admin_hl_kill(request: Request, on: Optional[str] = Form(None),
+                  k: str = Form(""), csrf: Optional[str] = Form(None)):
     """kill switch：off=恢复正常，on=暂停自动交易（仍允许人工平仓/撤单）。
 
     origin 显式写 'manual'：这是**人**按的按钮，绝不能被「连续 N 轮对账干净」自动解除
@@ -1179,9 +1397,28 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
     重置为当前 index：否则下一轮 DD 仍是 31% → 立刻又置 kill，「人工解」形同虚设。
     这条 curl 入口与面板 `/admin/switch/kill` 同一口径（runbook 用的是这条；
     面板上的按钮在「设置」页「管理」卡）。
+
+    【第七轮】两处收紧，都是 fail-closed 方向：
+
+    1. ``on`` **必须显式**（1/0、true/false、on/off、yes/no，大小写与空白不敏感）。
+       缺字段或未知值 → **400 且不改状态**：旧版 ``Form("0")`` + ``on in (...)``
+       让「漏写 on」等于「解除熔断」，一条手滑的 curl 就能解锁。
+    2. 解除 **已实现亏损熔断**（origin='realized_dd'）前，用同一个 30 天窗口复核：
+       仍越阈值就**拒绝**并解释剩余亏损/阈值。不重置窗口 —— 重置等于改风控口径。
     """
-    _require_admin(request, k or None)
-    want = on in ("1", "true", "on")
+    _admin_write_guard(request, k or None, csrf)
+    want = parse_on_flag(on)
+    if want is None:
+        raise HTTPException(400, "on 字段必须是 1/0（true/false、on/off、yes/no 也接受）；"
+                                 "缺失或未知值不改动 kill 状态")
+    if not want and db.hl_kill_origin() == "realized_dd":
+        from app.hl.views import equity_hint, realized_dd_clear_block, realized_dd_refusal_text
+        eq, _src = equity_hint(db, current_config())
+        detail = realized_dd_clear_block(db, current_config(), eq)
+        if detail and detail.get("over"):
+            msg = realized_dd_refusal_text(detail)
+            db.hl_log_event("kill", "解除已实现亏损熔断被拒：" + msg)
+            raise HTTPException(400, msg)
     if not want and db.hl_kill_origin() == "dd":
         from app.hl import dd as hl_dd
         try:
@@ -1192,24 +1429,36 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
             # 重置失败不能挡住解锁：宁可由下一轮重新熔断（用户会看到提示），也不要
             # 让一次 DB 写失败把 kill 卡死。
             db.hl_log_event("kill", f"解除回撤熔断时重置基线失败：{type(e).__name__}: {e}")
+    if not want and db.hl_kill_origin() == "realized_dd":
+        # 窗口已回正：允许解除，但**不重置** 30 天窗口（只解锁；窗口继续滚动）。
+        db.hl_log_event("kill", "解除已实现亏损熔断：30 天窗口已回正（窗口本身不重置）")
     db.hl_set_kill(want, "人工" if want else "", origin="manual")
     db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
+    invalidate_panel_cache()            # 刚改的 kill 状态别让页面继续显示旧值
     resp = RedirectResponse(_admin_url("overview", _k_out(request, k)), status_code=303)
     return authn.set_session_cookie(resp, request, config.admin_token, k or None)
 
 
 @app.post("/admin/hl/mr")
-def admin_hl_mr(request: Request, on: str = Form("0"), k: str = Form("")):
+def admin_hl_mr(request: Request, on: Optional[str] = Form(None),
+                k: str = Form(""), csrf: Optional[str] = Form(None)):
     """MR 腿开关（feat/mr-leg）。只挡新入场；持仓照常按信号离场。
 
     默认停用（configuration `mr_enabled` 无值 = 停用）——首笔真单在人工核对
     之前，这个开关就是 MR 腿的上线闸门。与 /admin/hl/kill 的关系：kill 挡
     所有腿的新开仓（包括 MR）；本开关只管 MR 自己。
+
+    ``on`` 的解析与 kill 同口径：必须显式、未知值 400（``on=yes`` 这类旧写法现在
+    会被明确拒绝而不是被当成「停用」）。
     """
-    _require_admin(request, k or None)
-    want = on in ("1", "true", "on")
+    _admin_write_guard(request, k or None, csrf)
+    want = parse_on_flag(on)
+    if want is None:
+        raise HTTPException(400, "on 字段必须是 1/0（true/false、on/off、yes/no 也接受）；"
+                                 "缺失或未知值不改动 MR 开关")
     db.set_config("mr_enabled", "1" if want else "0")
     db.hl_log_event("mr_admin", f"MR 腿人工{'启用' if want else '停用'}")
+    invalidate_panel_cache()
     # 面板 MR 开关现在在「设置」页「管理」卡 → 提交后回设置页，别跳回总览。
     resp = RedirectResponse(_admin_url("settings", _k_out(request, k)), status_code=303)
     return authn.set_session_cookie(resp, request, config.admin_token, k or None)

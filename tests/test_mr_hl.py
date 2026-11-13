@@ -777,8 +777,16 @@ class TestFifthRoundResiduals(unittest.TestCase):
             row = db.mr_trade_by_signal("2026-04-15")
             self.assertEqual(row["state"], "CLOSED")
             px = row["exit_price"]
-            # 剩余腿按回执成交价；先平掉的那 1.0 按当时的参考价（mark 95.5）估算
-            expected = ((px - 93.5) * 1.68 + (95.5 - 93.5) * 1.0
+            # 剩余腿按回执成交价；先平掉的那 1.0 按**回执 avg_px**（= 限价 95.357，
+            # 卖出 IOC 的最低可成交价），不是下单前的 mark 95.5 —— 第七轮 B6/F6：
+            # 旧断言把「片段按 mark 记价」这个缺陷本身钉成了期望值。
+            # 片段来源也必须活过最终关账（raw 是**合并**写回，不是整体覆盖）。
+            parts_closed = json.loads(row["raw"])["partial_exits"]
+            self.assertEqual(len(parts_closed), 1)
+            frag_px = parts_closed[0]["price"]
+            self.assertEqual(parts_closed[0]["price_source"], "avg_px")
+            self.assertAlmostEqual(frag_px, 95.357, places=6)
+            expected = ((px - 93.5) * 1.68 + (frag_px - 93.5) * 1.0
                         - 0.03 - row["fee_quote"])
             self.assertAlmostEqual(row["net_pnl"], expected, places=4)
 

@@ -792,6 +792,26 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
         # 自动关账、写 r_multiple 污染统计）；但超过 PENDING_BARS_MAX 根 4h 未处理
         # 就作废释放槽位，否则一次漏看提醒会永久堵死该标的的新信号。
         if row is not None and row["status"] == "pending":
+            if _hl_status_of(row) == "aborted":
+                # 【aborted 终态·老行兼容】执行器挂止损失败后已经兜底平仓、并确认全平
+                # （成交量不是未知）的行，`hl_status` 就是 `aborted`。这类行**不是**
+                # 「等用户确认的开仓」，不能按 pending 占槽 12 小时、更不能到期发
+                # 「待确认仓位已作废」的误导卡（用户根本没开过仓）。
+                # 新代码在 `db.open_position` 就把它排除了；这里再兜一层，覆盖
+                # 「挂单表/仓位行来自别的读路径或升级前的 DB 层」的情况。
+                try:
+                    db.ignore_position(int(row["id"]))
+                except Exception as e:                               # noqa: BLE001
+                    logger.warning("[engine] 作废 aborted 行失败（下一轮再试）: %s", e)
+                try:
+                    db.hl_log_event("decision",
+                                    f"{symbol} 开仓中止行（hl_status=aborted）已作废，"
+                                    f"槽位释放（交易所侧已确认全平）",
+                                    symbol=symbol, data={"pid": int(row["id"])})
+                except Exception:                                    # noqa: BLE001
+                    pass
+                _record_symbol_state(db, cfg, symbol, bars, ind, latest_closed_i, False)
+                return
             ref_now = int(now_ms if now_ms is not None else time.time() * 1000)
             age_bars = (ref_now - int(row["signal_bar_ms"])) // INTERVAL_MS
             if age_bars >= PENDING_BARS_MAX:

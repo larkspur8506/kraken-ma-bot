@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 from functools import wraps
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app import posfields
 # v_ledger 视图 SQL 用到的同源口径常量（L③/M2：±300s 窗口与毫秒阈值只此一份，
@@ -416,6 +416,30 @@ class DB:
         self.conn.commit()
 
     @_locked
+    def set_config_many(self, pairs: List[Tuple[str, Any]]) -> None:
+        """一次事务写多个配置键（**原子**：读者要么看到全部旧值、要么看到全部新值）。
+
+        只有一处真实需求 —— kill 开关：`hl_exec_kill` / `hl_exec_kill_origin` /
+        `hl_exec_kill_reason` 必须同进同退。旧实现（2026-11-13 复审 A3）是三次独立的
+        `set_config`，每次各自 commit，中间任何一个读者都能看到「kill=1 但 origin 还是
+        上一次的值（甚至空串）」—— 空 origin 在 `_run_locked` 里等价于「人工 kill、
+        永不自解」，一次读到撕裂状态就足以让自动解除逻辑卡死或（反向）误判来源。
+        同一把 RLock 包住「多次 execute + 一次 commit」即可：共享连接下未提交的写对
+        同进程其它线程本来就可见，串行化只能靠锁。
+        """
+        ts = now()
+        try:
+            for key, value in pairs:
+                self.conn.execute(
+                    "INSERT INTO configuration(key, value, updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    (str(key), json.dumps(value), ts))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    @_locked
     def del_config(self, key: str) -> None:
         """删掉一个配置键（宽限期 `hl_close_grace:<pid>` 这类「有生命周期的状态」用）。
 
@@ -442,8 +466,20 @@ class DB:
     # ---------------- positions
     @_locked
     def open_position(self, symbol: str) -> Optional[sqlite3.Row]:
+        """该标的当前**占用仓位槽**的那一行（pending/open）。
+
+        `hl_status='aborted'` 的行必须排除（2026-11-13 复审「aborted 终态」）：它的
+        含义是「开仓已中止、交易所侧已确认全平」—— 执行器挂止损失败后立刻兜底平仓，
+        成交被确认（成交量不是未知）才会写这个值。旧实现让它继续按 `pending` 占槽
+        12 小时（`PENDING_BARS_MAX` 根 4h），到期还发一条「待确认仓位已作废」的
+        误导卡（用户根本没开过仓，等的是「确认开仓」）。
+        排除后：新行当场释放槽位，升级前留下的老行（status 仍是 pending）也一并
+        安全释放 —— 比在引擎里再判一次更彻底，且不会改 `positions.status` 这列
+        既有语义（审计行仍可被 `position_by_id` 读到）。
+        """
         return self.conn.execute(
             "SELECT * FROM positions WHERE symbol=? AND status IN ('pending','open') "
+            "AND COALESCE(hl_status,'') <> 'aborted' "
             "ORDER BY signal_bar_ms DESC LIMIT 1", (symbol,)).fetchone()
 
     @_locked
@@ -968,11 +1004,25 @@ class DB:
 
     @_locked
     def mr_trade_append_partial(self, trade_id: int, *, qty: float, price: float,
-                                ts: float) -> None:
+                                ts: float, price_source: Optional[str] = None,
+                                oid: Any = None,
+                                cloid: Optional[str] = None) -> None:
         """把一次「部分平仓」片段追加进台账 `raw.partial_exits`。
 
         2026-11-02 第五轮：离场 IOC 部分成交时，下一轮只按**剩余**数量决算，前面
         平掉那一截的盈亏会从 `net_pnl` 里消失。这里按参考价先记下来，最终关账时加回。
+
+        2026-11-13 第七轮 B6（A3 同类）：片段必须自带**价格来源**（成交回执 / 限价 /
+        参考价），否则事后无法区分「这是成交价」还是「这是估算」。三个可选键加在
+        **参数表末尾**（`qty/price/ts` 的老调用原样有效），只在给值时落库：
+
+        - ``price_source``：`avg_px` / `limit_px` / `mark_expected` 等；
+        - ``oid`` / ``cloid``：产生这条片段的订单（追溯「哪张单平的这一截」）。
+
+        旧实现在 `mr._append_fragment()` 里先调本方法、再拿 ``db.conn`` 就地补写一次
+        UPDATE —— 读-改-写跨出了这把锁，与并发追加互相覆盖（后写的那次基于旧 raw，
+        把前一条片段的来源字段抹掉），而且调用方依赖 ``db.conn`` 这个内部字段。现在
+        「查 → 追加 → 一次 commit」全在同一次 ``_locked`` 临界区里完成。
         """
         row = self.conn.execute("SELECT raw FROM mr_trades WHERE id=?",
                                 (int(trade_id),)).fetchone()
@@ -985,7 +1035,14 @@ class DB:
             if isinstance(parsed, dict):
                 raw = dict(parsed)
         parts = list(raw.get("partial_exits") or [])
-        parts.append({"qty": float(qty), "price": float(price), "ts": float(ts)})
+        item: Dict[str, Any] = {"qty": float(qty), "price": float(price), "ts": float(ts)}
+        if price_source:
+            item["price_source"] = str(price_source)
+        if oid not in (None, ""):
+            item["oid"] = str(oid)
+        if cloid:
+            item["cloid"] = str(cloid)
+        parts.append(item)
         raw["partial_exits"] = parts
         self.conn.execute(
             "UPDATE mr_trades SET raw=?, updated_at=? WHERE id=?",
@@ -996,11 +1053,22 @@ class DB:
     def hl_log_event(self, kind: str, message: str, symbol: Optional[str] = None,
                      data: Any = None, code_rev: str = "",
                      ts: Optional[float] = None) -> None:
-        self.conn.execute(
-            "INSERT INTO hl_events(kind, symbol, message, data, code_rev, created_at) VALUES(?,?,?,?,?,?)",
-            (kind, symbol, message, json.dumps(data, ensure_ascii=False) if data is not None else None,
-             code_rev, now() if ts is None else float(ts)))
-        self.conn.commit()
+        """写一条事件。**必须**与其它公开方法共用同一把 ``self._lock``。
+
+        这条是全类唯一漏了 ``@_locked`` 的公开写方法（2026-11-13 复审 A3）：调度线程
+        写事件的同时 HTTP 线程在 commit，共享连接上的 execute/commit 会交错，表现为
+        ``cannot commit - no transaction is active`` / ``InterfaceError``，且「调用成功」
+        与「真的落库」不一致（实测 600 次并发里 61 次异常、只落 574 行）。
+        ``hl_events`` 是心跳/告警/审计的唯一来源，丢行等于事后无从复盘。
+        """
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO hl_events(kind, symbol, message, data, code_rev, created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (kind, symbol, message,
+                 json.dumps(data, ensure_ascii=False) if data is not None else None,
+                 code_rev, now() if ts is None else float(ts)))
+            self.conn.commit()
 
     @_locked
     def hl_recent_events(self, limit: int = 30, kind: Optional[str] = None) -> List[sqlite3.Row]:
@@ -1459,12 +1527,16 @@ class DB:
         默认 "manual"：新增调用点忘了传时段成人工 kill —— 偏保守（永不自解），
         不会出现「谁都能自解」的宽松默认。
         """
-        self.set_config("hl_exec_kill", 1 if on else 0)
-        self.set_config("hl_exec_kill_origin", str(origin or "manual"))
+        # 三个键**同一次事务**写入（2026-11-13 复审 A3）：分开写时任何读者都可能看到
+        # 「kill=1 + 上一次的 origin」或「kill=0 + 上一次的 origin」，前者会让自动解除
+        # 判错来源、后者会让面板把一次人工停手解释成对账停手。见 set_config_many。
+        pairs: List[Tuple[str, Any]] = [("hl_exec_kill", 1 if on else 0),
+                                        ("hl_exec_kill_origin", str(origin or "manual"))]
         if reason:
-            self.set_config("hl_exec_kill_reason", reason)
+            pairs.append(("hl_exec_kill_reason", reason))
         elif not on:
             # 解除 kill 时把原因一并清空（对抗审查 L6）：以前只写不清，解除之后
             # `hl_exec_kill_reason` 还留着上一次的原因，面板/看守/告警正文都会拿它
             # 去解释一个**已经不存在**的停手（「未暂停自动交易（对账异常）」这种自相矛盾）。
-            self.set_config("hl_exec_kill_reason", "")
+            pairs.append(("hl_exec_kill_reason", ""))
+        self.set_config_many(pairs)

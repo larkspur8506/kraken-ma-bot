@@ -121,6 +121,10 @@ class DashboardDeps:
     #: 可选：快照优先读取器（`SnapshotInfo`）。`/api/hl/status` 默认（`live=0`）用它免去每次实连交易所，
     #: 显式传 `?live=1` 或未注入时仍用 `info`（实时客户端）。
     snapshot_info_fn: Optional[Callable[[], Any]] = None
+    #: 可选：API 凭据状态（`main._agent_state`，三态 missing/configured/verified）。
+    #: 由 main 注入后，`/api/hl/status` 与 `/hl` 的 API 徽章与设置页卡片**同一个生产者**，
+    #: 不再出现「设置页说未配置、状态条说不限期」这种两套结论。
+    agent_state_fn: Optional[Callable[[], Any]] = None
 
 
 # ---------------------------------------------------------------- 小工具
@@ -337,7 +341,7 @@ def _health_badge_html(system: Any, kill: bool = False, kill_reason: str = "") -
                         " · ".join(notes), "badge-status")
 
 
-def _positions_badge_html(positions: Any, mr: Any = None) -> str:
+def _positions_badge_html(positions: Any, mr: Any = None, reachable: bool = True) -> str:
     """持仓徽章（P0-2 第一层）：几仓、什么方向。
 
     只做汇总：逐仓细节在「仓位」表里（那是唯一出处）。空仓给灰点「空仓」，
@@ -346,22 +350,37 @@ def _positions_badge_html(positions: Any, mr: Any = None) -> str:
     QQQ 超跌腿（MR）与交易所仓位同一张表，所以它必须计入，否则会出现
     「徽章说空仓、表里有一行 QQQ」的自相矛盾。MR 腿单独标出（不同策略、不同离场口径），
     不混进「多/空」计数。
+
+    ``reachable=False``（交易所读数不可得）→ 灰点「无法确认」，绝不写「空仓」：
+    「读不到」和「没有」是两件事，全页最显眼的第一层徽章说错方向最贵（第七轮 B3）。
+
+    有未被 MR 台账认领的 QQQ 仓（``mr_unclaimed``）→ 琥珀色并把「QQQ 异常」写进值里，
+    否则那张真实的、没有止损、也不知道该由谁管的仓会被一句「N 仓」掩盖。
     """
     rows = [_as_dict(x) for x in _as_list(positions)]
+    if not reachable:
+        extra = f" · 含 {sum(1 for r in rows if r.get('mr_unclaimed'))} 个异常仓" if any(
+            r.get("mr_unclaimed") for r in rows) else ""
+        return _strip_badge("muted", "持仓", "无法确认" + extra,
+                            "交易所读数不可得：既不能确认有仓，也不能确认空仓", "badge-status")
     mr_v = _mr_view({"mr": mr}) if mr else None
     mr_hold = bool(mr_v and mr_v.get("holding"))
     if not rows and not mr_hold:
         return _strip_badge("muted", "持仓", "空仓", "当前没有任何持仓", "badge-status")
     bits = ""
+    unclaimed = sum(1 for r in rows if r.get("mr_unclaimed"))
     if rows:
         longs = sum(1 for r in rows if _num(r.get("side"), 1) >= 0)
         shorts = len(rows) - longs
         mix = f"多{longs} · 空{shorts}" if (longs and shorts) else ("多" if longs else "空")
         bits = f"{len(rows)} 仓 <span class='muted'>· {mix}</span>"
+        if unclaimed:
+            bits += f" <span class='warn'>· QQQ 异常 {unclaimed}</span>"
     if mr_hold:
         bits = (bits + " · " if bits else "") + "<span class='muted'>QQQ(MR)</span>"
-    return _strip_badge("pos", "持仓", bits,
-                        "当前持仓数与方向（QQQ 为超跌 MR 腿，单列）；逐仓细节见「仓位」表",
+    return _strip_badge("warn" if unclaimed else "pos", "持仓", bits,
+                        "当前持仓数与方向（QQQ 为超跌 MR 腿，单列）；逐仓细节见「仓位」表"
+                        + ("；QQQ 异常 = 交易所仓位没有被 MR 台账认领" if unclaimed else ""),
                         "badge-status")
 
 
@@ -379,8 +398,29 @@ def _agent_badge_html(agent: Any, extra_cls: str = "") -> str:
     if cleanup == "done":
         return _strip_badge("neg", "API", "已清仓", "API 授权已到期并触发自动清仓", extra_cls)
     if str(a.get("source") or "") == "kraken-key-no-expiry":
-        # Kraken Derivatives key 无有效期（PR-1），也无代理钱包授权体系
-        return _strip_badge("pos", "API", "不限期", "Kraken API key 无有效期", extra_cls)
+        # Kraken Derivatives key 无有效期（PR-1），但**可用性必须三态**：
+        # 「配置项非空」不等于「能签名」，更不等于「刚刚读通过」。
+        if "configured" not in a:
+            return _strip_badge("muted", "API", "—",
+                                "凭据状态未知（该响应没有三态字段）", extra_cls)
+        if not a.get("configured"):
+            return _strip_badge("neg", "API", "未配置",
+                                "Kraken key/secret 缺失或不成对：执行器无法签名，"
+                                "私有读会失败（面板设置页「更新 API」）", extra_cls)
+        if a.get("last_read_ok") is False:
+            return _strip_badge("neg", "API", "读取失败",
+                                "最近一次私有读取失败："
+                                + str(a.get("verify_error") or "原因未知")
+                                + "（无有效期不等于是可用的 key）", extra_cls)
+        if a.get("verified") is True:
+            age = _opt_num(a.get("verify_age_s"))
+            when = "" if age is None else f"（{max(0.0, age):.0f} 秒前）"
+            return _strip_badge("pos", "API", "已验证",
+                                "最近一次调度轮私有读取成功" + when + "；Kraken key 无有效期",
+                                extra_cls)
+        return _strip_badge("warn", "API", "未验证",
+                            "key/secret 成对存在，但还没有成功的私有读证据："
+                            "下一轮调度读取成功后才算可用", extra_cls)
     if level == "no_expiry":
         return _strip_badge("pos", "API", "不限期", "API 授权未设到期时间", extra_cls)
     if days is None:
@@ -471,27 +511,49 @@ def _coin_of(symbol: Any) -> str:
     return s.split("_")[0] if s else ""
 
 
-def _sz_tick(info: Any, coin: str) -> Optional[float]:
-    """该 coin 的数量步长（`10 ** -sz_decimals`）；取不到返回 None。
+def _tick_from_decimals(dec: Any) -> Optional[float]:
+    try:
+        d = int(dec)
+    except (TypeError, ValueError):
+        return None
+    return 10.0 ** (-d) if 0 <= d <= 12 else None
+
+
+def _sz_tick(info: Any, coin: str, snap: Optional[dict] = None) -> Optional[float]:
+    """该 coin 的数量步长（`10 ** -sz_decimals`）；**零网络**拿不到就返回 None。
 
     止损覆盖判据（`app/hl/stops.covering_stop_px`）用它做「挂单张数够不够」的容差：
-    有交易所精度就用交易所精度，没有就退化成 `sz × 1e-6` 的相对噪声容差。
-    老桩/降级适配层（`SnapshotInfo`）没有 `specs`，这里一律吞掉异常返回 None ——
-    面板不能因为精度查不到就 500，也不能因此把「已保护」说成「无止损」。
+    有精度就用交易所精度，没有就退化成 `sz × 1e-6` 的相对噪声容差（更严）。
+
+    只有两个来源，都不触发网络（第七轮审核 #8：PR21 这里直接调 `info.specs()`，
+    冷缓存时会让 `/admin` 与 `/api/hl/status` 各多打一次 `/instruments`）：
+
+    1. 调度器随快照写下的 `sz_ticks`（`main._panel_sz_ticks`，首选；老快照没有这个键）；
+    2. 只读客户端**已经热了**的规格缓存（`KrInfo._specs_cache`，1h TTL，执行器预热）。
+
+    **不调用 `specs()`**：它是「查一次、可能外呼」的接口，渲染层拿到的对象是不是热的
+    只有它自己知道 —— 生产里 KrInfo 有缓存属性（未热时是 None），但降级适配层/新客户端
+    未必有，留一个「没有缓存属性就问一次」的后门等于把零网络的红线交给类型判断。
+    未热 / 没有缓存 → 返回 None（精度未知）：判据退化成更严的相对容差，宁严不松。
     """
-    if info is None or not coin:
+    if not coin:
+        return None
+    ticks = (snap or {}).get("sz_ticks") if isinstance(snap, dict) else None
+    if isinstance(ticks, dict) and coin in ticks:
+        got = _opt_num(ticks.get(coin))
+        if got and got > 0:
+            return got
+    if info is None:
+        return None
+    cache = getattr(info, "_specs_cache", None)
+    if cache is None:
+        # 没有缓存属性（降级适配层）或缓存未热（None）：精度未知，不外呼。
         return None
     try:
-        spec = (info.specs([coin]) or {}).get(coin) or {}
-        dec = spec.get("sz_decimals")
-        if dec is None:
-            dec = spec.get("szDecimals")
-        dec = int(dec)
-    except Exception:                                              # noqa: BLE001
+        spec = (cache or {}).get(coin) or {}
+    except (TypeError, AttributeError):
         return None
-    if dec < 0 or dec > 12:
-        return None
-    return 10.0 ** (-dec)
+    return _tick_from_decimals(spec.get("sz_decimals", spec.get("szDecimals")))
 
 
 def _stop_order_dicts(orders: Any) -> List[dict]:
@@ -907,6 +969,47 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         if coin and str(d.get("status")) == "open":
             open_by_coin[coin] = d
 
+    # ---------------- MR 腿状态（**先算**：下面「仓位」表要按它分层去重）----------------
+    # 第七轮 B1：交易所快照里本来就有 QQQ，`_render_body` 又会追加一行 MR ——
+    # 同一张仓两行，普通那行必然「❌ 无止损」。去重规则必须是「MR **已认领**才隐藏
+    # 普通行」，而不是按币种一律删：一律删会把「真实存在、但 MR 台账不认」的 QQQ 仓
+    # （手工单 / 台账丢失 / 数量对不上）藏起来，那是最需要被看见的一类异常。
+    mr_out: Optional[dict] = None
+    if deps.mr_fn is not None:
+        try:
+            raw_mr = deps.mr_fn()
+        except Exception:                                         # noqa: BLE001
+            raw_mr = {"state": "error", "error": "mr status read failed"}
+        mr_out = dict(raw_mr) if raw_mr else None
+    if not (isinstance(mr_out, dict) and _as_dict(mr_out.get("pos"))):
+        # 运行时没有 MR 持仓（停用 / 尚未 tick / 刚重启）→ 用台账补位。
+        # **只读**：不改 MR 状态机、不下单，只让「交易所那张仓」有个出处。
+        ledger: Optional[dict] = None
+        try:
+            row = _db_call(deps.db, "mr_open_trade")
+            if row is not None:
+                ld = _rowd(row)
+                lqty = _opt_num(ld.get("qty"))
+                if lqty and lqty > 0:
+                    ledger = {
+                        "qty": lqty,
+                        "entry_price": _opt_num(ld.get("entry_price")),
+                        "signal_date": ld.get("signal_date"),
+                        "entry_session": ld.get("entry_session"),
+                        "entry_ts": _opt_num(ld.get("entry_ts")),
+                        "state": str(ld.get("state") or "OPEN"),
+                    }
+        except Exception as e:                                    # noqa: BLE001
+            logger.warning("[hl-views] 读 MR 台账失败（不展示台账仓）：%s", e)
+            ledger = None
+        if ledger:
+            if mr_out is None:
+                mr_out = {"enabled": False, "state": "unknown", "recon": "unknown"}
+            mr_out["ledger_pos"] = ledger
+    _mr_now = _mr_view({"mr": mr_out}) if mr_out else None
+    mr_claim_qty = _opt_num(_mr_now.get("qty")) if _mr_now else None
+    mr_holding = bool(_mr_now and _mr_now.get("holding"))
+
     # ---------------- 持仓（快照为主，补 DB 的 signal/stop 信息）----------------
     # 判据要按 key 直读挂单（含 order_type），先统一补齐缺键，避免老快照行触发 KeyError。
     stop_orders = _stop_order_dicts(snap_orders)
@@ -919,6 +1022,15 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         entry = _num(d.get("entry_px"))
         mark = _num(d.get("mark_px"))
         upnl = _num(d.get("unrealized_pnl"))
+        # 分层去重：MR 已认领（有持仓且数量对得上）才把普通行让给 MR 行；
+        # 否则保留并标成异常（`mr_unclaimed`），渲染层会把它单独喊出来。
+        unclaimed = coin in MR_COINS
+        if unclaimed:
+            tick = _sz_tick(deps.info, coin, snap) or 0.0
+            tol = tick * 0.5 + 1e-12
+            if (mr_holding and mr_claim_qty and
+                    abs(size - float(mr_claim_qty)) <= tol):
+                continue
 
         # 方向以快照 side 为准（size 是绝对值，不能用来推方向；旧兜底恒返回 1）。
         try:
@@ -937,17 +1049,18 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         if trusted:
             stop_px = hl_stops.covering_stop_px(
                 stop_orders, coin, side=side, sz=size, entry_px=entry,
-                sz_tick=_sz_tick(deps.info, coin))
+                sz_tick=_sz_tick(deps.info, coin, snap))
             has_stop = stop_px is not None
 
         risk = abs(entry - stop_px) * size if (stop_px and entry and size) else 0.0
-        r_unrealized = round(upnl / risk, 4) if risk > 0 else 0.0
+        # 没有（可信的）止损就没有 R 与「止损距离」—— None → 渲染「—」。
+        # 旧版写 0.0：`+0.00R` 读起来像「刚好打平」、`0.00%` 像「止损就在现价」，
+        # 两个数都是凭空造的，而这一行恰恰标着「❌ 无」（第七轮 #5）。
+        r_unrealized = round(upnl / risk, 4) if risk > 0 else None
         if has_stop and stop_px and mark:
             stop_dist_pct = abs(stop_px - mark) / mark
-        elif row is not None:
-            stop_dist_pct = _num(row.get("stop_dist"))
         else:
-            stop_dist_pct = 0.0
+            stop_dist_pct = None
 
         positions_out.append({
             "coin": coin,
@@ -974,6 +1087,8 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             "funding_income": -_num(d.get("funding_since_open")),
             "signal_bar_ms": int(row.get("signal_bar_ms")) if row is not None else None,
             "position_id": int(row.get("id")) if row is not None else None,
+            # 交易所里有 QQQ、但 MR 台账没认领它 → 异常仓，渲染层要显式提示。
+            "mr_unclaimed": bool(unclaimed),
         })
 
     # ---------------- 挂单 ----------------
@@ -1231,8 +1346,20 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     # API 有效期（P3 R3）：状态条徽章的数据源。只读 hl_agent_state DB 缓存
     #（执行器每个整点刷新），面板渲染零网络调用；缺失/损坏一律空 dict → 徽章显「—」。
     agent_out: dict = {}
+    # 注入了统一生产者（main._agent_state）就用它：设置页卡片 / 状态条徽章 / JSON
+    # 三处必须是同一份三态结论（missing / configured / verified）。
+    _agent_fn = getattr(deps, "agent_state_fn", None)
+    if _agent_fn is not None:
+        try:
+            _st = _agent_fn()
+            if isinstance(_st, dict) and _st:
+                agent_out = dict(_st)
+        except Exception as e:                                    # noqa: BLE001
+            logger.warning("[hl-views] 读凭据三态失败（留空 → 徽章显 —）：%s", e)
     info_obj = getattr(deps, "info", None)
-    if info_obj is None or callable(getattr(info_obj, "price_tick", None)):
+    if agent_out:
+        pass
+    elif info_obj is None or callable(getattr(info_obj, "price_tick", None)):
         # Kraken Derivatives API key 无到期概念，也没有代理钱包授权体系：
         # 不读 HL 遗留的 hl_agent_state（那里的到期日会让徽章显示「169 天」）。
         # info 为 None（只读客户端没装配成功）时同样走这条：那时候读 hl_agent_state
@@ -1255,14 +1382,8 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         except Exception as e:                                        # noqa: BLE001
             logger.warning("[hl-views] 读 API 有效期状态失败（徽章显 —）：%s", e)
 
-    # MR 腿状态块：JSON 与面板 HTML 共用（原来只挂在 /api/hl/status 里，面板看不到）
-    mr_out: Optional[dict] = None
-    if deps.mr_fn is not None:
-        try:
-            raw_mr = deps.mr_fn()
-        except Exception:                                         # noqa: BLE001
-            raw_mr = {"state": "error", "error": "mr status read failed"}
-        mr_out = dict(raw_mr) if raw_mr else None
+    # MR 腿状态块：JSON 与面板 HTML 共用 —— 已在「持仓」之前算过（分层去重要用），
+    # 这里不再重复读取（读两次会让同一请求里的 enabled/pos 有机会来自两个版本）。
 
     account_out: Dict[str, Any] = {
         "address": address,
@@ -1291,6 +1412,12 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     return {
         "schema_version": SCHEMA_VERSION,
         "ts": now,
+        # 本次渲染的读数到底来自哪：调度器快照（带年龄）还是实时读取。
+        # 徽章只认这个字段 —— `SnapshotInfo.age_s()` 报的是「库里最新一行多旧」，
+        # 快照过期回落实时后它仍在涨，会让面板写「数据 16 分钟前」而实际是实时值
+        # （第七轮 #6：年龄与来源必须同一件事）。
+        "panel_snapshot_age_s": _opt_num(snap.get("panel_snapshot_age_s")),
+        "data_source": ("snapshot" if snap.get("panel_snapshot_age_s") is not None else "live"),
         "mode": mode,
         "kill": bool(kill),
         "kill_reason": kill_reason,
@@ -2193,32 +2320,91 @@ def _mr_phase_text(mr: Dict[str, Any]) -> str:
     return _MR_PHASE_TEXT.get(phase, "空仓")
 
 
+#: MR 腿的展示币种（与执行器 ``MR_LEG_COINS`` 同一组；面板只用来分层去重）。
+MR_COINS = frozenset({"QQQ"})
+
+#: MR 运行时状态（``mr.py`` 的 ``status["state"]``）→ 面板一句话。
+#:
+#: 这些状态原来在面板上**完全不可见**：``_mr_phase_text`` 只看信号相位，于是
+#: ``action_required``（需人工核对）/ ``order_gate_blocked``（被风控闸门拦下）/
+#: ``dry_run``（影子模式，一张真单都没发）全都渲染成「空仓」—— 最需要人动手的三种
+#: 状态在页面上长得跟「什么都没发生」一模一样（第七轮复审）。
+_MR_STATE_TEXT = {
+    "action_required": "需人工核对",
+    "order_gate_blocked": "风控闸门拦下",
+    "dry_run": "影子模式（未真实下单）",
+    "error": "异常",
+    "no_equity": "权益不足",
+    "no_data": "无标记价",
+    "total_notional_unknown": "名义未知（本轮不下单）",
+    "skipped_total_notional": "放弃信号（名义上限）",
+    "margin_mode_failed": "保证金模式失败",
+}
+
+
 def _mr_view(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """把 `status.mr` 归一成面板用的视图；停用且空仓 → None（正常态整块不出现）。
 
     口径（2026-11-02）：离场线 = 最近 4 个已完成会话收盘均值（与 `close > SMA5` 等价）；
     「距离场%」正 = 现价仍在线下方（多单安全）。
+
+    **台账仓（第七轮 B1 / 2026-11-13）**：``status.mr`` 里可能只有 ``ledger_pos``
+    （MR 停用/尚未 tick，但 DB ``mr_trades`` 里有一行 OPEN）。这时仍要展示 —— 交易所
+    上那张 QQQ 仓是真的，藏起来等于让人忘了它；同时明确标出 ``auto_exit=False``
+    （MR 停用 = 不管理，不会自动离场），别再出现「以为它会自己走」的误解。
+
+    **运行时状态（第七轮复审）**：``state`` / ``error`` / ``action_required`` 原样带出，
+    台账仓、闸门拦下、影子模式、需人工核对都必须能在页面上看见（见 `_MR_STATE_TEXT`）。
     """
     mr = _as_dict(p.get("mr"))
     if not mr:
         return None
     pos = _as_dict(mr.get("pos"))
+    ledger = _as_dict(mr.get("ledger_pos"))
     enabled = bool(mr.get("enabled"))
-    if not enabled and not pos:
+    from_ledger = not pos and bool(ledger)
+    if not enabled and not pos and not ledger:
         return None
     sig = _as_dict(mr.get("signal"))
-    holding = bool(pos)
-    entry = _opt_num(pos.get("entry_price"))
-    mark = _opt_num(pos.get("mark")) or _opt_num(mr.get("mark"))
-    exit_line = _opt_num(pos.get("exit_line")) or _opt_num(sig.get("exit_line"))
-    dist_exit = _opt_num(pos.get("dist_to_exit_pct"))
+    src = ledger if from_ledger else pos
+    holding = bool(pos) or bool(ledger)
+    entry = _opt_num(src.get("entry_price"))
+    mark = _opt_num(src.get("mark")) or _opt_num(mr.get("mark"))
+    exit_line = _opt_num(src.get("exit_line")) or _opt_num(sig.get("exit_line"))
+    dist_exit = _opt_num(src.get("dist_to_exit_pct"))
+    # 运行时状态与「需人工核对」的证据包（mr.py 的 _action_required 写入）。
+    state = str(mr.get("state") or "")
+    error = str(mr.get("error") or "")
+    ar = _as_dict(mr.get("action_required"))
+    ar_kind = str(ar.get("kind") or "")
+    ar_reason = str(ar.get("reason") or "")
+    state_txt = _MR_STATE_TEXT.get(state, "")
+    recon_bad = (str(mr.get("recon") or "") == "err" or state == "recon_err")
+    if recon_bad:
+        status = "对账不平"
+    elif ar or state == "action_required":
+        status = "需人工核对"
+    elif state_txt:
+        status = state_txt
+    elif not enabled and from_ledger:
+        status = "停用（不会自动离场）"
+    elif not enabled:
+        status = "停用"
+    elif holding:
+        status = "持仓中"
+    else:
+        status = _mr_phase_text(mr)
+    # 一句可执行的原因（面板与 /api/hl/status 同一份文案；不编造，没有就空串）。
+    detail = ar_reason or (error if (state_txt or recon_bad) else "")
+    if ar and ar_kind:
+        detail = f"{ar_kind}：{detail}" if detail else ar_kind
     return {
         "enabled": enabled, "holding": holding, "recon": mr.get("recon"),
-        "qty": _opt_num(pos.get("qty")), "entry": entry, "mark": mark,
-        "upnl": _opt_num(pos.get("upnl")), "upnl_pct": _opt_num(pos.get("upnl_pct")),
-        "notional": _opt_num(pos.get("notional")), "margin": _opt_num(pos.get("margin")),
-        "leverage": _opt_num(pos.get("leverage")),
-        "entry_ts": _opt_num(pos.get("entry_ts")),
+        "qty": _opt_num(src.get("qty")), "entry": entry, "mark": mark,
+        "upnl": _opt_num(src.get("upnl")), "upnl_pct": _opt_num(src.get("upnl_pct")),
+        "notional": _opt_num(src.get("notional")), "margin": _opt_num(src.get("margin")),
+        "leverage": _opt_num(src.get("leverage")),
+        "entry_ts": _opt_num(src.get("entry_ts")),
         "exit_line": exit_line, "dist_to_exit_pct": dist_exit,
         "dist_to_entry_pct": ((mark / entry - 1.0) * 100.0
                               if (holding and entry and mark) else None),
@@ -2227,10 +2413,16 @@ def _mr_view(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "sessions_usable": sig.get("sessions_usable"),
         "next_eval_et": sig.get("next_eval_et"),
         "phase": sig.get("phase"), "window": _as_dict(sig.get("window")),
-        "status": ("对账不平" if (str(mr.get("recon") or "") == "err"
-                             or str(mr.get("state") or "") == "recon_err")
-                   else ("停用" if not enabled
-                         else ("持仓中" if holding else _mr_phase_text(mr)))),
+        # 台账行只读、且停用时不管理：这两个字段驱动渲染层提示「不会自动离场」。
+        "from_ledger": bool(from_ledger),
+        "auto_exit": bool(enabled),
+        "read_only": bool(from_ledger or not enabled),
+        # 运行时状态：面板必须能看见「需人工核对 / 闸门拦下 / 影子模式」。
+        "state": state, "state_text": state_txt, "error": error,
+        "action_required": bool(ar), "action_kind": ar_kind,
+        "action_reason": ar_reason, "detail": detail,
+        "anomaly": bool(ar or recon_bad or state_txt),
+        "status": status,
     }
 
 
@@ -2248,6 +2440,9 @@ def _mr_card_line(p: Dict[str, Any]) -> str:
         parts.append(f"现价 {_fmt(mr['mark'])}")
     if mr["holding"]:
         parts.append(f"持仓 多 {_fmt_sz(mr.get('qty'))} @ {_fmt(mr.get('entry'))}")
+        if mr.get("from_ledger"):
+            # 台账来源（MR 未 tick/已停用）：价格/浮盈不是实时读数，必须标出来
+            parts.append("（台账）")
         if mr.get("dist_to_entry_pct") is not None:
             parts.append(f"距入场 {mr['dist_to_entry_pct']:+.2f}%")
         upnl_txt, upnl_cls = _sign(mr.get("upnl"))
@@ -2267,11 +2462,21 @@ def _mr_card_line(p: Dict[str, Any]) -> str:
                      + ("（已站上，等收盘）" if d < 0 else ""))
     if mr.get("next_eval_et"):
         parts.append(f"下一次评估 {_et_iso_local(mr['next_eval_et'])}")
-    status_css = "neg" if mr.get("status") == "对账不平" else "muted"
+    # 运行时异常（需人工核对 / 闸门拦下 / 影子模式 / API 异常）：状态词不能只染成
+    # 灰色说明 —— 这三种状态下 MR 这一轮**没有按预期工作**，必须一眼看见。
+    if mr.get("action_required") or mr.get("recon") == "err" or mr.get("error"):
+        status_css = "neg"
+    elif mr.get("anomaly"):
+        status_css = "warn"
+    else:
+        status_css = "muted"
+    detail_html = (f" <span class='{status_css}'>{_esc(mr['detail'])}</span>"
+                   if mr.get("detail") else "")
     return ("<div class='mrline'>"
             "<b>超跌腿 · QQQ</b> <span class='muted'>MR</span> "
             + "".join(f"{x} · " for x in parts)
-            + f"<b class='{status_css}'>{_esc(mr['status'])}</b></div>")
+            + f"<b class='{status_css}'>{_esc(mr['status'])}</b>"
+            + detail_html + "</div>")
 
 
 def _sign(v: Any, unit: str = " U") -> tuple:
@@ -2287,6 +2492,90 @@ def _neg_txt(v: Any, txt: str) -> str:
     """统计行里负值标红（现有 neg 类）；0 与正值原样返回。"""
     f = _opt_num(v)
     return f"<span class='neg'>{txt}</span>" if (f is not None and f < 0) else txt
+
+
+# ---------------------------------------------------------------- 已实现亏损熔断：解除前复核
+# 口径必须与执行器 `Executor._realized_dd_guard`（ExecParams 的默认值）一致：
+# 近 N 天 Σ(closed_pnl − fee) / 当前权益，rate ≤ −kill 即熔断。这里**只读复核**，
+# 不改判据、不重置任何基线 —— 真正的风控动作在执行器里。
+REALIZED_DD_WINDOW_DAYS = 30
+REALIZED_DD_KILL_PCT = 0.20
+
+
+def equity_hint(db: Any, cfg: Any = None) -> tuple:
+    """当前权益的最佳可得值（**零网络**）→ ``(value|None, 来源说明)``。
+
+    优先用面板快照里调度器刚读到的权益（≤ 快照过期阈值），否则退回配置里的定仓基数
+    （``equity``）。两者都拿不到 → ``(None, ...)``：调用方必须把它写成「无法判定」，
+    绝不能拿 0 当权益（比率会被放大成任何数）。
+    """
+    try:
+        from app.panel_store import DEFAULT_STALE_S
+    except Exception:                                             # noqa: BLE001
+        DEFAULT_STALE_S = 900.0
+    try:
+        row = db.panel_snapshot_latest() if db is not None else None
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] 读面板快照权益失败（退回配置基数）：%s", e)
+        row = None
+    if row:
+        try:
+            age = time.time() - float(row.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            age = DEFAULT_STALE_S + 1
+        snap = row.get("snapshot") or {}
+        eq = _opt_num((snap or {}).get("equity_total")) or _opt_num((snap or {}).get("equity"))
+        if 0 <= age <= DEFAULT_STALE_S and eq and eq > 0:
+            return eq, f"面板快照（{int(age // 60)} 分钟前）"
+    base = _opt_num(getattr(cfg, "equity", None)) if cfg is not None else None
+    if base and base > 0:
+        return base, "配置里的定仓基数"
+    return None, "权益不可得"
+
+
+def realized_dd_clear_block(db: Any, cfg: Any = None, equity: Any = None) -> Optional[dict]:
+    """解除「已实现亏损熔断」之前，用**同一个 30 天窗口**再算一遍。
+
+    为什么需要（第七轮 B7 / 信号报告 F2）：判据是滚动窗口，解除后下一轮（≤5 分钟）
+    会再触发 —— 面板/curl 承诺「可以恢复」，实际按下去必然弹回来，唯一的累计亏损
+    保护看起来像坏按钮。政策（本轮用户拍板）：**保留 30 天窗口、不重置基线**；
+    仍越阈值时**拒绝解除并解释剩余亏损与阈值**。
+
+    返回 ``None`` 表示「不判」（熔断线关掉 / 权益不可得 → 不该拦），否则返回::
+
+        {"net", "rate", "base", "window_days", "kill_pct", "warn_pct", "over"}
+
+    ``over=True`` 时调用方必须拒绝解除，并把 net / rate / base 原样解释给用户。
+    """
+    win = int(getattr(cfg, "realized_dd_window_days", REALIZED_DD_WINDOW_DAYS) or 0)
+    kill = float(getattr(cfg, "realized_dd_kill_pct", REALIZED_DD_KILL_PCT) or 0.0)
+    warn = float(getattr(cfg, "realized_dd_warn_pct", 0.10) or 0.0)
+    if win <= 0 or kill <= 0:
+        return None
+    base = _opt_num(equity)
+    if base is None or base <= 0:
+        return None
+    try:
+        net = float(db.hl_realized_net_since(time.time() - win * 86400.0) or 0.0)
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] 读已实现净额失败（不拦解除）：%s", e)
+        return None
+    rate = net / base
+    return {"net": net, "rate": rate, "base": base, "window_days": win,
+            "kill_pct": kill, "warn_pct": warn, "over": rate <= -kill}
+
+
+def realized_dd_refusal_text(detail: Dict[str, Any]) -> str:
+    """拒绝解除时的人话（同一条文案给面板与 curl，避免两处口径分叉）。"""
+    net = _num(detail.get("net"))
+    base = _num(detail.get("base"))
+    rate = _num(detail.get("rate"))
+    return (f"未解除：近 {int(_num(detail.get('window_days'), 30))} 天已实现净额 "
+            f"{net:+,.2f}U（{rate * 100:+.1f}%），仍越过熔断线 "
+            f"-{_num(detail.get('kill_pct'), REALIZED_DD_KILL_PCT) * 100:g}%"
+            f"（按权益 {base:,.2f}U 计）。亏损窗口没有重置：确认基线等于改风控口径，"
+            f"面板不提供该动作。要继续交易请等 30 天滚动窗口自然回正，"
+            f"或按 runbook 由人工直接改 DB/停用执行器。")
 
 
 def _grace_seconds_cfg(cfg: Any) -> float:
@@ -2626,7 +2915,8 @@ def _render_body(p: dict) -> str:
     o.append(_badge(_MODE_CLS.get(mode, "muted"), "模式", _esc(_MODE_TXT.get(mode, mode)),
                     "badge-status"))
     o.append(_health_badge_html(system, kill, kill_reason))
-    o.append(_positions_badge_html(positions, p.get("mr")))
+    o.append(_positions_badge_html(positions, p.get("mr"),
+                                   reachable=bool(_as_dict(p.get("network")).get("reachable", True))))
     o.append("</span>")
     o.append("<span class='bar-secondary'>")
     lat_txt = f"{latency:.0f} ms" if latency is not None else "—"
@@ -2754,8 +3044,14 @@ def _render_body(p: dict) -> str:
                 stop_cell = "<span class='muted'>? 无法确认</span>"
             else:
                 stop_cell = "<span class='neg'>&#10060; 无</span>"
+            # 交易所里有 QQQ 但 MR 台账没认领：这行必须按「异常」标出来，否则它就是
+            # 一张没人管、没有止损、且不知道属于谁的仓（第七轮 B1 要求不能藏）。
+            coin_cell = f"<b>{_esc(pos.get('coin') or '—')}</b>"
+            if pos.get("mr_unclaimed"):
+                coin_cell += " <span class='warn' title='交易所仓位没有被 MR 台账认领："\
+                             "可能是手工单、台账丢失或数量对不上'>未认领</span>"
             o.append("<tr>"
-                     + _td(f"<b>{_esc(pos.get('coin') or '—')}</b>")
+                     + _td(coin_cell)
                      + _td(f"<b>{side_txt}</b>")
                      + _td(_fmt_sz(pos.get("size")), "num hidem")
                      + _td(_fmt(pos.get("entry_px")), "num")
@@ -2775,13 +3071,15 @@ def _render_body(p: dict) -> str:
             # 小字行：与表格同一份 payload 数值、同一套格式化函数（同一事实一种写法），
             # 只是载体不同 —— 窄屏隐藏列时由它补足，宽屏整个 <tr> 被 CSS 藏掉。
             subm_fund = f" · 本单资金费 {fund_txt}" if show_fund_col else ""
+            subm_extra = (" · ⚠️ 未被 MR 台账认领（手工单 / 台账缺失）：不会自动离场"
+                          if pos.get("mr_unclaimed") else "")
             o.append(f"<tr class='subm'><td colspan='{ncol}'>"
                      f"数量 {_fmt_sz(pos.get('size'))} · "
                      f"{_lev_text(pos, long=True)}"
                      f"{' 逐' if pos.get('isolated') else ''} · "
                      f"保证金 {_fmt(pos.get('margin_used'))} U · "
                      f"强平 {_fmt(pos.get('liq_px')) if _opt_num(pos.get('liq_px')) else '—'}"
-                     f"{subm_fund}</td></tr>")
+                     f"{subm_fund}{subm_extra}</td></tr>")
         if mr is not None and mr["holding"]:
                 upnl_txt, upnl_cls = _sign(mr["upnl"])
                 pct = mr["upnl_pct"]
@@ -2790,8 +3088,11 @@ def _render_body(p: dict) -> str:
                 pct_txt = (f" · {pct:+.2f}%（价格）" if pct is not None else "")
                 dist_txt = (f"{mr['dist_to_exit_pct']:+.2f}%"
                             if mr["dist_to_exit_pct"] is not None else "—")
+                # 台账来源（MR 停用/未 tick）→ 明确写「台账」，别让人以为这是实时状态。
+                mr_src = (" <span class='muted'>MR · 台账</span>" if mr.get("from_ledger")
+                          else " <span class='muted'>MR</span>")
                 o.append("<tr>"
-                         + _td("<b>QQQ</b> <span class='muted'>MR</span>")
+                         + _td("<b>QQQ</b>" + mr_src)
                          + _td("<b>多</b>")
                          + _td(_fmt_sz(mr.get("qty")), "num hidem")
                          + _td(_fmt(mr.get("entry")), "num")
@@ -2809,7 +3110,17 @@ def _render_body(p: dict) -> str:
                 o.append(f"<tr class='subm'><td colspan='{ncol}'>"
                          f"离场线(SMA5) {_fmt(mr.get('exit_line'))} · 距离场 {dist_txt} · "
                          f"数量 {_fmt_sz(mr.get('qty'))} · 保证金 {_fmt(mr.get('margin'))} U · "
-                         f"下一次评估 {_et_iso_local(mr.get('next_eval_et'))}</td></tr>")
+                         f"下一次评估 {_et_iso_local(mr.get('next_eval_et'))}"
+                         # 「不会自动离场」只在真的不管理时写（auto_exit=False）；
+                         # 单纯是台账来源但 MR 仍启用 → 只是数据还没到，别吓人。
+                         + (" · ⚠️ MR 未启用：不会自动离场，需人工处理（离场线仅供参考）"
+                            if not mr.get("auto_exit") else
+                            (" · 台账读数（下一轮 MR tick 后转为实时）"
+                             if mr.get("from_ledger") else ""))
+                         # 运行时异常（需人工核对 / 闸门拦下 / 影子模式）：原因写在小字行，
+                         # 否则「持仓中」这一行会把「这一轮其实没按预期工作」盖掉。
+                         + (f" · ⚠️ {_esc(mr['detail'])}" if mr.get("detail") else "")
+                         + "</td></tr>")
         o.append("</tbody></table></div></div>")
         # 图例（可见文字，iOS 无悬停）：ROE 口径收口 + 窄屏小字行的存在说明。
         o.append('<div class="legend">浮盈 % = 浮盈 ÷ 保证金（ROE）· '

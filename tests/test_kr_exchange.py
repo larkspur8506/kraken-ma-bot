@@ -9,7 +9,7 @@ import unittest
 
 from app.kr.exchange import (KrExchange, _coerce_cloid, make_cloid,
                              parse_order_response, STATUS_DRY, STATUS_ERROR,
-                             STATUS_FILLED, STATUS_RESTING)
+                             STATUS_FILLED, STATUS_RESTING, STATUS_UNKNOWN)
 
 
 class _StubInfo:
@@ -313,11 +313,17 @@ class TestOrderStatusMachine(unittest.TestCase):
         self.assertTrue(out["not_executed"])
 
     def test_filled_without_execution_detail_fails_closed(self):
-        """说 filled 却没 EXECUTION 明细 → ok=False（绝不编造成交价/量）。"""
+        """说 filled 却没 EXECUTION 明细 → ok=False（绝不编造成交价/量）。
+
+        status 是 `unknown` 而不是 `error`（2026-11-13 复审 A2）：交易所明说「成交了」，
+        只是成交价/量拿不到 —— 这不是「明确没下单」，执行器**不能**按旧仓位量重挂
+        止损/重发平仓；它能做的只有刷新持仓/成交后再判。判据仍 fail-closed：
+        不编价、不编量。
+        """
         out = parse_order_response({"result": "success", "sendStatus": {
             "status": "filled", "order_id": "o-1"}})
         self.assertFalse(out["ok"])
-        self.assertEqual(out["status"], STATUS_ERROR)
+        self.assertEqual(out["status"], STATUS_UNKNOWN)
         self.assertIsNone(out["avg_px"])
         self.assertIsNone(out["filled_sz"])
         self.assertIn("EXECUTION", out["error"])

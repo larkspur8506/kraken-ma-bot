@@ -24,8 +24,11 @@ class TestCoveringStop(unittest.TestCase):
     def test_undersized_does_not_cover(self):
         self.assertFalse(has_covering_stop([_o(sz=0.5)], "BTC", side=1, sz=1.0,
                                            entry_px=100.0))
-        # 一个 tick 的差额算覆盖（交易所数量精度）
-        self.assertTrue(has_covering_stop([_o(sz=0.9999)], "BTC", side=1, sz=1.0,
+        # 一个完整 tick 是真实未覆盖的余量，不再当噪声吞掉（第七轮 A1）。
+        self.assertFalse(has_covering_stop([_o(sz=0.9999)], "BTC", side=1, sz=1.0,
+                                           entry_px=100.0, sz_tick=0.0001))
+        # 仅浮点噪声（远小于半格）仍算覆盖。
+        self.assertTrue(has_covering_stop([_o(sz=0.99999999)], "BTC", side=1, sz=1.0,
                                           entry_px=100.0, sz_tick=0.0001))
 
     def test_take_profit_is_not_a_stop(self):

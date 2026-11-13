@@ -10,6 +10,10 @@
 
 **红线**
     - 写只发生在调度器线程（`main.capture_panel_snapshot`），面板永不写。
+    - **面板渲染零网络**：止损覆盖判据要的「数量精度」由调度器随快照写进
+      `snapshot["sz_ticks"]`（见 `main._panel_sz_ticks`），渲染层只读库/内存缓存，
+      不再调 `specs()`（后者冷缓存会打 `/instruments`）。老快照没有这个键时
+      按「精度未知」处理 → 退化成严格的相对容差（fail-closed）。
     - 这张表是观测表：交易 / 风控 / 对账 / 看护一律不读它（与 `hl_snapshots` 同一约定）。
     - 快照缺失或过期时**自动回落到实时读取**（回落对象是 `PanelInfo`，即 A1 那层 10s 缓存），
       所以「调度器挂了」的后果是面板变慢，而不是面板空白或显示假数字。
@@ -102,9 +106,13 @@ class SnapshotInfo:
             return self._fallback_snapshot(address, None)
         data = copy.deepcopy(snap["snapshot"])
         # 让视图层知道「这份数据是几分钟前的」，用于状态条标注；不改变任何数值。
-        data.setdefault("panel_snapshot_age_s",
-                        round(max(0.0, self._clock() - float(snap.get("ts") or 0.0)), 1))
-        data.setdefault("panel_snapshot_source", snap.get("source") or "")
+        #
+        # 用**赋值**而不是 setdefault：这两个键描述的是「本次读到的这一行」，
+        # 快照体里若残留上一次的年龄（老行/手工写入），setdefault 会把它当成新值
+        # 继续往下传 —— 状态条就会报一个与来源无关的数字。
+        data["panel_snapshot_age_s"] = round(
+            max(0.0, self._clock() - float(snap.get("ts") or 0.0)), 1)
+        data["panel_snapshot_source"] = snap.get("source") or ""
         return data
 
     def all_mids(self) -> Dict[str, float]:
