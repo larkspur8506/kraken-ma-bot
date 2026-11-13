@@ -34,6 +34,11 @@ DEFAULT_MAX_LEVERAGE = {"BTC": 100, "ETH": 100, "SOL": 100, "QQQ": 20}
 _IOC_ORDER = "ioc"
 _STOP_ORDER = "stp"
 
+#: 「结果未知」：请求已发出，但无法判定交易所是否受理/成交（transport 异常、
+#: HTTP 5xx/408/425/429、回包不可解析、「说成交但没有 EXECUTION 明细」）。
+#: `ok` 仍为 False；`status` 单独一个取值 —— 见 `_unknown()`。
+STATUS_UNKNOWN = "unknown"
+
 
 def make_cloid(symbol: str, bar_ms: int, purpose: str) -> str:
     """确定性 cliOrdId（0x + 32 hex，34 字符 ≤ Kraken 64 上限）。
@@ -71,6 +76,38 @@ def _ok(status: str, oid=None, avg_px=None, filled_sz=None, raw=None,
 def _err(msg: str, raw: Any = None, status: str = STATUS_ERROR) -> dict:
     return {"ok": False, "status": status, "oid": None, "avg_px": None,
             "filled_sz": None, "raw": raw, "error": msg, "not_executed": False}
+
+
+def _unknown(msg: str, raw: Any = None) -> dict:
+    """「结果未知」回执：请求**已经发出**，但无法判定交易所是否受理/成交。
+
+    为什么用一个独立的 status 而不是新增键：``parse_order_response`` 的**键集合**是
+    跨组契约（`tests/test_kr_exchange.py::test_contract_keys_unchanged` 逐键断言，
+    消费侧也按这些键取值）。订单状态本来就住在 ``status`` 里，加一个 ``unknown``
+    取值不改形状，而且 ``ok`` 仍是 False —— 老的「非 ok 即失败」消费方行为不变。
+
+    消费契约（executor）：见到 `status=unknown` **禁止**盲重发平仓/按旧量挂止损，
+    必须先刷新可信持仓/挂单/成交（2026-11-13 复审 A2）。
+    """
+    return _err(msg, raw, status=STATUS_UNKNOWN)
+
+
+def _http_ambiguous(status: int) -> bool:
+    """这个 HTTP 状态能否断言「交易所没受理这张单」。
+
+    4xx（400/401/403/404/422…）是交易所明确拒绝：没下单、没成交。
+    其余（0 = 没有状态；408/425/429；5xx）都可能在服务端**已经处理过**——
+    网关超时/限流/服务端错误都可能在写操作落库之后才返回。
+    """
+    try:
+        st = int(status or 0)
+    except (TypeError, ValueError):
+        return True
+    if st <= 0:
+        return True
+    if st in (408, 425, 429):
+        return True
+    return st >= 500
 
 
 def _f(v, default: float = 0.0) -> float:
@@ -114,16 +151,17 @@ def parse_order_response(resp: dict) -> dict:
     「oid 为空」撤不掉 → 留在交易所裸奔。
     """
     if not isinstance(resp, dict):
-        return _err(f"响应不是 dict：{str(resp)[:200]}", resp)
+        # 200 但回包不是 JSON/dict（网关错误页、被截断的响应）：单子可能已经受理。
+        return _unknown(f"响应不是 dict：{str(resp)[:200]}", resp)
     send = resp.get("sendStatus")
     if not isinstance(send, dict):
-        return _err(f"响应缺 sendStatus：{str(resp)[:200]}", resp)
+        return _unknown(f"响应缺 sendStatus：{str(resp)[:200]}", resp)
     status_raw = send.get("status")
     status = str(status_raw or "").strip().lower()
     if not status:
         # 没状态就无从判定「成交 / 在场 / 没成交」——宁可当失败让调用方停手，
         # 也不能回一个 RESTING 让执行器去撤一张不存在的单。
-        return _err(f"响应缺 sendStatus.status（无法判定订单状态）：{str(resp)[:200]}", resp)
+        return _unknown(f"响应缺 sendStatus.status（无法判定订单状态）：{str(resp)[:200]}", resp)
     events = send.get("orderEvents") or []
     oid = send.get("order_id") or send.get("orderId")
     if not oid and isinstance(events, list):
@@ -167,7 +205,9 @@ def parse_order_response(resp: dict) -> dict:
         return _ok(STATUS_RESTING, oid=oid, raw=resp, not_executed=True)
     if status in ("filled", "partiallyfilled"):
         # 说成交却没有任何 EXECUTION 明细 —— 成交价/量不可信，绝不编造成交价。
-        return _err(f"订单状态 {status_raw} 但无 EXECUTION 明细（成交价/量不可信）", resp)
+        # 但**成交这个事实**是交易所自己说的：仓位很可能已经变了，调用方必须按
+        # 「结果未知」处理（刷新持仓/成交后再动作），不能当成「明确没成交」去重发。
+        return _unknown(f"订单状态 {status_raw} 但无 EXECUTION 明细（成交价/量不可信）", resp)
     reason = "; ".join(rejects) or str(status_raw or "") or "unknown"
     return _err(f"订单被拒：{reason}", resp)
 
@@ -322,9 +362,17 @@ class KrExchange:
         try:
             resp = self.endpoints.sendorder(params)
         except KrApiError as e:
-            return _err(f"下单被拒：{_exc_text(e)}", e.raw)
+            # 交易所**明确拒绝**（4xx / result=error）：没下单、没成交，可以安全重试/补救。
+            # 但 5xx / 408 / 429 是在写操作之后才失败的，单子可能已经受理 → 结果未知。
+            msg = f"下单被拒：{_exc_text(e)}"
+            if _http_ambiguous(getattr(e, "status", 0)):
+                return _unknown(msg, e.raw)
+            return _err(msg, e.raw)
         except Exception as e:                               # noqa: BLE001
-            return _err(f"下单异常：{_exc_text(e)}")
+            # 超时/连接重置/回包解析失败：请求**已经发出**，交易所可能已经受理并成交，
+            # 只是响应没回来。这里不能声称「没下单」——执行器据此决定是否重发，
+            # 判错就是「真实已成交 + 又发一张 reduce-only」(2026-11-13 复审 A2)。
+            return _unknown(f"下单异常：{_exc_text(e)}")
         out = parse_order_response(resp)
         out["request"] = {"coin": coin, "symbol": symbol, "is_buy": is_buy, "sz": sz,
                           "limit_px": limit_px, "reduce_only": reduce_only,

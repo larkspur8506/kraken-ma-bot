@@ -44,14 +44,16 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, time as _at_time
+from datetime import datetime, time as _at_time, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from app import mr_signal
+from app.hl import (ST_FAILED, ST_FILLED, ST_INTENT, ST_PLANNED, ST_RESTING, ST_SENT)
 from app.hl.exchange import _clean_alert_text, make_cloid
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,27 @@ MR_EVENT_KIND = "mr_admin"
 #: 下单意图事件（成交确认丢失时的认领凭据）：写在下单**之前**，每轮重试各一条。
 _ENTRY_INTENT_KIND = "mr_entry_intent"
 _EXIT_INTENT_KIND = "mr_exit_intent"
+
+#: MR 影子订单的 purpose（写进 `hl_orders`，**不是**交易所挂单）。
+#: 用途只有一个：让「当日下单上限 / 近一小时失败」这两道已有的风控闸门看得见 MR。
+#: 前缀 `mr_` 与主腿的 entry/stop/exit 分开：主腿的当日计数只数 purpose=='entry'，
+#: 两腿各数各的；失败计数按 status 统计，所以 MR 的失败也进全局失败熔断
+#: （fail-closed：只挡**新仓**，永不挡离场）。
+MR_PURPOSE_ENTRY = "mr_entry"
+MR_PURPOSE_EXIT = "mr_exit"
+#: 风控阈值复用主策略同一组 env（**不新增旋钮**）：`main.hl_params()` 读的也是这两个键，
+#: 所以面板/部署侧不存在第二处配置。
+ORDERS_PER_DAY_ENV = "HL_MAX_ORDERS_PER_DAY"
+FAIL_STREAK_ENV = "HL_MAX_FAIL_STREAK"
+DEFAULT_MAX_ORDERS_PER_DAY = 4
+DEFAULT_MAX_FAIL_STREAK = 3
+#: 需人工核对的事件 kind（B5 的恢复证据路径：面板/值班能查到「为什么停下」）。
+ACTION_REQUIRED_KIND = "mr_action_required"
+#: 离场「结果未知」的**阻塞上限**（秒）。IOC 在几秒内就定局：过了这个窗口还查不到
+#: 成交，说明取证本身不可用，而不是「单还在飞」。继续不发单 = 仓位无限期裸奔
+#: （MR 不挂止损），而下行只是「多一张 reduce-only 单」——不产生新敞口、不会反手。
+#: 所以超过这个窗口就把旧尝试收口成 failed，允许下一张离场（会计仍按证据/缺口标注）。
+_EXIT_UNKNOWN_BLOCK_S = 30 * 60.0
 #: taker 费率（HIP-3 xyz 实测 0.09%/边）——净盈亏的估算项。
 #: 单边 taker 费率，用于 fee_est（每次开/平各算一次名义 × 该值）。
 #: 旧值 0.0009 是 HL 的往返口径（4.5bp/边 × 2）且被当成单边用了 → 双倍高估。
@@ -89,6 +112,55 @@ def parse_total_notional_mult(raw: Any) -> float:
     if val != val or val <= 0:          # NaN / 非正数 = 不设限
         return 0.0
     return val
+
+
+#: 有成交证据的价格来源（不算估算）：`fills`=交易所成交、`avg_px`=下单回执均价、
+#: `order_receipt`=离场尝试影子行里的回执均价。三者都是交易所给的价；`limit_px` /
+#: `mark_estimated` / `all_mids` 是估算（关账时 `net_pnl_complete=False`）。
+_EVIDENCE_PRICE_SOURCES = ("fills", "avg_px", "order_receipt")
+
+
+def _price_is_evidence(source: Any) -> bool:
+    """该价格来源是否算「成交证据」（决定 `estimated` / `net_pnl_complete`）。"""
+    return str(source or "") in _EVIDENCE_PRICE_SOURCES
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    """数量/金额口径的 NaN / ±Inf / None / 脏串防护 → float（不可用则 default）。
+
+    为什么要单列：`covered_qty=NaN` 会让结算里所有 `>` / `<` 比较**都变假** ——
+    既不写 `reconciliation`、又把 NaN 净利写进台账，等于静默错误关账。数量口径一律
+    走这里（回执 `filled_sz` 是交易所给的，脏值只能当「不可用」）。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return out if math.isfinite(out) else float(default)
+
+
+def _int_env(name: str, default: int) -> int:
+    """env → int（脏值/缺键退回 default）。
+
+    与 `main.hl_params()` 同一解析口径（`int(f(NAME, default))`）：读不懂时**不退回 0**
+    —— 0 在两道闸门里的语义是「一律拒绝」，一个读坏的字符串不该把 MR 永久锁死。
+    """
+    raw = os.environ.get(name, "")
+    try:
+        return int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _day_start_ts(now_s: float) -> float:
+    """当日 0 点的**展示时区**时间戳（默认 UTC+8）。
+
+    与 `executor._today_start_ts` 同口径（同一个 `DISPLAY_TZ_OFFSET`）：两腿的「当日
+    下单数」必须按同一个日界切，否则同一天在两条腿上会得到不同的计数。
+    """
+    tz = timezone(timedelta(hours=int(os.environ.get("DISPLAY_TZ_OFFSET", "8"))))
+    d = datetime.fromtimestamp(float(now_s), tz)
+    return d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
 @dataclass(frozen=True)
@@ -176,10 +248,19 @@ class HlMrLeg:
     # ------------------------------------------------------------------ 读
 
     def _enabled(self) -> bool:
+        """`mr_enabled` 布尔口径：**统一 strip + lower** 后再判。
+
+        面板写的是 "1"/"0"，但手工改库/旧脚本会写 " 1 "、"TRUE"、"On"、"yes"。
+        旧实现只做 `in ("1","true","on")` 精确匹配 → 带空格或大写会被静默当成**停用**
+        （MR 不再进场，也不会有任何告警，看起来像「策略没信号」）。
+        反过来「读不懂」仍然按停用处理（fail-closed，与 kill 的语义一致）。
+        """
         try:
-            return self.db.get_config_str("mr_enabled", "0") in ("1", "true", "on")
+            raw = self.db.get_config_str("mr_enabled", "0")
         except Exception:                                     # noqa: BLE001
             return False
+        return str(raw if raw is not None else "").strip().lower() in (
+            "1", "true", "on", "yes")
 
     def _global_kill(self) -> bool:
         try:
@@ -431,113 +512,633 @@ class HlMrLeg:
 
     # ------------------------------------------------------------------ 认领
 
-    def _recent_intent(self, kind: str, now_s: float):
-        """最近一条「下单意图」事件 → (ts, payload)；超出认领窗口返回 None。"""
-        try:
-            rows = self.db.hl_recent_events(5, kind=kind)
-        except Exception:                                         # noqa: BLE001
+    # ------------------------------------------------ 风控覆盖（hl_orders 影子行）
+
+    def _shadow_begin(self, purpose: str, *, side: int, sz: float, px: Optional[float],
+                      reduce_only: bool, cloid: str, signal_date: str,
+                      now_ms: int) -> Optional[Dict[str, Any]]:
+        """写一条 `hl_orders` 影子意图（purpose=`mr_entry`/`mr_exit`）→ 定位键。
+
+        为什么要有它（第七轮 F7）：MR 的入场/离场此前只写 `hl_events`，于是执行器的
+        「当日下单上限」与「近一小时失败」两道闸门**完全看不到 MR** —— MR 若被持续
+        拒单（精度/价格非法），只会每 5 分钟重试 + 30 分钟节流告警，没有全局刹车。
+        影子行不是交易所挂单，只服务计数与审计。
+
+        `bar_ms` 取**当前 tick 分钟**（与 cloid 同源）：同一轮重放命中同一行（表上有
+        UNIQUE(symbol, bar_ms, purpose)），跨轮重试或崩溃后重跑各落一行 —— 失败计数
+        才有意义。写库失败**不阻断交易**：影子行只负责可见性，不能让审计写失败变成
+        「不平仓」。
+        """
+        rec = getattr(self.db, "hl_record_intent", None)
+        if not callable(rec):
             return None
-        for row in rows:
+        symbol = str(self.config.coin or "MR")
+        bar_ms = _attempt_ms(now_ms) * 60_000
+        try:
+            rec(symbol, symbol, bar_ms, purpose, int(side), float(sz),
+                px=(float(px) if px else None), reduce_only=bool(reduce_only),
+                cloid=cloid, status=ST_INTENT)
+            upd = getattr(self.db, "hl_update_order", None)
+            if callable(upd):
+                # signal_date 落到 raw：崩溃后要按它把「结果未知的尝试」对回台账。
+                # `ts` 用**本次 tick 的时刻**（不是 DB 的 now()）：判断「这张 IOC 还在
+                # 不在飞」必须与调用方同一个时钟，否则宿主时钟跳变/测试夹具的假时刻
+                # 会让 30 分钟的阻塞窗口算错（→ 提前重发或永久阻塞）。
+                upd(symbol, bar_ms, purpose,
+                    raw=json.dumps({"signal_date": str(signal_date), "cloid": cloid,
+                                    "ts": round(float(now_ms) / 1000.0, 3)},
+                                   ensure_ascii=False, default=str))
+        except Exception:                                     # noqa: BLE001
+            logger.warning("mr: 写影子订单行失败（不阻断本轮）", exc_info=True)
+            return None
+        return {"symbol": symbol, "bar_ms": bar_ms, "purpose": purpose}
+
+    def _shadow_finish(self, key: Optional[Dict[str, Any]], *, status: str,
+                       oid: Any = None, error: Any = None,
+                       filled_sz: Optional[float] = None,
+                       avg_px: Optional[float] = None) -> None:
+        """影子行落终态（filled / failed / sent=结果未知）。失败只记日志。"""
+        if not key:
+            return
+        upd = getattr(self.db, "hl_update_order", None)
+        if not callable(upd):
+            return
+        kw: Dict[str, Any] = {"status": str(status)}
+        if oid:
+            kw["oid"] = str(oid)              # Kraken 单号是 UUID：一律 str，不 int()
+        if error is not None:
+            kw["error"] = str(error)[:300]
+        if filled_sz is not None:
+            kw["filled_sz"] = float(filled_sz)
+        if avg_px is not None:
+            kw["avg_px"] = float(avg_px)
+        try:
+            upd(key["symbol"], int(key["bar_ms"]), key["purpose"], **kw)
+        except Exception:                                     # noqa: BLE001
+            logger.warning("mr: 更新影子订单行失败（忽略）", exc_info=True)
+
+    def _order_gate(self, now_s: float) -> Optional[str]:
+        """MR 入场前的两道**既有**风控闸门 → None=放行，否则拒绝原因。
+
+        阈值与 `executor._entry_gates` 同源（env `HL_MAX_ORDERS_PER_DAY` /
+        `HL_MAX_FAIL_STREAK`，经 `main.hl_params()` 装配到主腿），**不新增旋钮**。
+        计数只数**本腿**的影子行（主腿的当日计数只认 purpose=='entry'，两腿各数各的）。
+        失败计数把 `mr_exit` 也算进来：离场连续被拒同样是「这个腿现在不正常」。
+        **只挡入场**：离场永不因为这两道闸门被拦（否则亏损时反而平不掉）。
+        """
+        rows_fn = getattr(self.db, "hl_recent_orders", None)
+        if not callable(rows_fn):
+            return None
+        try:
+            rows = list(rows_fn(200) or [])
+        except Exception as exc:                              # noqa: BLE001
+            # 读不到台账 = 无法判断今天已经下了几单 → fail-closed，只挡入场
+            return f"读不到下单台账（{type(exc).__name__}），本轮不入场"
+        max_day = _int_env(ORDERS_PER_DAY_ENV, DEFAULT_MAX_ORDERS_PER_DAY)
+        max_fail = _int_env(FAIL_STREAK_ENV, DEFAULT_MAX_FAIL_STREAK)
+        day0 = _day_start_ts(now_s)
+        entries = 0
+        fails = 0
+        for r in rows:
             try:
-                ts = float(row["created_at"] or 0.0)
-                raw = row["data"]
-            except Exception:                                     # noqa: BLE001
+                purpose = str(r["purpose"] or "")
+                status = str(r["status"] or "")
+                created = float(r["created_at"] or 0.0)
+            except (KeyError, IndexError, TypeError, ValueError):
                 continue
-            if ts <= 0 or abs(now_s - ts) > float(self.config.adopt_window_s):
-                continue
-            payload = _event_data(raw)
-            if payload.get("signal_date"):
-                return ts, payload
+            if (purpose == MR_PURPOSE_ENTRY and created >= day0
+                    and status in (ST_SENT, ST_RESTING, ST_FILLED)):
+                entries += 1
+            if (purpose in (MR_PURPOSE_ENTRY, MR_PURPOSE_EXIT)
+                    and status == ST_FAILED and now_s - created < 3600.0):
+                fails += 1
+        if entries >= max_day:
+            return f"MR 当日下单已达 {entries} 次（上限 {max_day}）"
+        if fails >= max_fail:
+            return f"MR 近一小时失败 {fails} 次（上限 {max_fail}）"
         return None
 
-    def _adopt_entry(self, pos: dict, now: int, status: Dict[str, Any]) -> bool:
-        """有意图、无台账、xyz dex 有仓 → 按交易所口径补记 OPEN（无需人工改库）。"""
-        found = self._recent_intent(_ENTRY_INTENT_KIND, now / 1000.0)
-        if found is None:
-            return False
-        ts, payload = found
-        signal_date = str(payload.get("signal_date") or "")
-        if not signal_date or self.db.mr_trade_by_signal(signal_date) is not None:
-            return False
-        filled_sz = abs(float(pos.get("szi") or 0.0))
-        if float(pos.get("szi") or 0.0) <= 0:
-            # MR 只做多：空头仓不按 MR 入场认领（手工/别的系统开的）。
-            logger.warning("mr: 交易所 %s 是空头（szi=%s），跳过入场认领", self.config.coin,
-                           pos.get("szi"))
-            return False
-        entry_px = float(pos.get("entry_px") or 0.0) or float(payload.get("ref_price") or 0.0)
-        if filled_sz <= 0 or entry_px <= 0:
-            return False
-        trade_id = self.db.mr_record_entry(
-            signal_date=signal_date,
-            entry_session=str(payload.get("entry_session") or signal_date),
-            qty=filled_sz, qty_int=int(round(filled_sz * 10 ** 4)),
-            entry_price=entry_px, entry_order_id="", entry_ts=ts,
-            notional=filled_sz * entry_px, margin=filled_sz * entry_px,
-            equity_at_entry=payload.get("equity"),
-            raw={"adopted": True, "adopt_reason": "fill_confirmation_lost",
-                 "intent_ts": ts, "fill_source": "xyz_dex_position"})
-        status["state"] = "entered"
-        status["adopted"] = "entry"
-        self._alert(f"MR 入场确认丢失，已按交易所持仓补记台账 #{trade_id}："
-                    f"{self.config.coin} {filled_sz} @≈{entry_px:.2f}（信号 {signal_date}）")
-        return True
+    def _mr_attempts(self, purpose: str, signal_date: str,
+                     statuses: Tuple[str, ...]) -> List[Tuple[Any, Dict[str, Any]]]:
+        """本腿某 signal_date 上仍停在 `statuses` 里的影子行 → [(row, raw)]。
 
-    def _adopt_exit(self, open_row, now: int, status: Dict[str, Any]) -> bool:
-        """有离场意图、台账 OPEN、xyz dex 已无仓 → 按当前 mid 补记 CLOSED（价格为估算）。"""
-        found = self._recent_intent(_EXIT_INTENT_KIND, now / 1000.0)
-        if found is None:
-            return False
-        ts, payload = found
-        if str(payload.get("signal_date")) != str(open_row["signal_date"]):
-            return False
-        mark = self._mark([], None)
-        if mark <= 0:
-            return False
+        查询窗口（跨重启的「不可重复单」全靠这里）：`statuses` 只含 intent/sent 时
+        走 `hl_stuck_orders`（**无 LIMIT**，多久以前的未知尝试都看得见）。不能用
+        `hl_recent_orders(200)`：主腿每根 bar 都在写行，十几个小时后 MR 的未知尝试
+        就被挤出这 200 行 → 认不出来 → 换 cloid 重发就是第二笔仓。
+        """
+        rows: List[Any] = []
+        if set(statuses) <= {ST_INTENT, ST_SENT}:
+            fn = getattr(self.db, "hl_stuck_orders", None)
+            if callable(fn):
+                try:
+                    # older_than_s=-1 → 连「这一秒刚写的」也算；默认 180s 会把本 tick
+                    # 刚落的 intent 排除掉（那正是最需要取证的一条）。
+                    rows = list(fn(-1.0) or [])
+                except Exception:                             # noqa: BLE001
+                    rows = []
+        if not rows:
+            rows_fn = getattr(self.db, "hl_recent_orders", None)
+            if not callable(rows_fn):
+                return []
+            try:
+                rows = list(rows_fn(500) or [])
+            except Exception:                                 # noqa: BLE001
+                return []
+        out: List[Tuple[Any, Dict[str, Any]]] = []
+        for r in rows:
+            try:
+                if str(r["purpose"] or "") != purpose:
+                    continue
+                if str(r["status"] or "") not in statuses:
+                    continue
+            except (KeyError, IndexError, TypeError):
+                continue
+            data = _raw_dict(r)          # hl_orders.raw 与 mr_trades.raw 同为 JSON 文本
+            if str(data.get("signal_date") or "") != str(signal_date):
+                continue
+            out.append((r, data))
+        return out
+
+    def _key_of(self, row: Any) -> Dict[str, Any]:
+        return {"symbol": str(row["symbol"]), "bar_ms": int(row["bar_ms"]),
+                "purpose": str(row["purpose"])}
+
+    # ------------------------------------------------------------ 意图与成交证据
+
+    def _intent_event(self, kind: str, now_s: float, *,
+                      signal_date: Optional[str] = None,
+                      max_age_s: Optional[float] = None,
+                      limit: int = 60) -> Optional[Tuple[float, Dict[str, Any]]]:
+        """最近的意图事件 → (ts, payload)；可限定归属与年龄。
+
+        - `signal_date=None`：任意归属（入场侧**必须**从意图里取 signal_date，所以
+          超窗后无法再定归属 → 入场侧的年龄限制有语义）；
+        - `signal_date` 给定：只要该 signal_date 的最新一条（离场认领用）；
+        - `max_age_s=None`：**不限年龄**。离场侧的归属由台账那一行给出，意图只用来
+          证明「这笔离场是本系统发起的」，这个证明没有保质期（B5/F2）。
+
+        两个旧方法（`_latest_intent` / `_intent_for_signal`）是同一段扫描的两份拷贝，
+        合并成一处：少一份重复逻辑，也避免两边 limit/过滤条件漂移。
+        """
+        try:
+            rows = self.db.hl_recent_events(int(limit), kind=kind) or []
+        except Exception:                                     # noqa: BLE001
+            return None
+        want = None if signal_date is None else str(signal_date)
+        best: Optional[Tuple[float, Dict[str, Any]]] = None
+        for row in rows:                       # id DESC ≈ 时间倒序
+            try:
+                ts = float(row["created_at"] or 0.0)
+                payload = _event_data(row["data"])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            if ts <= 0 or ts > now_s + 60.0:            # 未来时间戳 = 时钟异常
+                continue
+            if max_age_s is not None and now_s - ts > float(max_age_s):
+                continue
+            sd = str(payload.get("signal_date") or "")
+            if not sd:                                  # 没有归属的意图无法用于认领
+                continue
+            if want is not None and sd != want:
+                continue
+            if best is None or ts > best[0]:
+                best = (ts, payload)
+        return best
+
+    def _fills(self, *, since_s: float, until_s: Optional[float] = None,
+               cloid: Optional[str] = None,
+               close_side: Optional[bool] = None) -> Tuple[Optional[List[dict]], str]:
+        """交易所成交（只读，**不写库**）→ (该标的相关成交, 说明)。
+
+        `(None, reason)` = **读不到**：调用方必须按「未知」处理，绝不能当「没有成交」
+        （否则一次接口抖动就会被写成「已确认无成交」）。
+        `close_side=True/False` 只挑平仓腿/开仓腿（dir 前缀或 reduce_only 判）。
+        """
+        cfg = self.config
+        start_ms = int(max(float(since_s or 0.0), 0.0) * 1000)
+        end_ms = int(float(until_s) * 1000) if until_s else None
+        address = self.address_fn() or ""
+        fn = getattr(self.info, "user_fills_by_time", None)
+        try:
+            if callable(fn):
+                rows = list(fn(address, start_ms, end_ms) or [])
+            else:
+                fn2 = getattr(self.info, "user_fills", None)
+                if not callable(fn2):
+                    return None, "venue 不提供成交查询"
+                rows = list(fn2(address) or [])
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning("mr: 读成交失败（按未知处理）：%s: %s", type(exc).__name__, exc)
+            return None, f"读成交失败 {type(exc).__name__}"
+        bare = str(cfg.coin).split(":")[-1]
+        out: List[dict] = []
+        for f in rows:
+            if not isinstance(f, Mapping):
+                continue
+            coin = str(f.get("coin") or "")
+            if coin and coin not in (cfg.coin, bare):
+                continue
+            try:
+                t = float(f.get("time") or 0.0)
+            except (TypeError, ValueError):
+                t = 0.0
+            if t and t < start_ms:            # 有些 venue 只在内存里过滤，双保险
+                continue
+            if end_ms and t and t > end_ms:
+                continue
+            if cloid and str(f.get("cloid") or "") != str(cloid):
+                continue
+            if close_side is not None:
+                direction = str(f.get("dir") or "").lower()
+                is_close = direction.startswith("close") or bool(
+                    int(f.get("reduce_only") or 0))
+                if bool(is_close) is not bool(close_side):
+                    continue
+            out.append(dict(f))
+        out.sort(key=lambda x: float(x.get("time") or 0.0))
+        return out, "ok"
+
+    # ------------------------------------------------------------ 统一决算
+
+    def _settlement(self, open_row: Any, *, covered_qty: float, covered_px: float,
+                    gap_qty: float = 0.0, gap_px: float = 0.0,
+                    price_source: str, estimated: bool,
+                    funding_paid: float = 0.0,
+                    extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """统一决算：正常收尾 / 补账 / 到期清仓共用一套会计口径。
+
+        第七轮 B6：旧实现两条关账路径各算各的 —— `_maybe_exit` 只按**交易所剩余量**
+        结算、从不与「台账 qty − Σ片段」核对（片段丢失时盈亏静默少记、无 reconciliation），
+        而 `_adopt_exit` 反而有核对。现在统一：
+
+        - `covered_qty/covered_px`：有**成交证据**的那一部分（真实成交优先，其次回执
+          avg_px/限价，最后才是参考价估算）；
+        - `gap_qty/gap_px`：台账有量但**拿不到成交证据**的差额 —— 按参考价估算入账，
+          但 `net_pnl_complete=False` + `reconciliation`，绝不冒充「确定的已实现盈亏」；
+        - `raw` 基于原行**合并**写回（保留 `partial_exits`/`cloid`/`ref_price` 等历史字段）。
+        """
+        rate = float(getattr(self.config, "taker_fee_rate", TAKER_FEE_RATE))
         qty = float(open_row["qty"] or 0.0)
         entry_price = float(open_row["entry_price"] or 0.0)
         notional = float(open_row["notional"] or 0.0)
-        # 2026-11-13 第六轮：补账必须带上已记录的部分平仓片段（与 _maybe_exit 的
-        # 决算同口径）。旧实现忽略 raw.partial_exits、按原 qty 整笔结算：
-        # 先平掉那一截的盈亏被算成「按 mark 重算」，且 raw 被整体覆盖 → 片段永久丢失。
         partials = _partial_exits(open_row)
         partial_qty = sum(abs(float(p.get("qty") or 0.0)) for p in partials)
         partial_notional = sum(abs(float(p.get("qty") or 0.0))
                                * float(p.get("price") or 0.0) for p in partials)
         partial_pnl = sum((float(p.get("price") or 0.0) - entry_price)
                           * float(p.get("qty") or 0.0) for p in partials)
-        remaining = qty - partial_qty
-        reconciliation = None
-        if remaining < -1e-9:
-            reconciliation = {"ledger_qty": qty, "partial_qty": partial_qty,
-                              "reason": "partial_exits exceed ledger qty",
-                              "remaining_clamped_to": 0.0}
-            logger.warning("mr: 补账时片段数量 %.10g > 台账 qty %.10g（#%s），剩余量按 0 计",
-                           partial_qty, qty, open_row["id"])
-            remaining = 0.0
-        fee_est = float(getattr(self.config, "taker_fee_rate", TAKER_FEE_RATE)) * (
-            notional + remaining * mark + partial_notional)
-        net_pnl = partial_pnl + (mark - entry_price) * remaining - fee_est
+        expected = qty - partial_qty
+        covered = max(float(covered_qty or 0.0), 0.0)
+        gap = float(gap_qty or 0.0)
+        tol = max(1e-9, abs(qty) * 1e-9)
+        # 「净利是否确定」= 数量没有缺口 **且** 价格有成交证据。只有前者时，
+        # 一笔按限价/参考价估算的关账会被读成「确定的已实现盈亏」（第七轮 B6：
+        # 缺口不能假确定，估算价同理）。
+        complete = abs(gap) <= tol and not bool(estimated)
+        recon = None
+        if (expected < -tol or abs(gap) > tol
+                or covered + gap < expected - tol or covered > expected + tol):
+            recon = {"ledger_qty": qty, "partial_qty": partial_qty,
+                     "expected_remaining": expected, "covered_qty": covered,
+                     "gap_qty": gap, "gap_estimated": gap > tol,
+                     "reason": ("partial_exits exceed ledger qty" if expected < -tol else
+                                "settled qty > ledger qty (understated ledger)" if
+                                covered > expected + tol else
+                                "settled qty < ledger qty (missing fill evidence)"),
+                     "gap_px": float(gap_px or 0.0) if gap > tol else None}
+            logger.warning("mr: 关账数量核对不平 #%s：台账 %.10g − 片段 %.10g = %.10g，"
+                           "本次有证据 %.10g，差额 %.10g（按参考价估算，标 estimated）",
+                           open_row["id"] if "id" in open_row.keys() else "?",
+                           qty, partial_qty, expected, covered, gap)
+        fee_est = rate * (notional + covered * covered_px + max(gap, 0.0) * gap_px
+                          + partial_notional)
+        net_pnl = (partial_pnl + (covered_px - entry_price) * covered
+                   + (gap_px - entry_price) * max(gap, 0.0)
+                   - float(funding_paid or 0.0) - fee_est)
         raw = _raw_dict(open_row)
-        raw.update({"adopted": True, "price_source": "all_mids", "intent_ts": ts,
-                    "ref_price": mark, "partial_exits": partials,
-                    "partial_pnl": partial_pnl, "partial_notional": partial_notional,
-                    "remaining_qty": remaining, "fee_est": fee_est,
-                    "net_pnl": net_pnl})
-        if reconciliation is not None:
-            raw["reconciliation"] = reconciliation
+        raw.update({
+            "exit_price_used": float(covered_px),
+            "price_source": str(price_source),
+            "estimated": (not complete),
+            "partial_exits": partials, "partial_pnl": partial_pnl,
+            "partial_notional": partial_notional,
+            "remaining_qty": covered + max(gap, 0.0),
+            "settled_qty": covered, "gap_qty": gap if abs(gap) > tol else 0.0,
+            "fee_est": fee_est, "net_pnl": net_pnl,
+            "net_pnl_complete": complete,
+            "funding_paid_usdc": float(funding_paid or 0.0),
+        })
+        if recon is not None:
+            raw["reconciliation"] = recon
+        if extra:
+            raw.update(extra)
+        return {"fee_est": fee_est, "net_pnl": net_pnl, "partial_pnl": partial_pnl,
+                "partial_qty": partial_qty, "covered_qty": covered, "gap_qty": gap,
+                "expected_remaining": expected, "reconciliation": recon,
+                "net_pnl_complete": complete, "raw": raw,
+                "entry_price": entry_price, "notional": notional}
+
+    def _action_required(self, status: Dict[str, Any], *, kind: str, reason: str,
+                         signal_date: str = "",
+                         evidence: Optional[Dict[str, Any]] = None) -> None:
+        """挂上「需人工核对」的恢复证据路径（B5 的明确出口）。
+
+        不做的事：不按 mark 编造成交、不重复下单。做的事：把**已有的**证据（交易所
+        持仓/成交、意图 ts、cloid/oid、台账行）摊开，落一条 `mr_action_required`
+        事件（同一 signal_date+kind 只落一次，避免每 5 分钟刷屏），并按 30 分钟节流推送。
+        """
+        payload = {"kind": str(kind), "reason": str(reason),
+                   "signal_date": str(signal_date or ""),
+                   "coin": str(self.config.coin or ""),
+                   "evidence": dict(evidence or {}), "at": self.clock()}
+        status["action_required"] = payload
+        # 事件去重：进程重启会清内存，所以按 DB 里最近的事件判（而不是实例属性）
+        try:
+            for row in self.db.hl_recent_events(10, kind=ACTION_REQUIRED_KIND) or []:
+                prev = _event_data(row["data"])
+                if (str(prev.get("kind") or "") == payload["kind"]
+                        and str(prev.get("signal_date") or "") == payload["signal_date"]):
+                    return
+        except Exception:                                     # noqa: BLE001
+            pass
+        try:
+            self.db.hl_log_event(ACTION_REQUIRED_KIND,
+                                 f"MR 需人工核对（{kind}）：{reason}", data=payload)
+        except Exception:                                     # noqa: BLE001
+            logger.warning("mr: 写 mr_action_required 失败", exc_info=True)
+        self._alert_throttled(f"action_required:{kind}",
+                              f"需人工核对（{kind}）：{reason}", interval_s=30 * 60.0)
+
+    def _adopt_entry(self, pos: dict, now: int, status: Dict[str, Any]) -> bool:
+        """有意图、无台账、交易所有多仓 → 补记 OPEN 台账（无需人工改库）。
+
+        B5（第七轮）：**6h 窗口只约束入场侧**（signal_date 只能从意图里取，超窗后无法
+        再确定归属）。但「超窗 = 永久 recon_err」也不对：交易所的仓就是事实，MR 不认领
+        它就既没有离场也没有保护。所以超窗时**加一道成交证据闸**：同 coin、开仓方向、
+        数量与持仓吻合、时间在意图之后的成交 → 按真实成交 VWAP 记价并入账；证据不足
+        则明确 `action_required`（原因 + 已有证据），**不**把来源不明的仓当成 MR 仓
+        （那会让 MR 去平别人的仓）。
+        """
+        now_s = now / 1000.0
+        window = float(getattr(self.config, "adopt_window_s", 6 * 3600.0))
+        found = self._intent_event(_ENTRY_INTENT_KIND, now_s, max_age_s=window)
+        stale = None
+        if found is None:
+            stale = self._intent_event(_ENTRY_INTENT_KIND, now_s)
+        if found is None and stale is None:
+            return False
+        ts, payload = found or stale            # type: ignore[assignment]
+        signal_date = str(payload.get("signal_date") or "")
+        if not signal_date or self.db.mr_trade_by_signal(signal_date) is not None:
+            return False
+        szi = float(pos.get("szi") or 0.0)
+        if szi <= 0:
+            # MR 只做多：空头仓不按 MR 入场认领（手工/别的系统开的）。
+            logger.warning("mr: 交易所 %s 是空头（szi=%s），跳过入场认领", self.config.coin,
+                           pos.get("szi"))
+            return False
+        filled_sz = abs(szi)
+        entry_px = float(pos.get("entry_px") or 0.0) or float(payload.get("ref_price") or 0.0)
+        raw_extra: Dict[str, Any] = {
+            "adopted": True, "adopt_reason": "fill_confirmation_lost",
+            "intent_ts": ts, "fill_source": "xyz_dex_position"}
+        if found is None:
+            # 超窗：必须有可归属的成交证据，否则交人工（不认领 = 不动那笔仓）
+            fills, note = self._fills(since_s=float(ts) - 120.0, until_s=now_s,
+                                      close_side=False)
+            fill_qty, fill_px, fill_ids = _fill_totals(fills)
+            tol = max(1e-9, filled_sz * 0.02)   # 容差 2%（部分成交/手续费扣量）
+            if fills is None or fill_qty <= 0 or abs(fill_qty - filled_sz) > tol:
+                self._action_required(
+                    status, kind="entry_adopt_stale",
+                    reason=(f"入场意图已超 {window / 3600:.1f}h（{note}），交易所有 "
+                            f"{filled_sz:g} 张 {self.config.coin} 多仓，但拿不到可归属的成交"
+                            f"证据（成交 {fill_qty:g} 张），不自动认领"),
+                    signal_date=signal_date,
+                    evidence={"position_szi": filled_sz, "fill_qty": fill_qty,
+                              "fill_ids": fill_ids[:10], "intent_ts": ts,
+                              "intent_cloid": payload.get("cloid"),
+                              "intent_planned_sz": payload.get("planned_sz"),
+                              "fills_api": note})
+                status["recon"] = "err"
+                return False
+            entry_px = entry_px or fill_px
+            raw_extra.update({"fill_source": "exchange_fills", "fill_ids": fill_ids[:10],
+                              "fill_qty": fill_qty, "fill_vwap": fill_px,
+                              "estimated": False})
+        if filled_sz <= 0 or entry_px <= 0:
+            return False
+        trade_id = self.db.mr_record_entry(
+            signal_date=signal_date,
+            entry_session=str(payload.get("entry_session") or signal_date),
+            qty=filled_sz, qty_int=int(round(filled_sz * 10 ** 4)),
+            entry_price=entry_px, entry_order_id=str(payload.get("oid") or ""),
+            entry_ts=ts,
+            notional=filled_sz * entry_px, margin=filled_sz * entry_px,
+            equity_at_entry=payload.get("equity"),
+            raw=raw_extra)
+        # 把「结果未知的入场尝试」影子行收口（否则看门狗会一直报卡单）
+        for row, _data in self._mr_attempts(MR_PURPOSE_ENTRY, signal_date,
+                                            (ST_INTENT, ST_SENT)):
+            self._shadow_finish(self._key_of(row), status=ST_FILLED,
+                                filled_sz=filled_sz, avg_px=entry_px,
+                                error="按交易所持仓补记台账")
+        status["state"] = "entered"
+        status["adopted"] = "entry"
+        self._alert(f"MR 入场确认丢失，已按交易所持仓补记台账 #{trade_id}："
+                    f"{self.config.coin} {filled_sz} @≈{entry_px:.2f}（信号 {signal_date}"
+                    f"{'，含成交证据' if filled_sz and raw_extra.get('fill_ids') else ''}）")
+        return True
+
+    def _adopt_exit(self, open_row, now: int, status: Dict[str, Any]) -> bool:
+        """台账 OPEN + 交易所已空仓 → 用离场意图 + 成交/订单证据补记 CLOSED。
+
+        第七轮 B5：旧实现只认 **6h 内**的离场意图，超出后「台账 OPEN + 交易所空仓」
+        **永久** recon_err —— MR 的自愈入口只剩认领本身，人工改库是唯一出口。离场侧
+        的归属由台账那一行给出（signal_date 已在 `mr_trades`），意图只需要证明「这笔
+        离场是本系统发起的」，这个证明没有保质期，所以这里**不限意图年龄**。
+
+        证据阶梯（有证据才认领；不按参考价编造成交、不重复下单）：
+
+        1. 平仓**成交**覆盖剩余量 → 按真实成交 VWAP 关账（source=fills，确定）；
+        2. 成交只覆盖一部分 → 已覆盖按成交 VWAP，缺口按 mark 估算并写
+           `reconciliation` + `net_pnl_complete=False` + action_required；
+        3. 超窗（> `adopt_window_s`）且没有成交 → 只认**订单证据**（离场影子行里的
+           回执均价，= 交易所给的成交均价）；订单证据也没有 → **不关账**，保持
+           recon_err + `action_required`（B5：「证据不足明确人工核对，不按 mark 编造
+           未知成交」）；
+        4. 窗内的旧口径保留（意图存在即可按 mark 估算关账，`estimated=True` + 喊人）：
+           这支撑 `tests/test_mr_audit_r6.py` 钉住的 PR #21 行为，且它只作用于 6h 内、
+           可被人工快速复核的窗口；
+        5. 连意图都没有 → 不认领（无法证明离场是本系统发起的），recon_err +
+           action_required 说明缺什么证据。
+
+        为什么超窗不再按 mark 关账：mark 是**当前**的中间价，与几小时前的真实成交价
+        无关；那条 net_pnl 会直接进面板「累计已实现」，等于把一个编出来的数当成事实。
+        宁可让台账停在 OPEN（它没有仓，安全）并喊人。
+        """
+        signal_date = str(open_row["signal_date"])
+        now_s = now / 1000.0
+        window = float(getattr(self.config, "adopt_window_s", 6 * 3600.0))
+        found = self._intent_event(_EXIT_INTENT_KIND, now_s, signal_date=signal_date)
+        if found is None:
+            self._action_required(
+                status, kind="exit_adopt_no_intent",
+                reason=(f"台账 OPEN 但交易所已无 {self.config.coin} 仓，且找不到该 signal_date "
+                        f"的离场意图 → 无法证明这笔离场由本系统发起；需核对 hl_fills/"
+                        f"交易所成交与台账 qty"),
+                signal_date=signal_date,
+                evidence={"ledger_qty": open_row["qty"],
+                          "ledger_entry_ts": open_row["entry_ts"],
+                          "entry_order_id": open_row["entry_order_id"]})
+            return False
+        ts, payload = found
+        stale = bool(window > 0 and now_s - float(ts) > window)
+        mark = self._mark([], None)
+        qty = float(open_row["qty"] or 0.0)
+        partials = _partial_exits(open_row)
+        partial_qty = sum(abs(float(p.get("qty") or 0.0)) for p in partials)
+        expected = max(qty - partial_qty, 0.0)
+        # 平仓成交证据（从入场前 2 分钟起，覆盖持仓期全部平仓腿）
+        fills, note = self._fills(since_s=float(open_row["entry_ts"] or 0.0) - 120.0,
+                                  until_s=now_s, close_side=True)
+        fill_qty, fill_px, fill_ids = _fill_totals(fills)
+        estimated = True
+        source = "all_mids"
+        covered = expected
+        covered_px = mark
+        gap_qty = 0.0
+        gap_px = 0.0
+        order_oid = ""
+        if fill_qty > 0:
+            covered = min(expected, fill_qty) if expected > 0 else fill_qty
+            covered_px = fill_px
+            source = "fills"
+            estimated = False
+            if expected > 0 and fill_qty + 1e-9 < expected:
+                gap_qty = expected - covered
+                gap_px = mark
+                estimated = True
+                self._action_required(
+                    status, kind="exit_adopt_partial_fills",
+                    reason=(f"成交只覆盖 {fill_qty:g}/{expected:g} 张，缺口按 mark {mark:.2f} "
+                            f"估算（net_pnl_complete=False），请人工核对"),
+                    signal_date=signal_date,
+                    evidence={"fill_qty": fill_qty, "fill_vwap": fill_px,
+                              "fill_ids": fill_ids[:10], "gap_qty": gap_qty})
+        elif stale:
+            # 超窗：意图只能证明「我们发过单」，证明不了成交价 —— 必须有订单/成交证据
+            ev_px, ev_qty, order_oid = self._exit_order_evidence(signal_date)
+            if ev_px <= 0 or ev_qty <= 0:
+                self._action_required(
+                    status, kind="exit_adopt_stale_no_evidence",
+                    reason=(f"离场意图已超 {window / 3600:.1f}h，交易所已无仓，但既查不到"
+                            f"可归属的平仓成交（{note}）也没有离场回执均价 → 不按参考价"
+                            f"编造成交；台账保持 OPEN，请核对 hl_fills/交易所成交与台账 qty"),
+                    signal_date=signal_date,
+                    evidence={"ledger_qty": qty, "partial_qty": partial_qty,
+                              "expected_remaining": expected,
+                              "intent_ts": ts, "intent_cloid": payload.get("cloid"),
+                              "fills_api": note,
+                              "recovery": ("人工核对后在 mr_trades 里补 exit_price/"
+                                           "net_pnl，或按真实成交关账")})
+                status["recon"] = "err"
+                return False
+            covered = min(expected, ev_qty) if expected > 0 else ev_qty
+            covered_px = ev_px
+            source = "order_receipt"
+            estimated = False
+            if expected > 0 and ev_qty + 1e-9 < expected:
+                gap_qty = expected - covered
+                gap_px = mark
+                estimated = True
+                self._action_required(
+                    status, kind="exit_adopt_partial_order",
+                    reason=(f"离场回执只覆盖 {ev_qty:g}/{expected:g} 张，缺口按 mark "
+                            f"{mark:.2f} 估算（net_pnl_complete=False），请人工核对"),
+                    signal_date=signal_date,
+                    evidence={"order_qty": ev_qty, "order_px": ev_px,
+                              "order_oid": order_oid, "gap_qty": gap_qty})
+        else:
+            # 6h 内：旧口径（意图存在 → 按 mark 估算关账），标 estimated + 喊人
+            if mark <= 0:
+                return False
+            kind = ("exit_adopt_fills_unreadable" if fills is None
+                    else "exit_adopt_mark_estimate")
+            self._action_required(
+                status, kind=kind,
+                reason=(f"离场意图存在（{ts:.0f}），但"
+                        + (f"成交读取失败（{note}）" if fills is None
+                           else "交易所查不到可归属的平仓成交")
+                        + f" → 按 mark {mark:.2f} 估算关账（source=all_mids，"
+                          f"net_pnl_complete=False），请人工核对真实成交价"),
+                signal_date=signal_date,
+                evidence={"ledger_qty": qty, "partial_qty": partial_qty,
+                          "intent_ts": ts, "intent_cloid": payload.get("cloid"),
+                          "fills_api": note})
+        if covered_px <= 0:
+            return False
+        st = self._settlement(
+            open_row, covered_qty=covered, covered_px=covered_px,
+            gap_qty=gap_qty, gap_px=gap_px, price_source=source, estimated=estimated,
+            extra={"adopted": True, "intent_ts": ts, "adopt_ref_price": mark,
+                   "fills_api": note, "fill_ids": fill_ids[:10],
+                   "fill_qty": fill_qty, "adopt_reason": "exit_confirmation_lost",
+                   "order_oid": order_oid or None})
         self.db.mr_close_trade(
-            int(open_row["id"]), exit_price=mark, exit_order_id="",
-            exit_ts=now / 1000.0, exit_reason="sma5_adopted",
+            int(open_row["id"]), exit_price=covered_px, exit_order_id="",
+            exit_ts=now_s, exit_reason="sma5_adopted",
             exit_signal_date=(str(payload.get("exit_signal_date") or "") or None),
-            funding_pct=None, fee_quote=fee_est, net_pnl=net_pnl,
-            raw=raw)
+            funding_pct=None, fee_quote=st["fee_est"], net_pnl=st["net_pnl"],
+            raw=st["raw"])
+        # 结果未知的离场尝试影子行收口
+        for row, _data in self._mr_attempts(MR_PURPOSE_EXIT, signal_date,
+                                            (ST_INTENT, ST_SENT)):
+            self._shadow_finish(self._key_of(row), status=ST_FILLED,
+                                avg_px=covered_px, filled_sz=covered,
+                                error="按离场证据补记台账")
         status["state"] = "exited"
         status["adopted"] = "exit"
-        self._alert(f"MR 离场确认丢失，交易所已空仓 → 按当前 mid {mark:.2f} 补记 CLOSED"
-                    f"（台账 #{open_row['id']}，净 {net_pnl:+.2f} USDC，价格为估算"
-                    + (f"，含已记录部分平仓 {partial_qty:g}" if partials else "") + "）")
+        status["net_pnl"] = st["net_pnl"]
+        status["net_pnl_complete"] = st["net_pnl_complete"]
+        self._alert(
+            f"MR 离场补记 CLOSED（台账 #{open_row['id']}，净 {st['net_pnl']:+.2f} USDC，"
+            f"价格来源 {source}"
+            + ("，价格为估算、净利未完成" if not st["net_pnl_complete"]
+               else "（有成交证据）")
+            + (f"，含已记录部分平仓 {partial_qty:g}" if partials else "")
+            + (f"，缺口 {gap_qty:g} 张按 mark 估算" if gap_qty > 1e-9 else "") + "）")
         return True
+
+    def _exit_order_evidence(self, signal_date: str) -> Tuple[float, float, str]:
+        """离场尝试影子行（purpose=mr_exit, status=filled）里的回执证据。
+
+        → `(VWAP, Σ数量, oid)`；没有任何回执均价/数量时 `(0,0,"")`。
+
+        这是 B5 里点名的「**订单**证据」：`avg_px` 是交易所给的成交均价（不是我们估
+        的），比 mark 强得多；它在「成交接口查不到（分页上限/读失败）」而离场回执已经
+        落库的那条路径上，是唯一可信的价格来源。崩溃在 `place_order` 之后就断掉的
+        尝试不会有回执，这里返回 0 → 调用方按「证据不足」处理。
+        """
+        qty = 0.0
+        notional = 0.0
+        oid = ""
+        for row, _data in self._mr_attempts(MR_PURPOSE_EXIT, signal_date, (ST_FILLED,)):
+            try:
+                px = float(row["avg_px"] or 0.0)
+                sz = abs(float(row["filled_sz"] or 0.0))
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            if px <= 0 or sz <= 0:
+                continue
+            qty += sz
+            notional += px * sz
+            try:
+                oid = str(row["oid"] or "") or oid
+            except (KeyError, IndexError):
+                pass
+        return (notional / qty if qty else 0.0), qty, oid
 
     def _venue_px(self, px: float, sz_decimals: int) -> float:
         """限价取整：优先 venue 自己的 tickSize（Kraken 只接受 tick 整数倍）。
@@ -780,6 +1381,44 @@ class HlMrLeg:
 
     # ------------------------------------------------------------------ 入场
 
+    def _resolve_entry_unknown(self, signal_date: str, now: int,
+                               status: Dict[str, Any]) -> str:
+        """核对「结果未知」的入场尝试 → `adopted` / `blocked` / `clear`。
+
+        第七轮（IOC 未知结果禁止无证重发）：`ok=false` 既可能是明确拒单，也可能是
+        「交易所已受理但回执丢失」。旧实现下一轮直接换 cloid 重发 —— 在后一种情况下
+        就是第二笔仓。现在只要有 intent/sent 的影子行（= 结果未知），就先取证据：
+
+        * 交易所有多仓 → 按持仓补记台账（`adopted`，**不再发单**）
+        * 读得到账户且确认无仓 → IOC 早已过期 = 确实没成交 → `clear`（允许重试）
+        * 读不到账户 → `blocked`（未知，**不发单**，挂 action_required）
+        """
+        pending = self._mr_attempts(MR_PURPOSE_ENTRY, signal_date, (ST_INTENT, ST_SENT))
+        if not pending:
+            return "clear"
+        address = self.address_fn() or ""
+        pos_now, read_ok = self._await_position(address, want=True, confirm_s=0.0)
+        if not read_ok:
+            self._action_required(
+                status, kind="entry_result_unknown",
+                reason=("上一笔入场结果未知（影子行停在 intent/sent）且账户读失败 → "
+                        "本轮不重发，等持仓/成交证据"),
+                signal_date=signal_date,
+                evidence={"pending_attempts": len(pending),
+                          "attempt_status": [str(r["status"]) for r, _d in pending][:5],
+                          "cloids": [d.get("cloid") for _r, d in pending][:5]})
+            return "blocked"
+        if pos_now is not None and float(pos_now.get("szi") or 0.0) > 0:
+            if self._adopt_entry(pos_now, now, status):
+                return "adopted"
+            # 认领不成立（空头仓 / 无成交证据）→ 不动那笔仓，也绝不重发
+            return "blocked"
+        # 账户读得到、确认没有仓：前一张 IOC 早已不在场 = 明确未成交
+        for row, _data in pending:
+            self._shadow_finish(self._key_of(row), status=ST_FAILED,
+                                error="核对：交易所无仓 → 视为未成交（IOC 已过期）")
+        return "clear"
+
     def _maybe_enter(self, now: int, sessions, rows, account: dict,
                      status: Dict[str, Any]) -> dict:
         cfg = self.config
@@ -793,6 +1432,15 @@ class HlMrLeg:
             return status
         signal_date = decision["signal_date"]
         if self.db.mr_trade_by_signal(signal_date) is not None:
+            return status
+        # ---- 结果未知的入场尝试：先取证再决定要不要重发 --------------------------
+        # IOC 的 ok=false 既可能是明确拒单，也可能是「交易所已受理但回执丢了」。
+        # 旧实现下一轮直接换 cloid 重发 —— 恰好在后一种情况下变成第二笔仓。
+        verdict = self._resolve_entry_unknown(signal_date, now, status)
+        if verdict == "adopted":
+            return status
+        if verdict == "blocked":
+            status["state"] = "action_required"
             return status
         sz_dec = self._sz_decimals()
         if sz_dec is None:
@@ -849,6 +1497,15 @@ class HlMrLeg:
             self._alert(f"MR 信号 {signal_date} 放弃（组合总名义上限）：{blocked}")
             return status
 
+        # ---- 既有风控闸门（当日下单数 / 近一小时失败）：阈值与主腿同源，不新增旋钮 ----
+        gate = self._order_gate(now / 1000.0)
+        if gate:
+            # **不写 SKIPPED**：这是临时性刹车（跨日/一小时后自解），信号的入场窗口
+            # 内还有后续 tick 可以重试，不该因为一次刹车就把当天唯一信号记成放弃。
+            status["state"] = "order_gate_blocked"
+            status["error"] = gate
+            self._alert_throttled("order_gate", f"MR 入场被风控闸门拦下：{gate}")
+            return status
         if not self._ensure_leverage(status):
             status["state"] = "margin_mode_failed"
             return status
@@ -861,34 +1518,104 @@ class HlMrLeg:
                   "entry_session": decision["entry_session_date"],
                   "planned_sz": sz, "ref_price": mark, "equity": equity_total,
                   "cloid": cloid}, ts=now / 1000.0)
+        shadow = self._shadow_begin(MR_PURPOSE_ENTRY, side=1, sz=sz, px=limit_px,
+                                    reduce_only=False, cloid=cloid,
+                                    signal_date=signal_date, now_ms=now)
         result = self.exchange.place_order(
             cfg.coin, True, sz, limit_px, reduce_only=False, tif="Ioc",
             cloid=cloid)
-        if not result.get("ok"):
-            # 下单失败：不写台账（下次 tick 换 cloid 重试），告警由 exchange 层清洗
+        if str(result.get("status") or "") == "dry":
+            # 影子模式（exchange.dry_run）：一张真单都没发，不留错误计数
+            status["state"] = "dry_run"
+            status["error"] = "影子模式：未真实下单"
+            self._shadow_finish(shadow, status=ST_PLANNED, error="dry_run")
+            return status
+        if not result.get("ok") or str(result.get("status") or "") not in (
+                "filled", "resting"):
+            # ok=false 有两个来源：明确拒单（invalidSize/资金不足）与**结果未知**
+            # （回执丢失、无 EXECUTION 明细）。先用账户事实分辨，绝不盲目重发。
+            err = str(result.get("error") or result.get("raw") or "unknown")
+            status["error"] = err
+            pos_now, read_ok = self._await_position(self.address_fn() or "",
+                                                    want=True, confirm_s=0.0)
+            if read_ok and pos_now is not None and float(pos_now.get("szi") or 0.0) > 0:
+                # 交易所已成交、只是回执丢了 → 按持仓补记台账，本轮不再发单
+                self._shadow_finish(shadow, status=ST_FILLED,
+                                    oid=result.get("oid"),
+                                    avg_px=result.get("avg_px"),
+                                    filled_sz=abs(float(pos_now.get("szi") or 0.0)),
+                                    error="回执失败但交易所已成交（按持仓补记）")
+                if self._adopt_entry(pos_now, now, status):
+                    status["state"] = "entered"
+                    status["adopted"] = "entry"
+                    self._alert_throttled(
+                        "entry_receipt_lost",
+                        f"MR 入场回执失败（{err[:120]}）但交易所已成交 → 已按持仓补记台账，"
+                        f"未重复下单")
+                    return status
+                status["state"] = "action_required"
+                return status
+            if not read_ok:
+                # 未知：IOC 可能已成交，但读不到账户 → 留影子行在 sent，等证据
+                self._shadow_finish(shadow, status=ST_SENT,
+                                    error=f"结果未知：读账户失败（{err[:160]}）")
+                self._action_required(
+                    status, kind="entry_result_unknown",
+                    reason=("入场下单结果未知（回执失败且账户读失败），本轮不重发；"
+                            "下一轮先按持仓/成交取证"),
+                    signal_date=signal_date,
+                    evidence={"cloid": cloid, "planned_sz": sz, "ref_price": mark,
+                              "exchange_error": err[:200]})
+                status["state"] = "action_required"
+                return status
+            # 账户读得到、确实没有仓 → 明确未成交，可以安全重试（下一轮换 cloid）
+            self._shadow_finish(shadow, status=ST_FAILED, error=err)
             status["state"] = "order_rejected"
-            status["error"] = str(result.get("error") or result.get("raw") or "unknown")
-            self._alert_throttled("entry_rejected", f"MR 入场被拒：{status['error'][:200]}")
+            self._alert_throttled("entry_rejected", f"MR 入场被拒：{err[:200]}")
             return status
         # 「受理」不等于「成交」：IOC 只认 filled；再用 xyz dex 持仓核一遍实际数量
         if str(result.get("status") or "") != "filled":
+            not_executed = bool(result.get("not_executed"))
             status["state"] = "entry_not_filled"
             status["error"] = f"回执 status={result.get('status')!r}"
+            self._shadow_finish(
+                shadow, status=ST_FAILED if not_executed else ST_SENT,
+                error=f"回执 status={result.get('status')!r}"
+                      f"{'（IOC 未成交，已不在场）' if not_executed else '（在场/结果未知，不重发）'}")
+            if not not_executed:
+                # resting 且没有 not_executed 标记（IOC 不该出现）：结果未知 —— 状态沿用
+                # entry_not_filled（既有契约），但影子行停在 sent 上，下一轮必须**先取证**
+                # 才会重发（`_resolve_entry_unknown`）。
+                self._action_required(
+                    status, kind="entry_resting_unknown",
+                    reason=f"入场回执 status={result.get('status')!r}（IOC 本不该在场）→ 不重发",
+                    signal_date=signal_date,
+                    evidence={"cloid": cloid, "oid": result.get("oid"), "planned_sz": sz})
+                self._alert_throttled(
+                    "entry_not_filled",
+                    "MR 入场单回执不是 filled（也未标未成交）——台账保持空，"
+                    "下一轮先按持仓/成交取证再决定是否重发")
+                return status
             self._alert_throttled(
                 "entry_not_filled",
-                "MR 入场单未成交（回执不是 filled）——不写台账，下轮重试")
+                "MR 入场单未成交（IOC 未成交/已撤销）——不写台账，下轮重试")
             return status
         filled, _seen = self._await_position(self.address_fn() or "", want=True)
         if filled is None:
             status["state"] = "entry_not_filled"
             status["error"] = f"确认窗口内交易所没有 {cfg.coin} 持仓"
+            self._shadow_finish(shadow, status=ST_SENT,
+                                oid=result.get("oid"),
+                                error="回执 filled 但确认窗口内没读到持仓（不重发，下轮取证）")
             self._alert_throttled(
                 "entry_not_filled",
-                f"MR 入场单回执 filled 但交易所没有出现 {cfg.coin} 持仓——不写台账，下轮重试")
+                f"MR 入场单回执 filled 但交易所没有出现 {cfg.coin} 持仓——不写台账，"
+                f"下轮先按成交/持仓取证（不重复下单）")
             return status
         filled_sz = abs(float(filled.get("szi") or 0.0))
         if filled_sz <= 0:
             status["state"] = "entry_not_filled"
+            self._shadow_finish(shadow, status=ST_FAILED, error="持仓数量为 0")
             return status
         entry_px = float(filled.get("entry_px") or 0.0)
         if entry_px <= 0:
@@ -903,6 +1630,8 @@ class HlMrLeg:
                  "planned_sz": sz, "filled_sz": filled_sz,
                  "fill_source": "xyz_dex_position",
                  "result_status": str(result.get("status"))})
+        self._shadow_finish(shadow, status=ST_FILLED, oid=result.get("oid"),
+                            filled_sz=filled_sz, avg_px=entry_px)
         if abs(filled_sz - sz) > 1e-9:
             try:
                 self.db.hl_log_event("mr_entry_partial_fill",
@@ -946,6 +1675,121 @@ class HlMrLeg:
 
     # ------------------------------------------------------------------ 离场
 
+    def _fragment_price(self, result: dict, limit_px: Optional[float],
+                        mark: float) -> Tuple[float, str]:
+        """部分平仓片段的成交价与来源：回执 avg_px → 限价 → 参考价（标估算）。
+
+        第七轮 B6：旧实现片段价一律取**下单前**的 mark，而卖出 IOC 的限价是
+        `mark×(1−15bp)`，真实成交只会 ≥ 限价 —— 于是片段价系统性偏高（最多 15bp），
+        且整笔还标 `price_source=avg_px`。这里按证据强弱排序，并且**永远标来源**：
+        卖出的限价是「最低可成交价」，用它记片段是保守方向，但仍不是成交价。
+        """
+        avg = float(result.get("avg_px") or 0.0)
+        if avg > 0:
+            return avg, "avg_px"
+        if limit_px and float(limit_px) > 0:
+            return float(limit_px), "limit_px"
+        return float(mark or 0.0), "mark_estimated"
+
+    def _append_fragment(self, trade_id: int, *, qty: float, price: float, ts: float,
+                         price_source: str, oid: Any = None,
+                         cloid: Optional[str] = None) -> None:
+        """把一次部分平仓片段写进台账 `raw.partial_exits`（**带价格来源**）。
+
+        2026-11-13 第七轮：价格来源整段交给 `db.mr_trade_append_partial()` —— 它把
+        「查 raw → 追加 → 一次 commit」放在同一把 DB 锁里。旧实现在这里拿 `db.conn`
+        就地补写一次 UPDATE（读-改-写跨出锁，与并发追加互相覆盖），而且调用方不该
+        依赖 `db.conn` 这个内部字段。写失败只记日志：会计口径不受影响，缺的只是
+        「这个价是成交还是估算」的审计标记。
+        """
+        try:
+            self.db.mr_trade_append_partial(int(trade_id), qty=float(qty),
+                                            price=float(price), ts=float(ts),
+                                            price_source=str(price_source) or None,
+                                            oid=oid, cloid=cloid)
+        except Exception:                                     # noqa: BLE001
+            logger.warning("mr: 记录部分成交片段失败", exc_info=True)
+
+    def _resolve_exit_unknown(self, open_row, pos, now: int, pending, status
+                              ) -> str:
+        """核对「结果未知」的离场尝试 → `closed` / `clear` / `blocked`。
+
+        第七轮：离场 IOC 的 ok=false、或「回执 filled 但读不到仓」，都可能意味着**已经
+        成交**。旧实现下一轮直接再发一张 —— reduce_only 不会反手，但这仍是「无证重发」，
+        会把成交价/数量归属搞乱。现在先按 cloid 回捞成交：
+
+        * 回捞到成交 → 记片段（真实价）→ 仓若已空则关账（closed）
+        * 成交查询可用且为空 → 上一张 IOC 确实没成交，允许本轮重新发（clear）
+        * 成交查询不可用 → 不知道 → **在飞窗口内**不发单（blocked，挂 action_required）；
+          超过 `_EXIT_UNKNOWN_BLOCK_S` 仍未取证 → 把该尝试收口成 failed 并放行下一张
+          （见下面的说明：阻塞上限比「无证重发」更危险）
+        """
+        sd = str(open_row["signal_date"])
+        now_s = now / 1000.0
+        for row, data in pending:
+            cloid = str(data.get("cloid") or "")
+            attempt_sz = abs(float(row["sz"] or 0.0))
+            created = float(data.get("ts") or row["created_at"] or 0.0)
+            fills, note = self._fills(since_s=created - 60.0, until_s=now_s,
+                                      cloid=(cloid or None), close_side=True)
+            qty, px, ids = _fill_totals(fills)
+            if fills is None:
+                if created and now_s - created > _EXIT_UNKNOWN_BLOCK_S:
+                    # IOC 在几秒内就定局；过了这个窗口还查不到成交，说明**取证本身**
+                    # 不可用（接口长期不可用/权限问题），而不是「单还在飞」。
+                    # 继续阻塞 = 仓位无限期裸奔（MR 不挂止损），而下行只是「多一张
+                    # reduce_only 单（无仓时被拒）」——不会产生新敞口，也不会反手。
+                    self._shadow_finish(
+                        self._key_of(row), status=ST_FAILED,
+                        error=f"核对超时：{note}（IOC 早已过期，允许下一张离场）")
+                    try:
+                        self.db.hl_log_event(
+                            "mr_exit_unknown_expired",
+                            f"MR 离场结果未知超过 {_EXIT_UNKNOWN_BLOCK_S / 60:.0f} 分钟且"
+                            f"成交不可查（{note}）→ 收口为 failed，允许下一张离场")
+                    except Exception:                     # noqa: BLE001
+                        logger.warning("mr: 写 mr_exit_unknown_expired 失败", exc_info=True)
+                    continue
+                self._action_required(
+                    status, kind="exit_result_unknown",
+                    reason=(f"上一笔离场结果未知（cloid={cloid or '?'}，{attempt_sz:g} 张）"
+                            f"且成交查询不可用（{note}）→ 本轮不重发"),
+                    signal_date=sd,
+                    evidence={"cloid": cloid, "oid": row["oid"],
+                              "attempt_sz": attempt_sz, "fills_api": note})
+                return "blocked"
+            if qty > 0:
+                self._append_fragment(int(open_row["id"]), qty=qty, price=px,
+                                      ts=now / 1000.0, price_source="fills",
+                                      oid=row["oid"], cloid=cloid)
+                self._shadow_finish(self._key_of(row), status=ST_FILLED,
+                                    filled_sz=qty, avg_px=px)
+                try:
+                    self.db.hl_log_event(
+                        "mr_exit_partial",
+                        f"MR 离场结果未知后按成交补记片段 {qty:g} @ {px:.2f}"
+                        f"（cloid {cloid or '?'}，fill_ids {ids[:3]}）")
+                except Exception:                             # noqa: BLE001
+                    logger.warning("mr: 写补记片段事件失败", exc_info=True)
+                continue
+            # 成交查询可用且为空：上一张 IOC 已不在场
+            self._shadow_finish(self._key_of(row), status=ST_FAILED,
+                                error="核对：无成交（IOC 已过期）")
+        # 片段落库后再看交易所：已空仓 → 走补账关账（证据优先、不限意图年龄）
+        left, seen = self._await_position(self.address_fn() or "", want=False,
+                                          confirm_s=0.0)
+        if not seen:
+            self._action_required(
+                status, kind="exit_state_unknown",
+                reason="核对离场结果时读不到持仓 → 本轮不发单，等下一轮取证",
+                signal_date=sd, evidence={"attempts": len(pending)})
+            return "blocked"
+        if left is None:
+            if self._adopt_exit(open_row, now, status):
+                return "closed"
+            return "blocked"
+        return "clear"
+
     def _maybe_exit(self, now: int, sessions, rows, open_row,
                     pos: Optional[dict], status: Dict[str, Any]) -> dict:
         cfg = self.config
@@ -979,6 +1823,20 @@ class HlMrLeg:
             "liq_price": None,
             "next_eval_et": signal.get("next_eval_et"),
         }
+        # ---- 结果未知的上一笔离场尝试：先取证，禁止无证重发（IOC） ----------------
+        pending = self._mr_attempts(MR_PURPOSE_EXIT, str(open_row["signal_date"]),
+                                    (ST_INTENT, ST_SENT))
+        if pending:
+            outcome = self._resolve_exit_unknown(open_row, pos, now, pending, status)
+            if outcome == "closed":
+                return status
+            if outcome == "blocked":
+                status["state"] = "action_required"
+                return status
+            open_row = self.db.mr_open_trade() or open_row
+            if pos is None:
+                return status
+
         if exit_date is None:
             return status
         if pos is None:
@@ -1005,36 +1863,82 @@ class HlMrLeg:
             data={"signal_date": open_row["signal_date"],
                   "exit_signal_date": exit_date, "sz": sz,
                   "ref_price": mark, "cloid": cloid}, ts=now / 1000.0)
+        shadow = self._shadow_begin(MR_PURPOSE_EXIT, side=-1, sz=sz, px=limit_px,
+                                    reduce_only=True, cloid=cloid,
+                                    signal_date=str(open_row["signal_date"]),
+                                    now_ms=now)
         result = self.exchange.place_order(
             cfg.coin, False, sz, limit_px, reduce_only=True, tif="Ioc",
             cloid=cloid)
+        if str(result.get("status") or "") == "dry":
+            status["state"] = "dry_run"
+            status["error"] = "影子模式：未真实下单"
+            self._shadow_finish(shadow, status=ST_PLANNED, error="dry_run")
+            return status
         if not result.get("ok"):
+            # 离场失败的两个来源：明确拒单 / 已成交但回执丢了 —— 用交易所持仓分辨
+            err = str(result.get("error") or result.get("raw") or "unknown")
+            status["error"] = err
+            left, seen = self._await_position(self.address_fn() or "",
+                                              want=False, confirm_s=0.0)
+            if seen and left is None:
+                # 已经空仓：按成交/意图证据关账，**绝不重发**
+                self._shadow_finish(shadow, status=ST_FILLED, oid=result.get("oid"),
+                                    filled_sz=sz, avg_px=result.get("avg_px"),
+                                    error="回执失败但交易所已空仓（按证据关账）")
+                if self._adopt_exit(open_row, now, status):
+                    return status
+                status["state"] = "action_required"
+                return status
+            if not seen:
+                # 读不到持仓 = 未知：留影子行在 sent，下一轮先取证
+                self._shadow_finish(shadow, status=ST_SENT,
+                                    error=f"结果未知：读持仓失败（{err[:140]}）")
+                self._action_required(
+                    status, kind="exit_result_unknown",
+                    reason=("离场下单结果未知（回执失败且持仓读失败）→ 本轮不重发，"
+                            "下一轮先按成交/持仓取证"),
+                    signal_date=str(open_row["signal_date"]),
+                    evidence={"cloid": cloid, "oid": result.get("oid"),
+                              "planned_sz": sz, "ref_price": mark,
+                              "exchange_error": err[:200]})
+                status["state"] = "action_required"
+                return status
+            # 仍有仓：明确未成交，可以安全重试（下一轮换 cloid）
+            self._shadow_finish(shadow, status=ST_FAILED, error=err)
             status["state"] = "holding"
-            status["error"] = str(result.get("error") or result.get("raw") or "unknown")
             self._alert_throttled("exit_rejected",
-                                  f"MR 离场被拒（下轮重试）：{status['error'][:200]}")
+                                  f"MR 离场被拒（下轮重试）：{err[:200]}")
             return status
         # 受理 ≠ 成交：必须看到 xyz dex 的仓真的没了才关账（否则台账 CLOSED + 裸仓）
         left, left_seen = self._await_position(self.address_fn() or "", want=False)
         if (left is not None or not left_seen
                 or str(result.get("status") or "") != "filled"):
+            filled_here = 0.0
             if left is not None and left_seen:
-                # 部分成交：先把已平掉的片段入账，否则最终决算只按剩余数量算盈亏。
+                # 部分成交：先把已平掉的片段入账（优先真实成交价，其次限价，最后参考价
+                # —— 绝不把参考价当成成交价写进去），否则最终决算只按剩余数量算盈亏。
                 prev_sz = abs(float(pos["szi"])) if pos else float(open_row["qty"] or 0.0)
                 left_sz = abs(float(left.get("szi") or 0.0))
-                filled_sz = prev_sz - left_sz
-                if filled_sz > 1e-12:
+                filled_here = prev_sz - left_sz
+                if filled_here > 1e-12:
+                    frag_px, frag_src = self._fragment_price(result, limit_px, mark)
+                    self._append_fragment(
+                        int(open_row["id"]), qty=filled_here, price=frag_px,
+                        ts=now / 1000.0, price_source=frag_src,
+                        oid=result.get("oid"), cloid=cloid)
                     try:
-                        self.db.mr_trade_append_partial(
-                            int(open_row["id"]), qty=filled_sz, price=mark,
-                            ts=now / 1000.0)
                         self.db.hl_log_event(
                             "mr_exit_partial",
-                            f"MR 离场部分成交 {filled_sz:g}（剩余 {left_sz:g}）—— "
-                            f"该片段按参考价 {mark:.2f} 记账")
-                    except Exception:                         # noqa: BLE001
-                        logger.warning("mr: 记录部分成交片段失败", exc_info=True)
+                            f"MR 离场部分成交 {filled_here:g}（剩余 {left_sz:g}）—— "
+                            f"片段价 {frag_px:.2f}（来源 {frag_src}）")
+                    except Exception:                     # noqa: BLE001
+                        logger.warning("mr: 写 mr_exit_partial 事件失败", exc_info=True)
             remain = (left or {}).get("szi", "?") if isinstance(left, dict) else "?"
+            self._shadow_finish(
+                shadow, status=ST_FILLED if filled_here > 1e-12 else ST_FAILED,
+                oid=result.get("oid"), filled_sz=filled_here or None,
+                error=f"partial/未确认（剩余 {remain}）")
             status["state"] = "exit_not_filled"
             status["error"] = f"回执 status={result.get('status')!r}，剩余 {remain}"
             self._alert_throttled(
@@ -1044,37 +1948,69 @@ class HlMrLeg:
             return status
         funding_paid = self._funding_paid(open_row, now)
         notional = float(open_row["notional"] or 0.0)
-        entry_price = float(open_row["entry_price"] or 0.0)
-        # 离场成交价用回执 avg_px（filled 时可用）；取不到才退回 mid。
-        exit_px = float(result.get("avg_px") or 0.0) or mark
-        partials = _partial_exits(open_row)
-        partial_notional = sum(abs(float(p.get("qty") or 0.0))
-                               * float(p.get("price") or 0.0) for p in partials)
-        partial_pnl = sum((float(p.get("price") or 0.0) - entry_price)
-                          * float(p.get("qty") or 0.0) for p in partials)
-        fee_est = float(getattr(self.config, "taker_fee_rate", TAKER_FEE_RATE)) * (notional + sz * exit_px + partial_notional)
+        # 本次真正平掉的量：回执 filled_sz 优先（部分成交时它比 sz 准），否则按持仓量
+        filled = float(result.get("filled_sz") or 0.0) or sz
+        covered_px, price_source = self._fragment_price(result, limit_px, mark)
+        if price_source != "avg_px":
+            # 回执没给成交均价：先按 cloid 回捞真实成交（权威），再退回限价/参考价
+            fills, note = self._fills(since_s=now / 1000.0 - 600.0,
+                                      until_s=now / 1000.0, cloid=cloid,
+                                      close_side=True)
+            fq, fpx, _ids = _fill_totals(fills)
+            if fq > 0 and fpx > 0:
+                covered_px, price_source = fpx, "fills"
+        partial_qty_now = sum(abs(float(p.get("qty") or 0.0))
+                              for p in _partial_exits(open_row))
+        expected = max(float(open_row["qty"] or 0.0) - partial_qty_now, 0.0)
+        gap = max(expected - filled, 0.0)          # 台账有量但这次没有成交证据
+        st = self._settlement(
+            open_row, covered_qty=filled, covered_px=covered_px,
+            gap_qty=gap, gap_px=mark, price_source=price_source,
+            estimated=(not _price_is_evidence(price_source)),
+            funding_paid=funding_paid,
+            extra={"exit_ref_price": mark, "limit_px": limit_px,
+                   # 用独立键：合并写回时不能把**入场**的 cloid 覆盖掉（审计链要
+                   # 同时能看到「哪张单开的」和「哪张单平的」）
+                   "exit_cloid": cloid,
+                   "oid": str(result.get("oid") or ""),
+                   "result_status": str(result.get("status"))})
         funding_pct = (funding_paid / notional * 100.0 if notional > 0 else None)
-        net_pnl = ((exit_px - entry_price) * sz - funding_paid - fee_est + partial_pnl)
         self.db.mr_close_trade(
-            int(open_row["id"]), exit_price=exit_px,
+            int(open_row["id"]), exit_price=covered_px,
             exit_order_id=str(result.get("oid") or ""),
             exit_ts=now / 1000.0, exit_reason="sma5", exit_signal_date=exit_date,
-            funding_pct=funding_pct, fee_quote=fee_est, net_pnl=net_pnl,
-            raw={"ref_price": mark, "exit_price_used": exit_px,
-                 "price_source": "avg_px" if result.get("avg_px") else "mid",
-                 "limit_px": limit_px, "cloid": cloid,
-                 "funding_paid_usdc": funding_paid, "fee_est": fee_est,
-                 "partial_exits": partials, "partial_pnl": partial_pnl,
-                 "result_status": str(result.get("status"))})
+            funding_pct=funding_pct, fee_quote=st["fee_est"], net_pnl=st["net_pnl"],
+            raw=st["raw"])
+        self._shadow_finish(shadow, status=ST_FILLED, oid=result.get("oid"),
+                            filled_sz=filled, avg_px=covered_px)
+        if gap > 1e-9:
+            # 缺口不静默：净利已标 net_pnl_complete=False，再喊一声人工核对
+            self._action_required(
+                status, kind="exit_settle_gap",
+                reason=(f"关账数量核对不平：台账 {open_row['qty']:g} − 已记片段 "
+                        f"{partial_qty_now:g} = {expected:g}，本次成交证据只有 {filled:g}；"
+                        f"缺口 {gap:g} 张按 mark {mark:.2f} 估算，净利标记为未完成"),
+                signal_date=str(open_row["signal_date"]),
+                evidence={"ledger_qty": open_row["qty"], "partial_qty": partial_qty_now,
+                          "filled_qty": filled, "gap_qty": gap,
+                          "reconciliation": st["reconciliation"]})
         self._slippage_guard(result, mark, side="离场")
         self._funding_guard(funding_pct, float(open_row["entry_ts"] or 0.0),
                             now / 1000.0)
         status["state"] = "exited"
         status["last_fill_at"] = now / 1000.0
+        status["net_pnl"] = st["net_pnl"]
+        status["net_pnl_complete"] = st["net_pnl_complete"]
         self._alert(
-            f"MR 离场：{cfg.coin} 平多 @≈{exit_px:.2f}（净 {net_pnl:+.2f} USDC，"
-            f"funding {funding_pct if funding_pct is not None else '?'}%、费用≈{fee_est:.2f}），"
-            f"信号日 {exit_date}")
+            f"MR 离场：{cfg.coin} 平多 @≈{covered_px:.2f}"
+            f"（净 {st['net_pnl']:+.2f} USDC，funding "
+            f"{funding_pct if funding_pct is not None else '?'}%、费用≈{st['fee_est']:.2f}，"
+            f"价格来源 {price_source}"
+            + (f"，缺口 {gap:g} 张按 mark 估算" if gap > 1e-9 else "")
+            # 估算价（限价/参考价）时净利不是「已实现真值」—— 告警必须自己说出来
+            + ("" if st["net_pnl_complete"]
+               else "，净利未完成：请核对真实成交价")
+            + f"），信号日 {exit_date}")
         return status
 
     def _funding_paid(self, open_row, now_ms: int) -> float:
@@ -1132,6 +2068,33 @@ def _partial_exits(row: Any) -> List[dict]:
     if not isinstance(parts, list):
         return []
     return [dict(p) for p in parts if isinstance(p, Mapping)]
+
+
+def _fill_totals(fills: Optional[List[dict]]) -> Tuple[float, float, List[str]]:
+    """成交列表 → (Σ数量, VWAP, 成交号前若干个)。
+
+    `fills is None`（读不到）与 `[]`（确认没有）在这里都得到 (0,0,[])，区别由调用方
+    用 `_fills()` 返回的第二个值自己判 —— 这个函数只做算术，不做「有没有」的判断。
+    """
+    qty = 0.0
+    notional = 0.0
+    ids: List[str] = []
+    for f in fills or []:
+        if not isinstance(f, Mapping):
+            continue
+        try:
+            sz = abs(float(f.get("sz") or 0.0))
+            px = float(f.get("px") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if sz <= 0 or px <= 0:
+            continue
+        qty += sz
+        notional += sz * px
+        tid = str(f.get("tid") or f.get("oid") or "")
+        if tid:
+            ids.append(tid)
+    return qty, (notional / qty if qty else 0.0), ids
 
 
 def _event_data(raw: Any) -> Dict[str, Any]:

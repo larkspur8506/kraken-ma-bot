@@ -24,6 +24,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -58,6 +59,29 @@ KIND_CLEANUP_OK = "agent_expiry_cleanup_ok"       # 清仓成功（**边沿触�
 KIND_CLEANUP_FAIL = "agent_expiry_cleanup_fail"   # 清仓失败（24h 去重）
 KIND_CLEANUP_OFF = "agent_expiry_cleanup_off"     # 开关关/执行器 off：只提醒，不清仓
 KIND_RENEW = "agent_renew"
+
+#: Kraken（Derivatives v3 API key）**没有到期概念**：没有代理钱包授权、也没有
+#: validUntil。`check_once` 见到这个 venue 能力就直接短路 —— 不读 extraAgents、
+#: 不读手工兜底、不清仓，只写一份「不限期」状态给面板。
+KRAKEN_SOURCE = "kraken-key-no-expiry"
+
+
+def venue_has_no_expiry(info: Any) -> bool:
+    """该 venue 的凭据是否**没有到期概念**（判据按 venue 能力，不按方法是否存在）。
+
+    技能里记过的坑：`agent_status` 在 KrInfo 上**存在**，只是返回
+    ``{"kind": "kraken-api", "expires": None}`` —— 用 ``hasattr`` 判会误报「没有任何
+    agent 授权」。所以这里认两个能力标志：`venue_address_free`（无钱包地址概念）
+    与 `price_tick`（Kraken 的 tick 精度接口，面板用的也是这一个判据）。
+    """
+    if info is None:
+        return False
+    try:
+        if bool(getattr(info, "venue_address_free", False)):
+            return True
+    except Exception:                                             # noqa: BLE001
+        pass
+    return callable(getattr(info, "price_tick", None))
 # 旧 kind：保留只读兼容（历史 alert_logs 行还在，面板/记录页照样认）
 KIND_ALERT_LEGACY = "agent_expiry_alert"
 KIND_CLEANUP_LEGACY = "agent_expiry_cleanup"
@@ -510,6 +534,11 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
     attempts = 0
     cancel_failed: List[dict] = []
     touched: Dict[str, float] = {}      # coin → 本次清仓里实际平掉的成交均价（跨重试累计）
+    #: coin → 那个价格的来源（`avg_px`=真实成交均价 / `limit_px`=回执缺均价时的限价）
+    touch_src: Dict[str, str] = {}
+    #: 跨轮累计的已平仓记录（第七轮：旧实现每轮 `closed=[]` 重置 → 重试过的清仓
+    #: 最后返回的是**最后一轮**的列表，告警会说「已清仓 0 笔」，而前一轮明明平了）。
+    all_closed: List[dict] = []
     for _ in range(max(0, int(retries)) + 1):
         attempts += 1
         last_err = ""
@@ -576,6 +605,13 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
                     "mark_px": (_f(p.get("positionValue")) / abs(szi)) if szi else 0.0,
                 })
 
+        # ---- 2b) 按 coin 去重（第七轮） ----------------------------------------
+        # Kraken 的 `snapshot()` 已经包含**全账户**（含 QQQ），而 `user_state_dex()`
+        # 在 Kraken 下返回的是同一个全账户 → 上面那段会把每个仓再追加一次，于是每个仓
+        # 被平两次：第二张 reduce-only 必然被拒 → last_err → 整轮重试，「已清仓」
+        # 的文案与 attempts 一起抖。去重保留先出现的（snapshot 的那条，带 mark_px）。
+        positions = _dedupe_positions(positions)
+
         # ---- 3) 逐仓平（市价 = 激进 IOC 限价，reduce_only，方向 = 平仓方向）
         for pos in positions:
             coin = str(pos.get("coin") or "")
@@ -626,16 +662,27 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
                 last_err = f"{coin} 平仓单未成交（{r.get('status')}）"
                 _ev(f"清仓：{last_err}")
                 continue
-            closed.append({"coin": coin, "sz": sz, "px": _f(r.get("avg_px"), px)})
-            touched[coin] = _f(r.get("avg_px"), px)
-            _ev(f"清仓：已平 {coin} {sz:g} @ {_f(r.get('avg_px'), px):,.2f}")
+            px_avg = _f(r.get("avg_px"))
+            fill_px = px_avg or px
+            closed.append({"coin": coin, "sz": sz, "px": fill_px,
+                           # 成交均价缺失时这里记的是**限价**（不是成交价）：
+                           # 必须带来源，否则 MR 台账会把它当「真实成交」关账。
+                           "price_source": "avg_px" if px_avg > 0 else "limit_px"})
+            touched[coin] = fill_px
+            touch_src[coin] = "avg_px" if px_avg > 0 else "limit_px"
+            _ev(f"清仓：已平 {coin} {sz:g} @ {fill_px:,.2f}")
+
+        # 本轮已平的仓先累计（第七轮：重试轮不能把前面真平掉的记录丢掉）。
+        # 按 coin 合并：重试轮会把同一个仓再记一次（第一轮回执 filled 但复查仍有仓），
+        # 直接 append 会让「已清仓 N 笔」的告警重复计数。
+        all_closed = _merge_closed(all_closed, closed)
 
         if last_err:
             continue
 
         # ---- 4) 复查：仓位必须真的没了（dry 模式交易所侧什么都没变，跳过复查）
         if dry:
-            return {"ok": True, "error": "", "closed": closed, "attempts": attempts,
+            return {"ok": True, "error": "", "closed": all_closed, "attempts": attempts,
                     "dry": True, "cancelled": 0}
         try:
             snap2 = info.snapshot(address) or {}
@@ -654,6 +701,9 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
                 p = item.get("position") or {}
                 if _f(p.get("szi")):
                     left.append({"coin": p.get("coin") or "?", "size": abs(_f(p.get("szi")))})
+        # 同一个仓在 snapshot 与 dex 读数里各出现一次 → 复查会报「仍有 2 个仓位未平」
+        # （Kraken 下两者同源）。去重后再判，否则清仓永远「失败」。
+        left = _dedupe_positions(left)
         if left:
             last_err = (f"复查仍有 {len(left)} 个仓位未平（"
                         + "、".join(str((p or {}).get("coin") or "?") for p in left) + "）")
@@ -678,32 +728,221 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
         try:
             mr_row = db.mr_open_trade()
             if mr_row is not None:
-                px = _f(touched.get("xyz:XYZ100")) or _f(mr_row["entry_price"])
-                qty = _f(mr_row["qty"])
-                entry_px = _f(mr_row["entry_price"])
-                notional = _f(mr_row["notional"])
-                if px > 0 and qty > 0:
-                    fee = 0.0009 * (notional + qty * px)
-                    db.mr_close_trade(
-                        int(mr_row["id"]), exit_price=px, exit_order_id="",
-                        exit_ts=time.time(), exit_reason=EXIT_REASON_EXPIRY,
-                        exit_signal_date=None, funding_pct=None, fee_quote=fee,
-                        net_pnl=(px - entry_px) * qty - fee,
-                        raw={"by": "agent_expiry", "price_source": "fill_or_entry"})
-                    _ev(f"清仓：MR 台账 #{mr_row['id']} 已关账 @ {px:,.2f}")
+                px, px_src = _mr_sold_price(mr_row, params, touched, snap, snap2,
+                                            sources=touch_src)
+                if px <= 0:
+                    # 一点价格证据都没有：仍要关账（否则永久 recon_err + 裸台账），
+                    # 但明确标成「入场价回落、估算」，别让报表把它当真实成交。
+                    px, px_src = _f(mr_row["entry_price"]), "entry_fallback"
+                closed_id = _close_mr_ledger(db, params, mr_row, exit_px=px,
+                                            price_source=px_src,
+                                            estimated=px_src != "avg_px",
+                                            now_ts=time.time())
+                if closed_id is not None:
+                    _ev(f"清仓：MR 台账 #{closed_id} 已关账 @ {px:,.2f}（{px_src}）")
         except Exception as e:                                    # noqa: BLE001
             logger.warning("[agent] MR 台账关账失败：%s", e)
-        return {"ok": True, "error": "", "closed": closed, "attempts": attempts,
+        return {"ok": True, "error": "", "closed": all_closed, "attempts": attempts,
                 "dry": False, "cancelled": len(cancelled),
                 "closed_local": booked, "cancel_failed": cancel_failed}
 
-    return {"ok": False, "error": last_err or "未知原因", "closed": [],
+    return {"ok": False, "error": last_err or "未知原因", "closed": all_closed,
             "attempts": attempts, "dry": dry, "cancelled": 0,
             "closed_local": [], "cancel_failed": cancel_failed}
 
 
 # 清仓关账用的 exit_reason：面板/统计据此区分「到期保护平仓」与策略离场
 EXIT_REASON_EXPIRY = "agent_expiry_cleanup"
+
+#: MR 台账关账的费率回落值（Kraken 6 级 taker 2.75bp/边）。与 `app.hl.mr.TAKER_FEE_RATE`
+#: 同值；`KR_TAKER_FEE` env / `Config.kr_taker_fee` 优先。
+_FALLBACK_TAKER_FEE = 0.000275
+
+
+def _dedupe_positions(positions: List[dict]) -> List[dict]:
+    """按 coin 去重（保留先出现的那条），丢弃没有 coin 的脏行。
+
+    Kraken 下 `snapshot()` 与 `user_state_dex()` 是**同一个全账户**：不去重就会把每个
+    仓平两次（第二张 reduce-only 必被拒），或把复查判成「仍有 N 个仓位未平」。
+    """
+    seen: set = set()
+    out: List[dict] = []
+    for p in positions or []:
+        coin = str((p or {}).get("coin") or "")
+        if not coin or coin in seen:
+            continue
+        seen.add(coin)
+        out.append(p)
+    return out
+
+
+def _merge_closed(acc: List[dict], new: List[dict]) -> List[dict]:
+    """把本轮「已平仓」记录并入累计列表（按 coin 去重，保留最后一次）。
+
+    `closed` 记的是「下单回执说成交」而不是「复查确认已平」，所以重试轮会把同一个仓
+    再记一次（第一轮回执 filled、但复查仍有仓 → 下一轮再平）。不去重就会在
+    「已清仓 N 笔」的告警里重复计数。
+    """
+    merged: Dict[str, dict] = {}
+    for item in list(acc or []) + list(new or []):
+        coin = str((item or {}).get("coin") or "")
+        if not coin:
+            continue
+        merged[coin] = item
+    return list(merged.values())
+
+
+def _taker_fee_rate(params: Any) -> float:
+    """MR 台账关账用的**单边** taker 费率。
+
+    第七轮：旧实现写死 `0.0009`（HL 时代的往返常数，还被当成单边用 → 双倍高估）。
+    顺序：params 上的显式字段 → env `KR_TAKER_FEE` → 常量（与 `main._build_mr_leg`
+    注入 `HlMrConfig.taker_fee_rate` 的来源同一个配置项）。
+    """
+    for key in ("taker_fee_rate", "kr_taker_fee"):
+        val = getattr(params, key, None)
+        try:
+            if val is not None and float(val) > 0:
+                return float(val)
+        except (TypeError, ValueError):
+            continue
+    try:
+        val = float(str(os.environ.get("KR_TAKER_FEE", "")).strip())
+        if val > 0:
+            return val
+    except (TypeError, ValueError):
+        pass
+    return _FALLBACK_TAKER_FEE
+
+
+def _is_mr_coin(coin: str) -> bool:
+    """这个合约名是不是 MR 腿的标的（QQQ 永续）。
+
+    Kraken 叫 `PF_QQQXUSD`，HL 时代叫 `xyz:XYZ100` / 裸 `XYZ100`；三种都认。
+    """
+    name = str(coin or "").upper()
+    return bool(name) and ("XYZ100" in name or "QQQ" in name)
+
+
+def _mr_coin_hints(params: Any, mr_row: Any) -> List[str]:
+    """MR 台账可能对应的交易所合约名（候选，按优先级）。
+
+    第七轮 F4：旧代码把键写死成 HL 遗留名 `"xyz:XYZ100"`，Kraken 下 `touched` 的键是
+    `PF_QQQXUSD` → 永远取不到成交价 → 回落入场价，把清仓盈亏静默算成 0。
+    """
+    out: List[str] = []
+    for key in ("mr_coin", "mr_symbol"):
+        val = getattr(params, key, None)
+        if isinstance(val, str) and val and val not in out:
+            out.append(val)
+    raw = _mr_raw(mr_row)
+    for key in ("coin", "symbol"):
+        val = raw.get(key)
+        if isinstance(val, str) and val and val not in out:
+            out.append(val)
+    for key in ("xyz:XYZ100", "QQQ", "PF_QQQXUSD"):
+        if key not in out:
+            out.append(key)
+    return out
+
+
+def _mr_raw(row: Any) -> Dict[str, Any]:
+    """MR 台账 `raw` 列 → dict（损坏/缺失返回 {}）。"""
+    try:
+        raw = row["raw"]
+    except (KeyError, IndexError, TypeError):
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _mr_sold_price(mr_row: Any, params: Any, touched: Dict[str, float],
+                   snap: Optional[dict], snap2: Optional[dict],
+                   sources: Optional[Dict[str, str]] = None) -> Tuple[float, str]:
+    """MR 台账关账价 → (价格, 来源)。
+
+    来源取值：`avg_px`（回执成交均价）/ `limit_px`（回执缺均价 → 只拿到限价）/
+    `mark`（快照标记价）/ `none`（一点价格证据都没有）。调用方据此决定 `estimated`：
+    **只有 `avg_px` 才算真实成交** —— 限价和标记价都是估算。
+    """
+    src_map = sources or {}
+    hints = _mr_coin_hints(params, mr_row)
+
+    def _src(coin: str, default: str) -> str:
+        return str(src_map.get(coin) or default)
+
+    for coin in hints:
+        px = _f((touched or {}).get(coin))
+        if px > 0:
+            return px, _src(coin, "limit_px")
+    # 兜底：touched 里任何名字像 MR 标的的键（Kraken 合约名不在提示表里也能认）
+    for coin, px in (touched or {}).items():
+        if _is_mr_coin(coin) and _f(px) > 0:
+            return _f(px), _src(coin, "limit_px")
+    for source in (snap2, snap):
+        for p in (source or {}).get("positions") or []:
+            coin = str((p or {}).get("coin") or "")
+            if coin in hints or _is_mr_coin(coin):
+                px = _f((p or {}).get("mark_px"))
+                if px > 0:
+                    return px, "mark"
+    return 0.0, "none"
+
+
+def _close_mr_ledger(db: Any, params: Any, mr_row: Any, *, exit_px: float,
+                     price_source: str, estimated: bool,
+                     now_ts: float) -> Optional[int]:
+    """关掉 MR 台账那一行（与 `mr._settlement` 同一套会计口径）。
+
+    第七轮 F4 的三个错都在这里收口：
+    1. **key**：价格按 coin 提示表取（不再写死 `xyz:XYZ100`）；
+    2. **费率**：走配置/`KR_TAKER_FEE`，不用 HL 往返常数 `0.0009`；
+    3. **raw**：基于原行**合并**（保留 `partial_exits`/`cloid` 等），片段盈亏加回
+       net_pnl，剩余量 = 台账 qty − Σ片段（超出时按 0 并写 reconciliation）。
+    """
+    rate = _taker_fee_rate(params)
+    qty = _f(mr_row["qty"])
+    entry_px = _f(mr_row["entry_price"])
+    notional = _f(mr_row["notional"])
+    px = _f(exit_px)
+    if px <= 0 or qty <= 0:
+        return None
+    raw = _mr_raw(mr_row)
+    partials = [dict(p) for p in (raw.get("partial_exits") or [])
+                if isinstance(p, dict)]
+    partial_qty = sum(abs(_f(p.get("qty"))) for p in partials)
+    partial_notional = sum(abs(_f(p.get("qty"))) * _f(p.get("price")) for p in partials)
+    partial_pnl = sum((_f(p.get("price")) - entry_px) * _f(p.get("qty")) for p in partials)
+    expected = qty - partial_qty
+    covered = expected if expected > 0 else 0.0
+    fee = rate * (notional + covered * px + partial_notional)
+    net_pnl = partial_pnl + (px - entry_px) * covered - fee
+    raw.update({
+        "by": "agent_expiry", "price_source": str(price_source),
+        "estimated": bool(estimated), "taker_fee_rate": rate,
+        "partial_exits": partials, "partial_pnl": partial_pnl,
+        "partial_notional": partial_notional,
+        "remaining_qty": covered, "settled_qty": covered,
+        "fee_est": fee, "net_pnl": net_pnl,
+        # 数量核对：片段总量超过台账 qty 时不能静默按「全部已平」算
+        "net_pnl_complete": expected >= -1e-9,
+    })
+    if expected < -1e-9:
+        raw["reconciliation"] = {"ledger_qty": qty, "partial_qty": partial_qty,
+                                 "reason": "partial_exits exceed ledger qty",
+                                 "remaining_clamped_to": 0.0}
+    db.mr_close_trade(int(mr_row["id"]), exit_price=px, exit_order_id="",
+                      exit_ts=float(now_ts), exit_reason=EXIT_REASON_EXPIRY,
+                      exit_signal_date=None, funding_pct=None, fee_quote=fee,
+                      net_pnl=net_pnl, raw=raw)
+    return int(mr_row["id"])
 
 
 def _coin_of(db: Any, params: Any, symbol: str) -> Optional[str]:
@@ -858,6 +1097,22 @@ def check_once(db: Any, cfg: Any, notifier: Any, info: Any, *,
     prev_cleanup = str(prev.get("cleanup") or "none")
     if prev_cleanup not in ("none", "done", "failed", "skipped"):
         prev_cleanup = "none"
+
+    # ---- 0) Kraken（API key 无到期）：整条 HL 到期/到期清仓链**短路** ------------
+    # 这条链的语义（代理钱包 validUntil → 到期前把整个账户平掉）在 Kraken 上不存在。
+    # 只要 DB 里残留一个 HL 时代的手工兜底值（hl_agent_valid_until_ms，面板输入框早
+    # 已删除、只剩「清除」路由），旧逻辑就会在下一个整点进入 cleanup/expired：
+    # cleanup 去平全账户（含策略正在持有的仓位），expired 直接 _kill(origin=expiry)
+    # 且永不自解。短路后：不读 extraAgents、不读手工兜底、不置 kill、不清仓，
+    # 只写一份「不限期」状态给面板（views/admin_ui 按 source 走极简 API 卡）。
+    if venue_has_no_expiry(info):
+        state = {"address": str(address or "") or "kraken",
+                 "valid_until_ms": None, "days_left": None,
+                 "checked_ms": int(now_ms), "cleanup": "none",
+                 "source": KRAKEN_SOURCE, "row_found": False,
+                 "level": "no_expiry", "venue_no_expiry": True}
+        write_state(db, state)
+        return state
 
     # ---- 1) 有效期：extraAgents（name 精确匹配）→ 手工兜底 → 未知
     source, until, agent_addr, row_found = resolve_until(

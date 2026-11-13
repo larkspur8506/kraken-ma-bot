@@ -15,6 +15,7 @@ import importlib
 import io
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -354,7 +355,10 @@ class TestNoTokenInRenderedHtml(BaseCase):
 
     def test_cookie_post_redirect_has_no_token(self):
         c = self._cookie_session()
-        r = c.post("/admin/switch/kill", data={"on": "0"}, follow_redirects=False)
+        csrf = re.search(r"name='csrf' value='([^']+)'", c.get("/admin?tab=settings").text)
+        self.assertIsNotNone(csrf, "写表单必须带 CSRF token")
+        r = c.post("/admin/switch/kill", data={"on": "0", "csrf": csrf.group(1)},
+                   follow_redirects=False)
         self.assertEqual(r.status_code, 303)
         self.assertNotIn(TOKEN, r.headers.get("location", ""))
 
@@ -364,7 +368,11 @@ class TestNoTokenInRenderedHtml(BaseCase):
         否则「不用 Cookie 的客户端」会在 303 之后被自己的下一页打回 401。
         """
         self.client.cookies.clear()
-        r = self.client.post("/admin/switch/kill", data={"on": "1", "k": TOKEN},
+        page = self.client.get("/admin", params={"k": TOKEN, "tab": "settings"})
+        csrf = re.search(r"name='csrf' value='([^']+)'", page.text)
+        self.assertIsNotNone(csrf, "首跳页面应提供 CSRF")
+        r = self.client.post("/admin/switch/kill", data={"on": "1", "k": TOKEN,
+                                                        "csrf": csrf.group(1)},
                              follow_redirects=False)
         self.assertEqual(r.status_code, 303)
         self.assertNotIn(TOKEN, r.headers.get("location", ""))

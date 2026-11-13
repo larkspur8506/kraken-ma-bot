@@ -381,17 +381,18 @@ def get_payload(deps: AdminDeps) -> dict:
                 p["agent"] = st
         except Exception as e:                                    # noqa: BLE001
             logger.warning("[admin] 读 agent_state 失败（徽章按 status_payload 兜底）：%s", e)
-    # 阶段 B：面板读数来自调度器写的快照时，把「这份数据多旧」交给状态条。
-    # 实时读数（PanelInfo / 直连 HlInfo）没有 age_s，取不到就不显示徽章。
-    try:
-        info = getattr(deps.hl_deps, "info", None)
-        age_fn = getattr(info, "age_s", None)
-        if callable(age_fn):
-            age = _opt_num(age_fn())
-            if age is not None and age >= 0:
-                p["panel_age_s"] = age
-    except Exception as e:                                        # noqa: BLE001
-        logger.warning("[admin] 读面板快照年龄失败（不显示徽章）：%s", e)
+    # 阶段 B：「这份数据多旧」只认 status_payload 从**实际用到的数据**里带出来的
+    # `panel_snapshot_age_s`（快照路径才有这个键）。
+    #
+    # 旧版读 `info.age_s()`（= 库里最新一行多旧）：快照过期/写操作后回落实时读取时，
+    # 渲染用的是**实时值**，徽章却仍写「数据 16 分钟前」—— 年龄与来源说了两件事，
+    # 判断方向会反（第七轮 #6）。`age_s()` 本身保留「最新快照年龄」的原语义
+    # （`panel_store` 的测试按这个口径钉着），面板不再拿它当「本次数据年龄」。
+    age = _opt_num(p.get("panel_snapshot_age_s"))
+    if age is not None and age >= 0:
+        p["panel_age_s"] = age
+    else:
+        p.pop("panel_age_s", None)
     return p
 
 
@@ -447,6 +448,54 @@ def _reset_dd_peak(deps: Any, now: Optional[float] = None) -> tuple:
         return False, "当前回撤指数不可用（权益可能已亏光），基线未重置 —— 请人工核对交易所"
     return True, (f"回撤基线已重置：当前指数 {new['index']:.2f}，"
                   f"回撤从 0% 重新计量")
+
+
+def _on_flag(value: Any) -> Optional[bool]:
+    """``on`` 字段解析（与 main 同一份实现：``authn.parse_on_flag``）。"""
+    return authn.parse_on_flag(value)
+
+
+def _realized_dd_refusal(deps: Any) -> str:
+    """解除「已实现亏损熔断」前的复核：返回拒绝文案（空串 = 允许解除）。
+
+    口径与执行器同源（30 天窗口、−20% 熔断线，见 ``views.realized_dd_clear_block``）；
+    权益用「面板快照 → 配置基数」两级（面板渲染/写路径都零网络）。**不重置窗口**：
+    重置等于改风控口径，面板不提供。
+    """
+    from app.hl import views as views_mod
+    cfg = None
+    try:
+        cfg = _call(deps.config_fn) if deps.config_fn is not None else None
+    except Exception:                                             # noqa: BLE001
+        cfg = None
+    db = getattr(deps, "db", None)
+    if db is None:
+        return ""
+    try:
+        eq, _src = views_mod.equity_hint(db, cfg)
+        detail = views_mod.realized_dd_clear_block(db, cfg, eq)
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[admin] 已实现亏损熔断复核失败（不拦解除）：%s", e)
+        return ""
+    if detail and detail.get("over"):
+        return views_mod.realized_dd_refusal_text(detail)
+    return ""
+
+
+def _invalidate(deps: Any) -> None:
+    """写操作后让面板读数缓存立刻失效（快照/10s TTL 都绕过一次）。
+
+    ``deps.hl_set_kill`` / ``set_config`` 在 main 里已经被 ``_panel_write`` 包过；
+    这条是给「不经过那两个钩子」的写（renew / fallback clear）与 admin_ui 内部
+    直接调 db 的路径兜底 —— 自己点出来的写，页面必须立刻反映。
+    """
+    try:
+        info = getattr(getattr(deps, "hl_deps", None), "info", None)
+        fn = getattr(info, "invalidate", None)
+        if callable(fn):
+            fn()
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[admin] 失效面板缓存失败（忽略）：%s", e)
 
 
 # ---------------------------------------------------------------- 记录 Tab
@@ -1460,7 +1509,8 @@ def _status_strip(p: dict) -> str:
     primary = [
         _badge(_MODE_CLS[mode], "模式", _MODE_TXT[mode], "", "badge-status"),
         _health_badge_html(system, kill, kill_reason),
-        _positions_badge_html(p.get("positions"), p.get("mr")),
+        _positions_badge_html(p.get("positions"), p.get("mr"),
+                              reachable=bool(net.get("reachable", True))),
     ]
     # 第二层：辅助读数，字号更小（badge-small）—— 出问题要看得到，但不是第一眼。
     secondary = [
@@ -1627,12 +1677,52 @@ def render_agent_card(deps: AdminDeps) -> str:
     if str(state.get("source") or "") == "kraken-key-no-expiry":
         # Kraken：key 无到期、无代理钱包地址、无「到期前自动清仓」这套东西 ——
         # 只报一行状态，不摆五行空壳（手机上一张卡够用）。
+        #
+        # **但这一行必须是三态真值**（第七轮 B2）：旧版无条件写「已配置 · 无到期」，
+        # 于是 key 被清空/写错/半对时卡片永远是绿的 —— 面板上唯一能看凭据状态的地方
+        # 给了假阳性，切 live 后执行器 fail-closed 停手却查不出原因。
+        configured = state.get("configured")
+        verified = state.get("verified") is True
+        last_ok = state.get("last_read_ok")
+        age = _opt_num(state.get("verify_age_s"))
+        if configured is None:
+            # 老 state / 没接三态字段：如实说「不知道」，不冒充已配置
+            word, cls = "状态未知", "muted"
+            note = "该状态来源没有「是否配置/是否已验证」字段（旧版本写入）。"
+        elif not configured:
+            word, cls = "未配置", "neg"
+            note = ("Kraken API key/secret 缺失或不成对（半对不会混搭两个来源）："
+                    "执行器无法签名，私有读会失败。请在下方「更新 API」保存一对 key/secret。")
+        elif last_ok is False:
+            word, cls = "已配置 · 读取失败", "neg"
+            note = ("最近一次私有读取失败"
+                    + (f"（{_esc(str(state.get('verify_error') or ''))}）"
+                       if state.get("verify_error") else "")
+                    + "。key 存在不等于能签名 —— 请核对 key/secret 是否是同一对、"
+                      "是否被 Kraken 停用；下一轮调度成功读取后转「已验证」。")
+        elif verified:
+            when = f"（{age:.0f} 秒前）" if age is not None else ""
+            word, cls = "已配置 · 已验证", "pos"
+            note = f"最近一次调度轮私有读取成功{when}：key/secret 能正常签名。"
+        else:
+            word, cls = "已配置 · 未验证", "warn"
+            note = ("key/secret 成对存在，但还没有成功的私有读证据"
+                    + (f"（最近一次成功在 {age:.0f} 秒前，已超出有效期）"
+                       if age is not None else "")
+                    + "：下一轮调度读取成功后才算可用。")
+        src_txt = {"db": "DB", "env": "环境变量"}.get(str(state.get("cred_source") or ""), "")
         return ("<details class='card agent-card'><summary>API 状态</summary>"
                 "<div class='grid'><div class='kv'>"
                 "<span class='k'>Kraken Futures API</span>"
-                "<span class='v pos'>已配置 · 无到期</span></div></div>"
+                f"<span class='v {cls}'>{word}</span></div>"
+                + (f"<div class='kv'><span class='k'>凭据来源</span>"
+                   f"<span class='v'>{src_txt}</span></div>" if src_txt else "")
+                + "<div class='kv'><span class='k'>到期</span>"
+                  "<span class='v'>不限期（Kraken API 无到期）</span></div></div>"
+                f"<div class='legend'>{note}</div>"
                 "<div class='legend'>key/secret 只存服务器 DB，只用于签名，不能提币；"
-                "换 key 走下方「更新 API」。</div></details>")
+                "换 key 走下方「更新 API」——保存后要等下一轮私有读成功才会显示"
+                "「已验证」。</div></details>")
     if level == "no_expiry":
         until_txt = "不限期（Kraken API 无到期）"
         left_txt = "不会到期"
@@ -1703,6 +1793,7 @@ def render_agent_renew_block(deps: AdminDeps) -> str:
              "<b>Withdrawal=No Access</b>；把 Key 与 Secret（base64）粘到下面保存。</div>"
              "<form method='post' action='/admin/hl/agent/renew' autocomplete='off'>"
              f"{_hidden_k(_token_of(deps))}"
+             f"{_csrf_field(deps)}"
              "<input type='text' name='apikey' autocomplete='off' spellcheck='false' "
              "placeholder='API Key' required>"
              "<input type='password' name='apisecret' autocomplete='off' spellcheck='false' "
@@ -1766,6 +1857,8 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
     o.append("<form method='post' action='/admin/switch/kill'>"
              # hidden k：只在「凭据靠 URL」时渲染；Cookie/Bearer 会话不带（token 不进 HTML）
              f"{_hidden_k(_token_of(deps))}"
+             # CSRF 隐藏域：由 ADMIN_TOKEN 派生（不是 token 本身），所有写表单一致带
+             f"{_csrf_field(deps)}"
              f"<button class='{'red' if not kill else 'gray'}' type='submit' name='on' value='1'>"
              "触发（暂停开仓）</button>"
              f"<button class='{'gray' if kill else 'red'}' type='submit' name='on' value='0'>"
@@ -1786,6 +1879,7 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
              + "&nbsp;｜ PF_QQQXUSD · 名义 = 权益×0.5 · 只挡新入场</div>")
     o.append("<form method='post' action='/admin/hl/mr'>"
              f"{_hidden_k(_token_of(deps))}"
+             f"{_csrf_field(deps)}"
              f"<button class='{'red' if not mr_on else 'gray'}' type='submit' name='on' value='1'>"
              "启用 MR 腿</button>"
              f"<button class='{'gray' if mr_on else 'red'}' type='submit' name='on' value='0'>"
@@ -1866,6 +1960,26 @@ def _hidden_k(token: str) -> str:
     return f"<input type='hidden' name='k' value='{_esc(t)}'>" if t else ""
 
 
+def _hidden_csrf(token: str) -> str:
+    """表单里的 CSRF 隐藏域（由 ADMIN_TOKEN 派生，**不是** token 本身）。
+
+    Cookie 会话的写操作要求同源 Origin + 这个令牌（见 ``app/auth.py``）；表单带它，
+    页面照样不含 ADMIN_TOKEN。三个写表单（拉闸 / MR / 更新 API）必须**一致**都带 ——
+    少一个就会出现「有的按钮能点、有的被 403」这种更难排查的半套状态。
+    """
+    value = authn.csrf_token(str(token or ""))
+    return f"<input type='hidden' name='csrf' value='{_esc(value)}'>" if value else ""
+
+
+def _csrf_field(deps: "AdminDeps") -> str:
+    """取当前 ADMIN_TOKEN（只在服务端用于派生），渲染成隐藏域。"""
+    try:
+        token = str(_call(deps.token_fn, "") or "")
+    except Exception:                                             # noqa: BLE001
+        token = ""
+    return _hidden_csrf(token)
+
+
 def _links_k(request: Request, token: str) -> str:
     """HTML/跳转里要不要带 k：**永远不带**。
 
@@ -1942,6 +2056,20 @@ def _auth(deps: AdminDeps, request: Request, k: Optional[str]) -> str:
     return token
 
 
+def _auth_write(deps: AdminDeps, request: Request, k: Optional[str],
+                csrf: Optional[str] = None) -> str:
+    """写操作鉴权：401（没认出来是谁）→ 403（Cookie 会话跨源/无 CSRF）→ token。
+
+    与 ``main._admin_write_guard`` 同一口径，差别只在 token 的来源（deps 注入 vs
+    ``config.admin_token``）—— 两条实现都调同一个 ``authn.write_denied``。
+    """
+    token = _auth(deps, request, k)
+    denied = authn.write_denied(request, token, k, csrf)
+    if denied:
+        raise HTTPException(403, "写操作被拒：" + denied)
+    return token
+
+
 # ---------------------------------------------------------------- 路由
 def build_admin_router(deps: AdminDeps) -> APIRouter:
     """合并后的管理面板路由（GET /admin 四 Tab + 三个 POST + 三条旧地址重定向）。"""
@@ -1988,10 +2116,15 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
     # 迁移**只动位置与 redirect 目标**（tab=switch → tab=overview → 2026-11-10 起 tab=settings）：
     # 字段（on=1/0）、路由、事件文案、DD 熔断解除时重置基线的那段逻辑全部原样保留。
     @router.post("/admin/switch/kill")
-    def admin_switch_kill(request: Request, on: str = Form("0"), k: str = Form("")):
-        token = _auth(deps, request, k or None)
+    def admin_switch_kill(request: Request, on: Optional[str] = Form(None),
+                          k: str = Form(""), csrf: Optional[str] = Form(None)):
+        token = _auth_write(deps, request, k or None, csrf)
         link_k = _links_k(request, token)
-        want = str(on or "") in ("1", "true", "on")
+        # on 必须显式：缺字段/未知值 → 400 且**不改状态**（旧版缺字段 = 解除熔断）。
+        want = _on_flag(on)
+        if want is None:
+            raise HTTPException(400, "on 字段必须是 1/0（true/false、on/off、yes/no 也接受）；"
+                                     "缺失或未知值不改动 kill 状态")
         if deps.hl_set_kill is not None:
             # 【v2·高2】解除**回撤熔断**时必须同时把回撤基线重置掉：
             # dd 熔断永不自解，但 peak 不重置的话，下一轮 DD 仍是 31% → 立刻又置 kill
@@ -1999,7 +2132,19 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             # 必须在本请求内先重置、再解锁：分两步做的话，中间那一轮 tick 会抢先置 kill。
             # 其它 origin（manual/reconcile/daily_loss/size/expiry）**不**重置基线：
             # 那些停手与回撤无关，顺手把基线抹掉等于替用户绕过回撤熔断。
+            #
+            # 【第七轮 B7】**已实现亏损熔断**（origin=realized_dd）不走重置路线：
+            # 判据是 30 天滚动窗口，重置窗口 = 改风控口径。仍越阈值时拒绝解除并解释
+            # 剩余亏损/阈值；窗口已回正时只解锁、不动窗口。
             note = ""
+            if not want and _kill_origin(deps) == "realized_dd":
+                refusal = _realized_dd_refusal(deps)
+                if refusal:
+                    deps.log_event("kill", "面板解除已实现亏损熔断被拒：" + refusal)
+                    return _session_cookie(
+                        RedirectResponse(_back(link_k, "settings", refusal), status_code=303),
+                        request, token, k)
+                note = "；30 天亏损窗口已回正（窗口不重置，继续滚动）"
             if not want and _kill_origin(deps) == "dd":
                 ok, msg = _reset_dd_peak(deps)
                 note = (("；" + msg) if ok else
@@ -2007,6 +2152,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                 deps.log_event("kill", f"解除回撤熔断（origin=dd）→ {'重置基线成功' if ok else '重置基线失败'}：{msg}")
             _manual_kill(deps, want, "人工" if want else "")
             deps.log_event("kill", f"面板{'触发' if want else '解除'} kill switch")
+            _invalidate(deps)
             return _session_cookie(
                 RedirectResponse(
                     _back(link_k, "settings", (f"已解除 kill switch{note}" if not want
@@ -2020,7 +2166,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
 
     # ---------------- 清除手工兜底有效期（M3 的显式入口） ----------------
     @router.post("/admin/hl/agent/fallback/clear")
-    def admin_agent_fallback_clear(request: Request, k: str = Form("")):
+    def admin_agent_fallback_clear(request: Request, k: str = Form(""),
+                                   csrf: Optional[str] = Form(None)):
         """清掉手工兜底有效期（把空串写进 DB）。
 
         2026-10-30 起「设置兜底值」的输入框随参数表单一起删除了（防陈旧兜底值
@@ -2028,12 +2175,13 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         且是唯一能删掉 DB 里已有脏值的入口。要**设置**兜底值走容器内 sqlite 直改
         （docs/HL_RUNBOOK.md）。
         """
-        token = _auth(deps, request, k or None)
+        token = _auth_write(deps, request, k or None, csrf)
         link_k = _links_k(request, token)
         err = deps.put("hl_agent_valid_until_ms", "")
         if err:
             raise HTTPException(400, f"清除失败：{err}")
         deps.log_event("decision", "面板清除手工兜底有效期（hl_agent_valid_until_ms）")
+        _invalidate(deps)
         return _session_cookie(
             RedirectResponse(_back(link_k, "settings", "已清除手工兜底有效期"),
                              status_code=303), request, token, k)
@@ -2041,14 +2189,15 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
     # ---------------- 更新 API（到期续期后热切换私钥） ----------------
     @router.post("/admin/hl/agent/renew")
     def admin_agent_renew(request: Request, apikey: str = Form(""),
-                          apisecret: str = Form(""), k: str = Form("")):
+                          apisecret: str = Form(""), k: str = Form(""),
+                          csrf: Optional[str] = Form(None)):
         """保存 Kraken Derivatives API key/secret（form 字段 apikey/apisecret）。
 
         失败一律 400 + 人话指引；**响应与日志都不含凭据任何片段**。
         校验只做格式（key 非空、secret 是 base64）；真实有效性由下一轮执行器
         请求 fail-closed 暴露（签名错 = 全部私有读数报错并停手，不会错单）。
         """
-        token = _auth(deps, request, k or None)
+        token = _auth_write(deps, request, k or None, csrf)
         link_k = _links_k(request, token)
         if deps.renew_fn is None:
             raise HTTPException(400, "更新 API 未接线（执行器模块未装配），本次没有保存任何东西")
