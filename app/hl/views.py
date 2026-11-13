@@ -43,6 +43,7 @@ from app import auth as authn
 from app import posfields
 from app.hl import flows as hl_flows
 from app.hl import dd as hl_dd
+from app.hl import stops as hl_stops
 from app.ui_theme import (ICON_LINKS, SYMBOL_CSS, THEME_CSS, H1_BLOCK, PRODUCT_NAME,
                           normalize_theme, theme_attr, theme_switch_html)
 
@@ -470,6 +471,54 @@ def _coin_of(symbol: Any) -> str:
     return s.split("_")[0] if s else ""
 
 
+def _sz_tick(info: Any, coin: str) -> Optional[float]:
+    """该 coin 的数量步长（`10 ** -sz_decimals`）；取不到返回 None。
+
+    止损覆盖判据（`app/hl/stops.covering_stop_px`）用它做「挂单张数够不够」的容差：
+    有交易所精度就用交易所精度，没有就退化成 `sz × 1e-6` 的相对噪声容差。
+    老桩/降级适配层（`SnapshotInfo`）没有 `specs`，这里一律吞掉异常返回 None ——
+    面板不能因为精度查不到就 500，也不能因此把「已保护」说成「无止损」。
+    """
+    if info is None or not coin:
+        return None
+    try:
+        spec = (info.specs([coin]) or {}).get(coin) or {}
+        dec = spec.get("sz_decimals")
+        if dec is None:
+            dec = spec.get("szDecimals")
+        dec = int(dec)
+    except Exception:                                              # noqa: BLE001
+        return None
+    if dec < 0 or dec > 12:
+        return None
+    return 10.0 ** (-dec)
+
+
+def _stop_order_dicts(orders: Any) -> List[dict]:
+    """快照挂单 → 判据可直读的 dict 列表（缺键补默认值）。
+
+    `covering_stop_px` 按 key 直读 `order_type`/`is_buy`/`sz`/`trigger_px`，而老快照行或
+    降级适配层可能缺这些键；缺键会让整个 `/api/hl/status` 抛 KeyError。这里统一补齐：
+    缺 `order_type` → None（「未知」，不当止盈单放行，也不当止损单放行），
+    其余数值缺键 → 0/False，与下方 `orders_open` 的序列化口径一致。
+    """
+    out: List[dict] = []
+    for o in orders or []:
+        od = _rowd(o)
+        if not od:
+            continue
+        out.append({
+            "coin": str(od.get("coin") or ""),
+            "is_buy": bool(od.get("is_buy")),
+            "sz": _num(od.get("sz")),
+            "reduce_only": bool(od.get("reduce_only")),
+            "is_trigger": bool(od.get("is_trigger")),
+            "trigger_px": _opt_num(od.get("trigger_px")) or 0.0,
+            "order_type": od.get("order_type"),
+        })
+    return out
+
+
 # 显示口径：信号层用的是 MEXC 的合约名（BTC_USDT），但真实成交发生在 Hyperliquid，
 # 那里合约就叫 BTC / ETH。面板一律显示 HL 侧的名字，免得看的人以为在交易 USDT 对。
 # 内部键（signal_bar_ms、幂等键、DB 里的 symbol）保持不动 —— 只换展示。
@@ -676,10 +725,17 @@ def _reconcile(reachable: bool, snap_positions: List[dict], snap_orders: List[di
         if coin not in snap_coins:
             return True
         if row.get("hl_stop_oid") and orders_trusted:
-            has_stop = any(str(o.get("coin") or "") == coin
-                           and o.get("reduce_only") and o.get("is_trigger")
-                           for o in snap_orders)
-            if not has_stop:
+            # 与止损列/执行器同一口径（app/hl/stops.py）：旧实现只判
+            # coin + reduce_only + is_trigger，一张同向小额止盈单就能让对账显示「一致」，
+            # 而同一行的止损列却是 ❌ —— 两个结论互相矛盾，用户不知道信哪个。
+            try:
+                _side = int(row.get("side") or 1)
+                _sz = float(row.get("hl_sz") or row.get("coin_qty") or 0.0) or None
+                _entry = float(row.get("actual_entry") or row.get("entry_price") or 0.0) or None
+            except (TypeError, ValueError):
+                _side, _sz, _entry = None, None, None
+            if hl_stops.covering_stop_px(snap_orders, coin, side=_side, sz=_sz,
+                                         entry_px=_entry) is None:
                 return True
     for coin in snap_coins:
         if coin in open_by_coin:
@@ -852,6 +908,8 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             open_by_coin[coin] = d
 
     # ---------------- 持仓（快照为主，补 DB 的 signal/stop 信息）----------------
+    # 判据要按 key 直读挂单（含 order_type），先统一补齐缺键，避免老快照行触发 KeyError。
+    stop_orders = _stop_order_dicts(snap_orders)
     positions_out: List[dict] = []
     for p in snap_positions:
         d = _rowd(p)
@@ -862,19 +920,25 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         mark = _num(d.get("mark_px"))
         upnl = _num(d.get("unrealized_pnl"))
 
+        # 方向以快照 side 为准（size 是绝对值，不能用来推方向；旧兜底恒返回 1）。
+        try:
+            side = int(d.get("side")) if d.get("side") not in (None, "") else 1
+        except (TypeError, ValueError):
+            side = 1
+
+        # 止损覆盖判据与执行器/探针**同源**（app/hl/stops.covering_stop_px）：同 coin、
+        # reduce_only、is_trigger、非止盈类型、trigger_px>0、方向相反、触发价在亏损侧、
+        # 张数够覆盖，全部由那一份函数判。以前这里内联只看 coin+reduce_only+is_trigger，
+        # 于是「买向 0.001 张的盈利侧止盈单」也能让面板显示「已有止损」，与执行器/探针
+        # 互相矛盾（2026-11-13 审核 P2-1）。
         stop_px: Optional[float] = None
         has_stop = False
         trusted = orders_trusted
         if trusted:
-            for o in snap_orders:
-                od = _rowd(o)
-                if str(od.get("coin") or "") != coin:
-                    continue
-                if od.get("reduce_only") and od.get("is_trigger"):
-                    tp = _opt_num(od.get("trigger_px"))
-                    if tp and tp > 0:
-                        stop_px, has_stop = tp, True
-                        break
+            stop_px = hl_stops.covering_stop_px(
+                stop_orders, coin, side=side, sz=size, entry_px=entry,
+                sz_tick=_sz_tick(deps.info, coin))
+            has_stop = stop_px is not None
 
         risk = abs(entry - stop_px) * size if (stop_px and entry and size) else 0.0
         r_unrealized = round(upnl / risk, 4) if risk > 0 else 0.0
@@ -884,12 +948,6 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             stop_dist_pct = _num(row.get("stop_dist"))
         else:
             stop_dist_pct = 0.0
-
-        try:
-            side = int(d.get("side")) if d.get("side") not in (None, "") else 1
-        except (TypeError, ValueError):
-            side = 1
-        # 注：size 是绝对值，不能用来推方向（旧兜底恒返回 1）；方向以快照 side 为准。
 
         positions_out.append({
             "coin": coin,
@@ -931,6 +989,9 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             "reduce_only": bool(od.get("reduce_only")),
             "trigger_px": _opt_num(od.get("trigger_px")) or 0.0,
             "is_trigger": bool(od.get("is_trigger")),
+            # 下游要区分止盈单与止损单：order_type 原样透传（Kraken 用 take_profit），
+            # 快照没给就是 None（未知 ≠ 止损），不在这里猜。
+            "order_type": od.get("order_type"),
             "timestamp": _to_seconds(od.get("timestamp")),
         })
 

@@ -33,6 +33,7 @@ from app.hl import pnl as hl_pnl
 from app.hl import flows as hl_flows
 from app.hl import funding as hl_funding
 from app.hl import dd as hl_dd
+from app.hl.stops import has_covering_stop
 from app.kr.exchange import (STATUS_DRY, STATUS_FILLED, STATUS_RESTING, _clean_alert_text,
                              make_cloid)
 from app.engine import DISPLAY_TZ, TZ_LABEL
@@ -2290,12 +2291,30 @@ class Executor:
         except Exception as ex:                                     # noqa: BLE001
             close = {"ok": False, "status": "error", "error": f"{type(ex).__name__}: {ex}"}
         ok_close = bool(close.get("ok")) and close.get("status") == STATUS_FILLED
+        remain = 0.0
         if ok_close:
-            self._close_local(int(row["id"]), float(close.get("avg_px") or limit_px),
-                              "stop_missing", sz)
+            _filled, remain = self._filled_split(coin, sz, close)
+            if remain <= 0:
+                self._close_local(int(row["id"]), float(close.get("avg_px") or limit_px),
+                                  "stop_missing", sz)
+            else:
+                # 只平掉一部分：剩余量必须留在账上（继续走补挂/平仓流程），
+                # 整笔关账会让它变成「交易所里有、本地没记录」的孤儿仓 → kill 停手。
+                try:
+                    self.db.set_pos_hl(int(row["id"]), hl_sz=remain)
+                except Exception as ex:                              # noqa: BLE001
+                    logger.warning("[hl-exec] 补挂失败兜底部分成交回写 hl_sz 失败：%s", ex)
+                self._event(EV_ERROR,
+                            f"{symbol} 补挂失败兜底平仓部分成交，剩余 {remain} 仍在交易所（未关账）",
+                            symbol=symbol, data={"filled": _filled, "remain": remain})
+        if ok_close and remain <= 0:
+            tail = "已市价平仓"
+        elif ok_close:
+            tail = f"仅平掉一部分，剩余 {remain:g} 仍在交易所"
+        else:
+            tail = f"尝试平仓但结果异常（{close.get('status')}）"
         self._alert(f"【Kraken】🛑 {coin} 止损单丢失且补挂失败（{res.get('error')}），"
-                    f"已{'市价平仓' if ok_close else '尝试平仓但结果异常'}（{close.get('status')}）。"
-                    f"**请立刻人工核对交易所**！")
+                    f"{tail}。**请立刻人工核对交易所**！")
 
     @staticmethod
     def _mark_px(snap: Optional[dict], coin: str) -> Optional[float]:
@@ -2340,56 +2359,127 @@ class Executor:
 
         默认参数保留，旧调用（只判「有没有」）行为不变。
         """
-        try:
-            need_sz = float(sz) if sz is not None else 0.0
-        except (TypeError, ValueError):
-            need_sz = 0.0
-        try:
-            ref_px = float(entry_px) if entry_px is not None else 0.0
-        except (TypeError, ValueError):
-            ref_px = 0.0
-        # 盈利侧判据要有方向才有意义：只给 entry_px 不给 side 时**不猜**（保持旧语义）。
-        loss_side = ref_px > 0 and side is not None
-        side_i = int(side) if side is not None else 0
-        tol = 0.0
-        if need_sz > 0:
-            tick = self._size_tick(coin) if hasattr(self, "info") else None
-            tol = float(tick) if tick and tick > 0 else need_sz * 1e-6
-        for o in snap.get("open_orders") or []:
-            if o.get("coin") != coin or not o.get("reduce_only") or not o.get("is_trigger"):
-                continue
-            # 止盈单不是止损（P2-C）。类型缺失（老桩/降级适配层）不当作止盈 —— 那种情况
-            # 已有下面 trigger/方向/数量/亏损侧四道判据，不靠类型缺失放行任何东西。
-            if str(o.get("order_type") or "").strip().lower() in _TAKE_PROFIT_TYPES:
-                continue
+        # 判据本体在 app/hl/stops.py —— 执行器/面板/探针共用一份，不再各写一遍
+        # （2026-11-13 审核 P2-1 就是面板那份落后于这份导致的）。
+        tick = None
+        if sz:
             try:
-                trig = float(o.get("trigger_px") or 0.0)
-                if trig <= 0:
-                    continue
-            except (TypeError, ValueError):
-                continue
-            if loss_side:
-                # 多仓（side>0）的止损必须在入场价**下方**；空仓在上方。
-                if side_i > 0 and not trig < ref_px:
-                    continue
-                if side_i < 0 and not trig > ref_px:
-                    continue
-            if side is not None:
-                try:
-                    is_buy = bool(o.get("is_buy"))
-                except Exception:                                    # noqa: BLE001
-                    continue
-                if is_buy != (side_i < 0):
-                    continue
-            if need_sz > 0:
-                try:
-                    osz = float(o.get("sz") or 0.0)
-                except (TypeError, ValueError):
-                    continue
-                if osz < need_sz - tol:
-                    continue
-            return True
-        return False
+                tick = self._size_tick(coin) if hasattr(self, "info") else None
+            except Exception:                                        # noqa: BLE001
+                tick = None
+        return has_covering_stop(snap.get("open_orders") or [], coin, side=side,
+                                 sz=sz, entry_px=entry_px, sz_tick=tick)
+
+    # ---------------------------------------------------- 部分成交 / 保护恢复（审计 r6）
+    def _filled_split(self, coin: str, sz: float, res: dict) -> Tuple[float, float]:
+        """把平仓回执拆成 (已成交量, 剩余量)。
+
+        契约背景（`KrExchange.parse_order_response`）：Kraken 对**部分成交**也回
+        ``status=filled``，真实成交量在 ``filled_sz``。只判 status 就整笔关账，会把
+        交易所里剩下的仓位从本地账本抹掉 —— 下一轮对账看到「交易所有仓、本地无记录」，
+        直接 kill 停手，剩余仓既没有保护也没人平（2026-11-13 审核 P1-1）。
+
+        回执**没给** filled_sz（老适配层/降级桩）或给了非正数时按整单成交返回，
+        保持改动前语义；给了就按 tick 容差算剩余量。
+        """
+        try:
+            filled = float(res.get("filled_sz"))
+        except (TypeError, ValueError):
+            return float(sz), 0.0
+        if filled <= 0:
+            return float(sz), 0.0
+        tick = None
+        try:
+            tick = self._size_tick(coin)
+        except Exception:                                            # noqa: BLE001
+            tick = None
+        tol = float(tick) if tick and tick > 0 else float(sz) * 1e-6
+        remain = float(sz) - filled
+        if remain <= tol:
+            remain = 0.0
+        return min(filled, float(sz)), max(remain, 0.0)
+
+    def _emergency_rehang_stop(self, row, coin: str, symbol: str, side: int, sz: float,
+                               exit_bar_ms: int, sz_dec: int) -> Optional[float]:
+        """止损已被撤掉、平仓却没发出去/失败时，立刻把原止损挂回去。
+
+        返回挂回的触发价；挂不上返回 None（调用方负责兜底平仓与告警）。用
+        ``exit:rehang`` 这个 purpose：与开仓止损（stop@入场bar）、事后补挂（stop:fix）
+        不同源，不会撞 cloid。
+        """
+        try:
+            re_px = self._round_px(coin, float(row["actual_stop"] or row["stop_price"]), sz_dec)
+        except Exception as ex:                                      # noqa: BLE001
+            self._event(EV_ERROR, f"{symbol} 止损挂回前取整失败：{ex}", symbol=symbol)
+            return None
+        if not self._gate_act(ACT_REPLACE, coin, side, symbol=symbol):
+            self._event(EV_ERROR, f"{symbol} churn 熔断：平仓失败后止损未挂回", symbol=symbol)
+            return None
+        self._churn_note(coin, side)
+        cloid = self._attempt_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG)
+        try:
+            res = self.ex.place_order(coin, side != 1, sz, re_px, reduce_only=True,
+                                      trigger_px=re_px, cloid=cloid)
+        except Exception as ex:                                      # noqa: BLE001
+            res = {"ok": False, "status": "error", "error": f"{type(ex).__name__}: {ex}"}
+        ok = _order_live(res)
+        status = res.get("status") if ok else ST_FAILED
+        err = None if ok else str(res.get("error"))[:300]
+        try:
+            self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side, sz,
+                                     px=re_px, reduce_only=True, status=status,
+                                     cloid=cloid, error=err, oid=res.get("oid"))
+            # record_intent 是 INSERT OR IGNORE：同 (symbol, bar, purpose) 的第二次重挂
+            # 不会更新 oid，必须显式回写最新结果（否则撤残留止损撤到旧单）。
+            self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG,
+                                    oid=res.get("oid"), status=status, cloid=cloid,
+                                    error=err, px=re_px, sz=sz)
+        except Exception as ex:                                      # noqa: BLE001
+            logger.warning("[hl-exec] 应急止损挂回落库失败（忽略）：%s", ex)
+        return re_px if ok else None
+
+    def _protect_after_exit_failure(self, position_id: int, row, coin: str, symbol: str,
+                                    side: int, sz: float, exit_bar_ms: int,
+                                    sz_dec: int) -> str:
+        """离场失败后的保护恢复：先挂回止损，挂不上就把仓位平掉。
+
+        ``return``：``rehang``（已挂回保护）/ ``flattened``（已平掉）/ ``unprotected``
+        （既没挂回也没确认平掉 → 告警必须喊人）。
+        """
+        px = self._emergency_rehang_stop(row, coin, symbol, side, sz, exit_bar_ms, sz_dec)
+        if px is not None:
+            self._event(EV_ORDER, f"{symbol} 离场失败，已把止损挂回 @ {px:,.2f}", symbol=symbol)
+            return "rehang"
+        try:
+            close_px = self._round_px(coin, self.ex.slippage_limit(coin, side != 1), sz_dec)
+        except Exception:                                            # noqa: BLE001
+            mark = self._mark_px(self._snapshot(), coin)
+            close_px = self._round_px(coin, mark, sz_dec) if mark else 0.0
+        if close_px <= 0:
+            self._event(EV_ERROR, f"{symbol} 离场失败且拿不到平仓价，未处理", symbol=symbol)
+            return "unprotected"
+        try:
+            res = self.ex.place_order(coin, side != 1, sz, close_px, reduce_only=True)
+        except Exception as ex:                                      # noqa: BLE001
+            res = {"ok": False, "status": "error", "error": f"{type(ex).__name__}: {ex}"}
+        if not (bool(res.get("ok")) and res.get("status") == STATUS_FILLED):
+            self._event(EV_ERROR, f"{symbol} 离场失败后的兜底平仓未确认", symbol=symbol,
+                        data={"close": res})
+            return "unprotected"
+        _filled, remain = self._filled_split(coin, sz, res)
+        if remain > 0:
+            # 只平掉一部分：本地必须留着剩余量并继续受保护流程管，绝不能整笔关账。
+            try:
+                self.db.set_pos_hl(position_id, hl_sz=remain)
+            except Exception as ex:                                  # noqa: BLE001
+                logger.warning("[hl-exec] 兜底部分成交回写 hl_sz 失败：%s", ex)
+            self._event(EV_ERROR,
+                        f"{symbol} 兜底平仓部分成交，剩余 {remain} 仍在交易所（未关账）",
+                        symbol=symbol, data={"filled": _filled, "remain": remain})
+            return "unprotected"
+        self._close_local(position_id, float(res.get("avg_px") or close_px), "stop_missing", sz)
+        self._verify_no_residual_stops(row, coin)
+        return "flattened"
 
     # ------------------------------------------------------------ 闸门
     def _entry_gates(self, symbol: str, plan, snap: dict, equity: Optional[float] = None,
@@ -2918,12 +3008,31 @@ class Executor:
                 close_px = limit_px
             close = self.ex.place_order(coin, side != 1, filled_sz, close_px, reduce_only=True)
             closed_ok = bool(close.get("ok")) and close.get("status") == STATUS_FILLED
-            msg = (f"【Kraken】⚠️ {coin} 止损单挂失败（{stop_err}），"
-                   + ("已立即平仓" if closed_ok else f"平仓未确认（{close.get('status')}）——仓位可能仍在交易所")
-                   + "。本次未持仓，请人工核对。")
+            remain = 0.0
+            if closed_ok:
+                _filled, remain = self._filled_split(coin, filled_sz, close)
+            if closed_ok and remain <= 0:
+                self.db.set_pos_hl(position_id, hl_status="aborted")
+                tail = "已立即平仓。本次未持仓，请人工核对。"
+            elif closed_ok:
+                # 只平掉一部分 → 剩余量继续留在账上（hl_status 保持 open）：
+                # 写 aborted 会让 reconcile 的 local_open 过滤把这一行排除，
+                # 剩余仓变成「交易所里有、本地无记录」的孤儿仓，没人补挂也没人平
+                # （2026-11-13 审核 P1-1）。
+                try:
+                    self.db.set_pos_hl(position_id, hl_status="open", hl_sz=remain)
+                except Exception as ex:                              # noqa: BLE001
+                    logger.warning("[hl-exec] 保护失败部分平仓回写失败：%s", ex)
+                self._event(EV_ERROR,
+                            f"{symbol} 止损挂失败、兜底平仓部分成交，剩余 {remain} 仍在交易所（未关账）",
+                            symbol=symbol, data={"filled": _filled, "remain": remain})
+                tail = (f"兜底平仓只成交一部分，剩余 {remain:g} 仍在交易所且无止损，"
+                        f"下一轮对账会尝试补挂。请人工核对。")
+            else:
+                tail = f"平仓未确认（{close.get('status')}）——仓位可能仍在交易所，请人工核对。"
+            msg = f"【Kraken】⚠️ {coin} 止损单挂失败（{stop_err}），{tail}"
             self._event(EV_ERROR, f"止损挂单失败 → 立即平仓：{stop_err}",
                         symbol=symbol, data={"close": close, "stop_res": stop_res})
-            self.db.set_pos_hl(position_id, hl_status="aborted")
             self._alert(msg)
             return True
         self.db.hl_update_order(symbol, bar_ms, PURPOSE_STOP, status=ST_RESTING,
@@ -3409,8 +3518,11 @@ class Executor:
                 self._event(EV_ERROR,
                             f"{symbol} 平仓限价计算失败且拿不到标记价，本轮不发单：{e}",
                             symbol=symbol)
-                self._alert(f"【Kraken】🛑 {coin} 平仓限价计算失败，且快照里读不到该仓标记价"
-                            f"——本轮**未下平仓单**（止损单已撤）。请立即人工平仓或挂回止损！")
+                self._protect_after_exit_failure(position_id, row, coin, symbol, side, sz,
+                                                 exit_bar_ms, sz_dec)
+                self._alert(f"【Kraken】🛑 {coin} 平仓限价计算失败且读不到标记价"
+                            f"——本轮**未下平仓单**（止损单已撤，已尝试挂回止损/兜底平仓）。"
+                            f"请立即人工核对交易所！")
                 return True
             try:
                 limit_px = self._round_px(coin, mark, sz_dec)
@@ -3429,8 +3541,18 @@ class Executor:
             self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FAILED,
                                     error=str(res.get("error"))[:300])
             self._event(EV_ERROR, f"平仓失败：{res['error']}", symbol=symbol)
-            self._alert(f"【Kraken】⚠️ {coin} 平仓失败：{res['error']}\n"
-                        f"（止损单已撤！请立即人工平仓或手动挂回止损）")
+            # 走到这里时止损单已经撤掉了 —— 不平仓就必须立刻恢复保护，
+            # 否则从这一刻到下一轮 reconcile（≤5 分钟）是裸仓窗口
+            # （2026-11-13 审核 P1-2）。
+            outcome = self._protect_after_exit_failure(position_id, row, coin, symbol, side, sz,
+                                                       exit_bar_ms, sz_dec)
+            if outcome == "rehang":
+                tail = "止损单**已挂回**，仓位继续受保护；下一轮会重试离场。"
+            elif outcome == "flattened":
+                tail = "止损挂回失败，已改为市价平仓。请人工核对。"
+            else:
+                tail = "止损挂回与兜底平仓都未成功——**仓位可能仍在交易所且无止损**，请立即人工处理！"
+            self._alert(f"【Kraken】⚠️ {coin} 平仓失败：{res['error']}\n（止损单已撤）{tail}")
             return True
         if res["status"] != STATUS_FILLED:
             # IOC 挂出未成（resting）≠ 已平仓。绝不能按限价关账 —— 交易所仓位还在，
@@ -3501,11 +3623,26 @@ class Executor:
                 self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FILLED,
                                         oid=close.get("oid"), filled_sz=close.get("filled_sz"),
                                         avg_px=px, raw=str(close.get("raw"))[:2000])
-                self._close_local(position_id, px, reason, sz)
-                self._verify_no_residual_stops(row, coin)     # 审计三轮：残留止损复核
-                r = self._r_multiple(row, px)
-                self._alert(f"【Kraken】⚠️ {coin} 平仓未成交、止损重挂失败，已市价平仓"
-                            f" @ {px:,.2f}（R {r:+.2f}）。请人工核对。")
+                _filled, remain = self._filled_split(coin, sz, close)
+                if remain > 0:
+                    # 兜底市价平仓也只成交一部分 → 剩余量留在账上继续受保护流程管，
+                    # 整笔关账会把它变成孤儿仓（2026-11-13 审核 P1-1）。
+                    try:
+                        self.db.set_pos_hl(position_id, hl_sz=remain)
+                    except Exception as ex:                          # noqa: BLE001
+                        logger.warning("[hl-exec] 平仓兜底部分成交回写 hl_sz 失败：%s", ex)
+                    self._event(EV_ERROR,
+                                f"{symbol} 兜底平仓部分成交，剩余 {remain} 仍在交易所（未关账）",
+                                symbol=symbol, data={"filled": _filled, "remain": remain})
+                    self._alert(f"【Kraken】🛑 {coin} 平仓未成交、止损重挂失败，兜底市价单只成交 "
+                                f"{_filled:g}/{sz:g}——剩余 {remain:g} 仍在交易所且无止损，"
+                                f"下一轮继续处理。请人工核对！")
+                else:
+                    self._close_local(position_id, px, reason, sz)
+                    self._verify_no_residual_stops(row, coin)     # 审计三轮：残留止损复核
+                    r = self._r_multiple(row, px)
+                    self._alert(f"【Kraken】⚠️ {coin} 平仓未成交、止损重挂失败，已市价平仓"
+                                f" @ {px:,.2f}（R {r:+.2f}）。请人工核对。")
             else:
                 self._alert(f"【Kraken】🛑 {coin} 平仓未成交且止损重挂失败、市价平仓未确认"
                             f"（{close.get('status')}）——仓位可能仍在交易所且无止损，"
