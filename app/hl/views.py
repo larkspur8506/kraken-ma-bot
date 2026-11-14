@@ -1176,7 +1176,7 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
     # 面板统一按「正=收入」渲染，所以此处对每个 sinceOpen 取反；
     # payload 的 funding_total（及 /api/hl/* 消费者）与总览同用这一个口径。
     funding_total = sum(-_num(d.get("funding_since_open")) for d in (_rowd(p) for p in snap_positions))
-    unrealized_pnl = sum(p["unrealized_pnl"] for p in positions_out)
+    unrealized_pnl = sum(_num(_rowd(p).get("unrealized_pnl")) for p in snap_positions)
 
     # ---------------- 信号 ----------------
     signals: List[dict] = []
@@ -2351,7 +2351,7 @@ def _mr_view(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     **台账仓（第七轮 B1 / 2026-11-13）**：``status.mr`` 里可能只有 ``ledger_pos``
     （MR 停用/尚未 tick，但 DB ``mr_trades`` 里有一行 OPEN）。这时仍要展示 —— 交易所
     上那张 QQQ 仓是真的，藏起来等于让人忘了它；同时明确标出 ``auto_exit=False``
-    （MR 停用 = 不管理，不会自动离场），别再出现「以为它会自己走」的误解。
+    （MR 开关只挡新仓，持仓仍按信号离场；执行模式 off 才停止执行）。
 
     **运行时状态（第七轮复审）**：``state`` / ``error`` / ``action_required`` 原样带出，
     台账仓、闸门拦下、影子模式、需人工核对都必须能在页面上看见（见 `_MR_STATE_TEXT`）。
@@ -2387,7 +2387,7 @@ def _mr_view(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     elif state_txt:
         status = state_txt
     elif not enabled and from_ledger:
-        status = "停用（不会自动离场）"
+        status = "停用（仅停新仓，已有仓继续离场）"
     elif not enabled:
         status = "停用"
     elif holding:
@@ -2415,7 +2415,7 @@ def _mr_view(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "phase": sig.get("phase"), "window": _as_dict(sig.get("window")),
         # 台账行只读、且停用时不管理：这两个字段驱动渲染层提示「不会自动离场」。
         "from_ledger": bool(from_ledger),
-        "auto_exit": bool(enabled),
+        "auto_exit": bool(holding and state != "mode_off"),
         "read_only": bool(from_ledger or not enabled),
         # 运行时状态：面板必须能看见「需人工核对 / 闸门拦下 / 影子模式」。
         "state": state, "state_text": state_txt, "error": error,
@@ -3113,10 +3113,12 @@ def _render_body(p: dict) -> str:
                          f"下一次评估 {_et_iso_local(mr.get('next_eval_et'))}"
                          # 「不会自动离场」只在真的不管理时写（auto_exit=False）；
                          # 单纯是台账来源但 MR 仍启用 → 只是数据还没到，别吓人。
-                         + (" · ⚠️ MR 未启用：不会自动离场，需人工处理（离场线仅供参考）"
-                            if not mr.get("auto_exit") else
-                            (" · 台账读数（下一轮 MR tick 后转为实时）"
-                             if mr.get("from_ledger") else ""))
+                         + (" · ⚠️ 执行模式 off：不会自动离场，需人工处理"
+                            if mr.get("state") == "mode_off" else
+                            (" · MR 已停新仓，已有仓继续按信号离场"
+                             if not mr.get("enabled") else
+                             (" · 台账读数（下一轮 MR tick 后转为实时）"
+                              if mr.get("from_ledger") else "")))
                          # 运行时异常（需人工核对 / 闸门拦下 / 影子模式）：原因写在小字行，
                          # 否则「持仓中」这一行会把「这一轮其实没按预期工作」盖掉。
                          + (f" · ⚠️ {_esc(mr['detail'])}" if mr.get("detail") else "")

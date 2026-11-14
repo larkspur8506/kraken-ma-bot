@@ -471,7 +471,7 @@ class TestSettlementGap(MrBase):
     def test_no_gap_when_partials_are_recorded(self):
         tid = mr_entry(self.db, qty=100.0, entry=100.0, entry_ts=NOW / 1000.0 - 86400)
         self.db.mr_trade_append_partial(tid, qty=40.0, price=109.8,
-                                        ts=NOW / 1000.0 - 3600)
+                                        ts=NOW / 1000.0 - 3600, price_source="avg_px")
         info = Info(szi=60.0, mid=110.0, fills_api="none")
 
         def _exit(coin, is_buy, sz, limit_px, **kw):
