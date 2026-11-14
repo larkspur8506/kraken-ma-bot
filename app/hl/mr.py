@@ -795,7 +795,9 @@ class HlMrLeg:
         # 「净利是否确定」= 数量没有缺口 **且** 价格有成交证据。只有前者时，
         # 一笔按限价/参考价估算的关账会被读成「确定的已实现盈亏」（第七轮 B6：
         # 缺口不能假确定，估算价同理）。
-        complete = abs(gap) <= tol and not bool(estimated)
+        partial_prices_known = all(_price_is_evidence(str(p.get("price_source") or ""))
+                                   for p in partials)
+        complete = abs(gap) <= tol and not bool(estimated) and partial_prices_known
         recon = None
         if (expected < -tol or abs(gap) > tol
                 or covered + gap < expected - tol or covered > expected + tol):
@@ -1004,6 +1006,40 @@ class HlMrLeg:
         fills, note = self._fills(since_s=float(open_row["entry_ts"] or 0.0) - 120.0,
                                   until_s=now_s, close_side=True)
         fill_qty, fill_px, fill_ids = _fill_totals(fills)
+        # 全持仓期成交已覆盖原始总量时，扣掉已入账片段的数量与名义。
+        # 不能裁数量为 remaining 却仍使用全笔 VWAP（会把旧片段重复定价）。
+        if partial_qty > 0 and abs(fill_qty - qty) <= max(1e-9, qty * 1e-9):
+            if partials and all(_price_is_evidence(str(p.get("price_source") or ""))
+                                for p in partials):
+                partial_ntl = sum(float(p.get("qty") or 0.0) * float(p.get("price") or 0.0)
+                                  for p in partials)
+                remaining_ntl = fill_qty * fill_px - partial_ntl
+                fill_qty = expected
+                fill_px = remaining_ntl / expected if expected > 0 else 0.0
+            else:
+                # 旧片段含估算价：既然全笔真实成交齐了，就统一重建整笔，避免用估算价
+                # 从真实名义中相减后造出另一段“真实价”。原片段保留为审计来源。
+                raw_rebuilt = _raw_dict(open_row)
+                raw_rebuilt["partial_exits_before_rebuild"] = partials
+                raw_rebuilt["partial_exits"] = []
+                open_row = {**dict(open_row), "raw": json.dumps(raw_rebuilt)}
+                partials = []
+                partial_qty = 0.0
+                expected = qty
+        elif partial_qty > 0 and fills:
+            # 非全量窗口只接纳能证明尚未入片段的订单；无身份不猜归属。
+            old_oids = {str(p.get("oid")) for p in partials if p.get("oid")}
+            old_cloids = {str(p.get("cloid")) for p in partials if p.get("cloid")}
+            if not old_oids and not old_cloids:
+                self._action_required(status, kind="exit_adopt_ambiguous_fragments",
+                                      reason="历史片段无订单身份且成交未覆盖全笔，无法排除重复证据",
+                                      signal_date=signal_date)
+                return False
+            fills = [f for f in fills if
+                     (f.get("oid") or f.get("cloid")) and
+                     str(f.get("oid") or "") not in old_oids and
+                     str(f.get("cloid") or "") not in old_cloids]
+            fill_qty, fill_px, fill_ids = _fill_totals(fills)
         estimated = True
         source = "all_mids"
         covered = expected
@@ -1904,7 +1940,16 @@ class HlMrLeg:
                               "exchange_error": err[:200]})
                 status["state"] = "action_required"
                 return status
-            # 仍有仓：明确未成交，可以安全重试（下一轮换 cloid）
+            # 仍有仓也可能已部分成交；未知回执必须保留，下一轮按 cloid 回捞片段。
+            if str(result.get("status") or "") == "unknown":
+                self._shadow_finish(shadow, status=ST_SENT, error=err)
+                status["state"] = "action_required"
+                self._action_required(status, kind="exit_result_unknown",
+                                      reason="离场回执未知，仍有仓不代表零成交；等待成交核对",
+                                      signal_date=str(open_row["signal_date"]),
+                                      evidence={"cloid": cloid, "planned_sz": sz})
+                return status
+            # 交易所明确拒单才可收口为 failed。
             self._shadow_finish(shadow, status=ST_FAILED, error=err)
             status["state"] = "holding"
             self._alert_throttled("exit_rejected",

@@ -1115,6 +1115,10 @@ class Executor:
         qty = self._num(row["hl_sz"])
         if qty <= 0:
             qty = self._num(row["actual_contracts"])
+        # hl_sz 随部分离场递减；此窗口从开仓起取全笔成交，因此必须核对原始总量。
+        original_qty = self._num(row["actual_contracts"])
+        if original_qty > qty:
+            qty = original_qty
         if qty <= 0:
             return None
         # 成交时间下界：仓位开仓时刻（缺 opened_at 用 created_at）。不设下界就会把
@@ -1194,8 +1198,11 @@ class Executor:
             anchored = [c for c in legs
                         if c["oid"] is not None and str(c["oid"]) == str(stop_oid)]
             if anchored:
-                legs = anchored
-                reason = "stop"
+                remaining = self._num(row["hl_sz"])
+                partial_exit = remaining > 0 and qty > remaining + tol
+                if not partial_exit or abs(sum(c["sz"] for c in anchored) - qty) <= tol:
+                    legs = anchored
+                    reason = "stop"
         # 同一轮里这批成交已被别的仓用掉了 → 不重复归因（M5）。否则两个同 coin 的
         # 本地 open 行会各自拿**同一批**成交关账，一个真实仓位被抹掉两次。
         if consumed:
@@ -2260,7 +2267,7 @@ class Executor:
             # 也早退，就变成「有裸仓不修」，而且没人会去修：停手是为了不加新仓，
             # 不是为了让已有的仓裸奔。人工 origin='manual' 仍然早退（人在核对，
             # 自动化不许跟他抢交易所）。
-            if origin not in ("dd", "reconcile", "size"):
+            if origin not in ("dd", "reconcile", "size", "realized_dd", "daily_loss"):
                 self._event(EV_DECISION, f"kill 已触发：{symbol} 暂不自动补挂止损", symbol=symbol)
                 return
             self._event(EV_DECISION,
@@ -2332,8 +2339,8 @@ class Executor:
         if _order_live(res):
             self.db.hl_update_order(symbol, bar_ms, PURPOSE_STOP, status=res["status"],
                                     oid=res.get("oid"), error=None)
-            self.db.set_pos_hl(int(row["id"]),
-                               hl_stop_oid=res.get("oid"))
+            self.db.confirm_repaired_position(int(row["id"]), self._pos_entry_px(row),
+                                              sz, stop, res.get("oid"))
             self._event(EV_ORDER, f"{symbol} 止损丢失 → 已自动补挂 @ {px:,.2f}", symbol=symbol)
             self._alert(f"【Kraken】🔧 {coin} 止损单丢失，已自动补挂（原价 {px:,.2f}，"
                         f"新单号 {res.get('oid')}，{sz} {coin}）。自动交易已暂停（kill），"
@@ -2683,6 +2690,10 @@ class Executor:
             snap = None
         if snap is None:
             self._mark_exit_unknown(position_id, symbol, coin, res, "账户快照不可读")
+            return "unknown"
+        # 挂单读失败不能被解释成“缺止损”。未知恢复同样必须遵守这个门卫。
+        if snap.get("orders_trusted") is not True:
+            self._mark_exit_unknown(position_id, symbol, coin, res, "挂单表不可信")
             return "unknown"
         ex_pos = {p.get("coin"): p for p in (snap.get("positions") or [])}
         try:

@@ -1477,6 +1477,20 @@ class DB:
         self.conn.commit()
 
     @_locked
+    def confirm_repaired_position(self, pid: int, entry: float, sz: float,
+                                  stop: float, oid: Any) -> None:
+        """保护补回后原子升级 pending 与执行器量，避免两次 commit 间留下半恢复行。"""
+        self.conn.execute(
+            "UPDATE positions SET actual_entry=CASE WHEN status='pending' THEN ? ELSE actual_entry END, "
+            "actual_contracts=CASE WHEN status='pending' THEN ? ELSE actual_contracts END, "
+            "actual_stop=CASE WHEN status='pending' THEN ? ELSE actual_stop END, "
+            "opened_at=CASE WHEN status='pending' THEN COALESCE(opened_at,created_at) ELSE opened_at END, "
+            "status='open', stop_placed=1, hl_status='open', hl_sz=?, hl_stop_oid=? "
+            "WHERE id=? AND status IN ('pending','open')",
+            (float(entry), float(sz), float(stop), float(sz), oid, int(pid)))
+        self.conn.commit()
+
+    @_locked
     def set_pos_hl(self, pid: int, **kw) -> None:
         allowed = ("hl_status", "hl_entry_oid", "hl_stop_oid", "hl_sz")
         sets, vals = [], []

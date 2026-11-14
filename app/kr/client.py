@@ -72,7 +72,11 @@ class KrEndpoints:
 
     def openpositions(self) -> list:
         resp, st = self.c.get_private(f"{API}/openpositions")
-        return _raise_if_error(resp, st, "openpositions").get("openPositions") or []
+        data = _raise_if_error(resp, st, "openpositions")
+        rows = data.get("openPositions")
+        if not isinstance(rows, list):
+            raise KrApiError("openpositions：缺 openPositions 或类型不是 list", st, resp)
+        return rows
 
     def openorders(self) -> list:
         """挂单：缺键 / 类型不是 list 一律抛错（fail-closed）。
