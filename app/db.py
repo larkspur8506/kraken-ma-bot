@@ -1487,7 +1487,7 @@ class DB:
             "opened_at=CASE WHEN status='pending' THEN COALESCE(opened_at,created_at) ELSE opened_at END, "
             "status='open', stop_placed=1, hl_status='open', hl_sz=?, hl_stop_oid=? "
             "WHERE id=? AND status IN ('pending','open')",
-            (float(entry), float(sz), float(stop), float(sz), oid, int(pid)))
+            (float(entry) if entry is not None else None, float(sz), float(stop), float(sz), oid, int(pid)))
         self.conn.commit()
 
     @_locked
