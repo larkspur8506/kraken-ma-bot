@@ -87,6 +87,33 @@ class Review9(unittest.TestCase):
             parts=json.loads(db.mr_open_trade()['raw'])['partial_exits']
             self.assertEqual(sum(p['qty'] for p in parts),4)
 
+    def test_mr_unknown_full_fill_recovers_without_new_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=DB(os.path.join(td,'x.db'));mr_entry(db,qty=10,entry=100)
+            info=Info(szi=0,mid=110,fills=[fill(t=NOW-1000,px=110,sz=10,cloid='c',tid='f')])
+            ex=Ex(info);leg=make_leg(db,info,ex,fee=.000275)
+            exit_intent(db)
+            key=leg._shadow_begin(M.MR_PURPOSE_EXIT,side=-1,sz=10,px=110,reduce_only=True,cloid='c',signal_date='2026-11-05',now_ms=NOW-60000)
+            leg._shadow_finish(key,status='sent')
+            pending=leg._mr_attempts(M.MR_PURPOSE_EXIT,'2026-11-05',('intent','sent'))
+            self.assertEqual(leg._resolve_exit_unknown(db.mr_open_trade(),None,NOW,pending,{}),'closed')
+            self.assertFalse(ex.calls)
+            row=db.conn.execute('select * from mr_trades').fetchone()
+            self.assertAlmostEqual(row['net_pnl'],99.4225)
+            self.assertTrue(json.loads(row['raw'])['net_pnl_complete'])
+
+    def test_partial_fragment_database_error_blocks_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=DB(os.path.join(td,'x.db'));mr_entry(db,qty=10,entry=100)
+            info=Info(szi=6,mid=110,fills=[fill(t=NOW-1000,px=110,sz=4,cloid='c',tid='f')]);ex=Ex(info);leg=make_leg(db,info,ex)
+            key=leg._shadow_begin(M.MR_PURPOSE_EXIT,side=-1,sz=10,px=110,reduce_only=True,cloid='c',signal_date='2026-11-05',now_ms=NOW-60000)
+            leg._shadow_finish(key,status='sent')
+            pending=leg._mr_attempts(M.MR_PURPOSE_EXIT,'2026-11-05',('intent','sent'))
+            with patch.object(db,'mr_resolve_exit_fragment',side_effect=RuntimeError('disk failure')):
+                self.assertEqual(leg._resolve_exit_unknown(db.mr_open_trade(),{'szi':6},NOW,pending,{}),'blocked')
+            self.assertFalse(ex.calls)
+            self.assertEqual(len(leg._mr_attempts(M.MR_PURPOSE_EXIT,'2026-11-05',('intent','sent'))),1)
+
     def test_mr_all_fragments_complete(self):
         for age in (60,7*3600):
             with self.subTest(age=age),tempfile.TemporaryDirectory() as td:
