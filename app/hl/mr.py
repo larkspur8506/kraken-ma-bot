@@ -1026,7 +1026,7 @@ class HlMrLeg:
                 partials = []
                 partial_qty = 0.0
                 expected = qty
-        elif partial_qty > 0 and fills:
+        elif partial_qty > 0 and expected > max(1e-9, qty * 1e-9) and fills:
             # 非全量窗口只接纳能证明尚未入片段的订单；无身份不猜归属。
             old_oids = {str(p.get("oid")) for p in partials if p.get("oid")}
             old_cloids = {str(p.get("cloid")) for p in partials if p.get("cloid")}
@@ -1047,7 +1047,15 @@ class HlMrLeg:
         gap_qty = 0.0
         gap_px = 0.0
         order_oid = ""
-        if fill_qty > 0:
+        fragments_complete = (qty > 0 and abs(qty - partial_qty) <= max(1e-9, qty * 1e-9)
+                              and all(_price_is_evidence(str(p.get("price_source") or ""))
+                                      for p in partials))
+        if fragments_complete:
+            covered = 0.0
+            covered_px = sum(float(p["qty"]) * float(p["price"]) for p in partials) / partial_qty
+            source = "fills"
+            estimated = False
+        elif fill_qty > 0:
             covered = min(expected, fill_qty) if expected > 0 else fill_qty
             covered_px = fill_px
             source = "fills"
@@ -1795,11 +1803,16 @@ class HlMrLeg:
                               "attempt_sz": attempt_sz, "fills_api": note})
                 return "blocked"
             if qty > 0:
-                self._append_fragment(int(open_row["id"]), qty=qty, price=px,
-                                      ts=now / 1000.0, price_source="fills",
-                                      oid=row["oid"], cloid=cloid)
-                self._shadow_finish(self._key_of(row), status=ST_FILLED,
-                                    filled_sz=qty, avg_px=px)
+                try:
+                    self.db.mr_resolve_exit_fragment(
+                        int(open_row["id"]), self._key_of(row), qty=qty, price=px,
+                        ts=now / 1000.0, cloid=cloid, oid=row["oid"], fill_ids=ids)
+                except Exception:
+                    logger.exception("mr: 原子补记成交失败，保留未知尝试")
+                    self._action_required(status, kind="exit_fragment_uncommitted",
+                                          reason="成交片段未能原子落库，本轮不重发离场",
+                                          signal_date=sd)
+                    return "blocked"
                 try:
                     self.db.hl_log_event(
                         "mr_exit_partial",
@@ -1821,7 +1834,8 @@ class HlMrLeg:
                 signal_date=sd, evidence={"attempts": len(pending)})
             return "blocked"
         if left is None:
-            if self._adopt_exit(open_row, now, status):
+            fresh_row = self.db.mr_open_trade() or open_row
+            if self._adopt_exit(fresh_row, now, status):
                 return "closed"
             return "blocked"
         return "clear"
@@ -1957,6 +1971,16 @@ class HlMrLeg:
             return status
         # 受理 ≠ 成交：必须看到 xyz dex 的仓真的没了才关账（否则台账 CLOSED + 裸仓）
         left, left_seen = self._await_position(self.address_fn() or "", want=False)
+        if not left_seen:
+            self._shadow_finish(shadow, status=ST_SENT, oid=result.get("oid"),
+                                filled_sz=result.get("filled_sz"), avg_px=result.get("avg_px"),
+                                error="回执已受理，持仓确认不可读，结果待核对")
+            self._action_required(status, kind="exit_result_unknown",
+                                  reason="离场回执已返回，但持仓确认失败；保留订单证据，下轮先取证",
+                                  signal_date=str(open_row["signal_date"]),
+                                  evidence={"cloid": cloid, "oid": result.get("oid")})
+            status["state"] = "action_required"
+            return status
         if (left is not None or not left_seen
                 or str(result.get("status") or "") != "filled"):
             filled_here = 0.0

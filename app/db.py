@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -1049,6 +1050,48 @@ class DB:
             (json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str),
              now(), int(trade_id)))
         self.conn.commit()
+
+    @_locked
+    def mr_resolve_exit_fragment(self, trade_id: int, key: Dict[str, Any], *,
+                                 qty: float, price: float, ts: float,
+                                 cloid: str, oid: Any = None,
+                                 fill_ids: Optional[List[str]] = None) -> None:
+        """Atomically replace this order's cumulative fills and finish its shadow.
+
+        Replays replace the same order aggregate; several executions of one order
+        are summed by the caller, never discarded just because cloid is shared.
+        Legacy fragments carrying that cloid are replaced too.
+        """
+        if (not cloid or qty <= 0 or price <= 0
+                or not math.isfinite(qty) or not math.isfinite(price)):
+            raise ValueError("fragment requires positive quantity/price and cloid")
+        with self.conn:
+            row = self.conn.execute("SELECT raw FROM mr_trades WHERE id=? AND state='OPEN'",
+                                    (int(trade_id),)).fetchone()
+            if row is None:
+                raise ValueError("MR trade is not OPEN")
+            raw = json.loads(row["raw"] or "{}")
+            parts = list(raw.get("partial_exits") or [])
+            same = [p for p in parts if str(p.get("cloid") or "") == cloid
+                    or (oid and str(p.get("oid") or "") == str(oid))]
+            if sum(float(p.get("qty") or 0) for p in same) > qty + 1e-9:
+                raise ValueError("cumulative fill evidence is smaller than recorded fragments")
+            parts = [p for p in parts if p not in same]
+            item = {"qty": float(qty), "price": float(price), "ts": float(ts),
+                    "price_source": "fills", "cloid": cloid,
+                    "fill_ids": list(fill_ids or [])}
+            if oid:
+                item["oid"] = str(oid)
+            parts.append(item)
+            raw["partial_exits"] = parts
+            self.conn.execute("UPDATE mr_trades SET raw=?,updated_at=? WHERE id=?",
+                              (json.dumps(raw, ensure_ascii=False, sort_keys=True), now(), int(trade_id)))
+            cur = self.conn.execute(
+                "UPDATE hl_orders SET status='filled',filled_sz=?,avg_px=?,updated_at=? "
+                "WHERE symbol=? AND bar_ms=? AND purpose=?",
+                (float(qty), float(price), now(), key["symbol"], int(key["bar_ms"]), key["purpose"]))
+            if cur.rowcount != 1:
+                raise ValueError("MR shadow order missing")
 
     def hl_log_event(self, kind: str, message: str, symbol: Optional[str] = None,
                      data: Any = None, code_rev: str = "",

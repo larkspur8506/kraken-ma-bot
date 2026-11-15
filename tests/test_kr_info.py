@@ -157,7 +157,7 @@ class TestSnapshot(unittest.TestCase):
         ep = _StubEp(account=ACC, orders=[
             {"order_id": "x-1", "symbol": "PF_LTCUSD", "side": "buy",
              "unfilledSize": 1.0, "limitPrice": 90.0, "orderType": "lmt"},
-            {"order_id": "x-2", "symbol": "PF_XBTUSD", "side": "sell",
+            {"order_id": "x-2", "symbol": "PF_XBTUSD", "side": "sell", "reduceOnly": False,
              "unfilledSize": 0.01, "limitPrice": 76000.0, "orderType": "lmt"}])
         with self.assertLogs("app.kr.info", level="WARNING") as cap:
             snap = _mk(ep).snapshot("kr")
