@@ -39,6 +39,7 @@ _STOP_ORDER = "stp"
 #: HTTP 5xx/408/425/429、回包不可解析、「说成交但没有 EXECUTION 明细」）。
 #: `ok` 仍为 False；`status` 单独一个取值 —— 见 `_unknown()`。
 STATUS_UNKNOWN = "unknown"
+STATUS_PARTIAL = "partially_filled"
 
 
 def make_cloid(symbol: str, bar_ms: int, purpose: str) -> str:
@@ -119,7 +120,7 @@ def _f(v, default: float = 0.0) -> float:
         return default
 
 
-def parse_order_response(resp: dict) -> dict:
+def parse_order_response(resp: dict, requested_sz: Optional[float] = None) -> dict:
     """把 sendorder 响应归一化成 _ok/_err dict（状态机见下，跨组契约 2026-11-08）。
 
     真实形状（Kraken Derivatives v3 OpenAPI，2026-11-08 核对）::
@@ -194,24 +195,32 @@ def parse_order_response(resp: dict) -> dict:
             fills.append((q, p))
         elif typ in ("REJECT", "CANCEL", "CANCELLED"):
             rejects.append(str(e.get("reason") or typ))
-    if fills:
-        qty = sum(q for q, _ in fills)
-        avg = (sum(q * p for q, p in fills) / qty) if qty > 0 else None
-        return _ok(STATUS_FILLED, oid=oid, avg_px=avg, filled_sz=qty or None, raw=resp)
+    if fills or status in ("filled", "partiallyfilled"):
+        if fills:
+            qty = sum(q for q, _ in fills)
+            avg = sum(q * p for q, p in fills) / qty
+            cancelled = any(str(e.get("type") or "").upper() in ("CANCEL", "CANCELLED")
+                            for e in events if isinstance(e, dict))
+            partial_status = status == "partiallyfilled" or cancelled
+            if requested_sz is not None:
+                try:
+                    requested = float(requested_sz)
+                except (TypeError, ValueError):
+                    return _unknown("请求数量非法，无法判断成交是否完整", resp)
+                if not math.isfinite(requested) or requested <= 0:
+                    return _unknown("请求数量非法，无法判断成交是否完整", resp)
+                tol = max(requested * 1e-9, 1e-12)
+                if qty > requested + tol:
+                    return _unknown("EXECUTION 总量超过请求数量", resp)
+                partial_status = partial_status or qty < requested - tol
+            return _ok(STATUS_PARTIAL if partial_status else STATUS_FILLED,
+                       oid=oid, avg_px=avg, filled_sz=qty, raw=resp)
+        return _unknown(f"订单状态 {status_raw} 但无可用 EXECUTION 明细（成交价/量不可信）", resp)
     if status in ("placed", "untouched", "edited"):
         return _ok(STATUS_RESTING, oid=oid, raw=resp)
     if status == "cancelled" or "wouldnotexecute" in status:
-        # IOC 未成交/被撤销：**不是**「挂单在场」，而是「这张单没成交、已经不在了」。
-        # 保留 STATUS_RESTING 只为不破坏 executor（它据此撤单放弃，语义安全），
-        # 但显式标 not_executed=True 让调用方不必靠 status 猜。
         return _ok(STATUS_RESTING, oid=oid, raw=resp, not_executed=True)
-    if status in ("filled", "partiallyfilled"):
-        # 说成交却没有任何 EXECUTION 明细 —— 成交价/量不可信，绝不编造成交价。
-        # 但**成交这个事实**是交易所自己说的：仓位很可能已经变了，调用方必须按
-        # 「结果未知」处理（刷新持仓/成交后再动作），不能当成「明确没成交」去重发。
-        return _unknown(f"订单状态 {status_raw} 但无 EXECUTION 明细（成交价/量不可信）", resp)
-    reason = "; ".join(rejects) or str(status_raw or "") or "unknown"
-    return _err(f"订单被拒：{reason}", resp)
+    return _err("订单被拒：" + ("; ".join(rejects) or str(status_raw or "unknown")), resp)
 
 
 def _fmt_num(x: float) -> str:
@@ -375,7 +384,7 @@ class KrExchange:
             # 只是响应没回来。这里不能声称「没下单」——执行器据此决定是否重发，
             # 判错就是「真实已成交 + 又发一张 reduce-only」(2026-11-13 复审 A2)。
             return _unknown(f"下单异常：{_exc_text(e)}")
-        out = parse_order_response(resp)
+        out = parse_order_response(resp, requested_sz=_sz)
         out["request"] = {"coin": coin, "symbol": symbol, "is_buy": is_buy, "sz": sz,
                           "limit_px": limit_px, "reduce_only": reduce_only,
                           "trigger_px": trigger_px, "cliOrdId": cli}

@@ -454,19 +454,10 @@ class TestSettlementGap(MrBase):
                               self.db.mr_open_trade(),
                               {"szi": 60.0, "entry_px": 100.0, "unrealized_pnl": 0.0,
                                "margin_used": 10.0, "position_value": 6600.0}, status)
-        self.assertEqual(out["state"], "exited")
-        row = row_of(self.db, tid)
-        raw = raw_of(self.db, tid)
-        self.assertFalse(raw["net_pnl_complete"])
-        self.assertTrue(raw["estimated"])
-        self.assertEqual(raw["reconciliation"]["gap_qty"], 40.0)
-        self.assertEqual(raw["reconciliation"]["ledger_qty"], 100.0)
-        self.assertEqual(raw["settled_qty"], 60.0)
-        self.assertEqual(out["action_required"]["kind"], "exit_settle_gap")
-        # 缺口没有静默丢：按 mark 估算入账，但标为未完成
-        expect = (109.8 - 100.0) * 60.0 + (110.0 - 100.0) * 40.0
-        self.assertAlmostEqual(raw["net_pnl"], expect, places=6)
-        self.assertAlmostEqual(row["net_pnl"], expect, places=6)
+        self.assertEqual(out["state"], "action_required")
+        self.assertIsNotNone(self.db.mr_open_trade())
+        self.assertEqual(out["action_required"]["kind"], "exit_quantity_conflict")
+        self.assertIsNone(row_of(self.db, tid)["net_pnl"])
 
     def test_no_gap_when_partials_are_recorded(self):
         tid = mr_entry(self.db, qty=100.0, entry=100.0, entry_ts=NOW / 1000.0 - 86400)

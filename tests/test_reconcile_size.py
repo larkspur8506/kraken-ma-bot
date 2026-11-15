@@ -127,11 +127,11 @@ class TestSizeWithinTolerance(Base):
         self.assertEqual(self.size_events(), [])
         self.assertEqual(self.info.calls_by_time, [])       # 一致时不做回捞（省一次请求）
 
-    def test_one_tick_difference_is_within_tolerance(self):
-        """1 tick（BTC szDecimals=5 → 1e-5）以内的差是浮点噪声，不算超差。"""
+    def test_half_tick_difference_is_within_tolerance(self):
+        """半 tick 以内只吸收舍入；完整 tick 由第十轮回归覆盖。"""
         pid = self.open_position(sz=0.01)
         self.add_local_fill("f1", sz=0.01)
-        rec = self.executor().reconcile(self.snap_with(0.01 + 1e-5))
+        rec = self.executor().reconcile(self.snap_with(0.01 + 0.5e-5))
         self.assertTrue(rec["ok"], rec["problems"])
         self.assertEqual(self.size_events(), [])
 

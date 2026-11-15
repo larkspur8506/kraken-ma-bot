@@ -334,12 +334,12 @@ class TestOrderStatusMachine(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("partiallyFilled", out["error"])
 
-    def test_partially_filled_with_execution_is_filled(self):
+    def test_partially_filled_with_execution_preserves_partial(self):
         out = parse_order_response({"result": "success", "sendStatus": {
             "status": "partiallyFilled", "order_id": "o-1",
             "orderEvents": [{"type": "EXECUTION", "amount": 0.5, "price": 100.0}]}})
         self.assertTrue(out["ok"])
-        self.assertEqual(out["status"], STATUS_FILLED)
+        self.assertEqual(out["status"], "partially_filled")
         self.assertAlmostEqual(out["filled_sz"], 0.5)
 
     def test_missing_status_fails_closed(self):
