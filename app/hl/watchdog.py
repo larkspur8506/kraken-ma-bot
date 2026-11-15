@@ -14,12 +14,11 @@ import datetime as dt
 import os
 import sys
 import time
-import urllib.request
-from email.utils import parsedate_to_datetime
 from typing import List, Optional
 
-from app.hl import MODE_OFF, EV_HEARTBEAT
+from app.hl import MODE_OFF, MR_LEG_COINS, EV_HEARTBEAT
 from app.hl.info import HlInfoError
+from app.hl.stops import has_covering_stop
 
 
 def _brief(msg: object, limit: int = 120) -> str:
@@ -29,7 +28,6 @@ def _brief(msg: object, limit: int = 120) -> str:
 
 STUCK_ORDER_S = 180.0
 HEARTBEAT_MAX_S = 15 * 60
-CLOCK_SKEW_MAX_S = 2.0
 AGENT_WARN_DAYS = 3.0        # agent 授权剩余天数低于此值就告警（到期=无法下单）
 
 
@@ -37,28 +35,51 @@ def _env(key: str, default: str = "") -> str:
     return (os.environ.get(key) or default).strip()
 
 
-def check_clock_skew(base_url: str = "https://futures.kraken.com",
-                     timeout: float = 10.0) -> Optional[float]:
-    """用响应头 Date 估服务器时间偏差（秒）。取不到返回 None。
+def _f(v, default: float = 0.0) -> float:
+    """宽松转 float（NaN/inf/脏值 → default）：文案格式化不能因一个空值整段崩掉。"""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    return x if x == x and x not in (float("inf"), float("-inf")) else default
 
-    Kraken（PR-12 去 HL 残留）：原来 POST `api.hyperliquid.xyz/info`，Kraken 部署下
-    这条等于在量 HL 的时间。改用 Kraken **公开** GET（instruments，无需签名）——
-    时钟偏差仍然有意义：Kraken 的签名请求带时间戳，本机跑快/跑慢会让请求时间戳对不齐，
-    偏差过大就可能被拒。
+
+def _coin_of(symbol) -> Optional[str]:
+    """signal symbol → display coin（env `HL_COIN_MAP` 覆盖 → 注册表）。
+
+    与 `app.market.hl_coin()` 同一条解析链：**不做 `split("_")[0]` 兜底** ——
+    `1000PEPE_USDT` 那样会拼出一个并不存在的合约名，于是「本地有仓/交易所有仓」
+    两边对不上，看守要么误报要么漏报。解析不出返回 None（调用方按「无法对账」处理）。
     """
     try:
-        req = urllib.request.Request(
-            base_url.rstrip("/") + "/derivatives/api/v3/instruments",
-            headers={"User-Agent": "cma-watchdog"}, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            date_hdr = resp.headers.get("Date")
-            resp.read()
-        if not date_hdr:
-            return None
-        server = parsedate_to_datetime(date_hdr).timestamp()
-        return time.time() - server
-    except Exception:                                                # noqa: BLE001
+        from app.market import hl_coin
+        return hl_coin(str(symbol))
+    except Exception:                                            # noqa: BLE001
         return None
+
+
+def _sz_ticks(info, coins) -> dict:
+    """{coin: 1 个数量 tick}；拿不到就留空（由共享判据退化成严格相对容差）。
+
+    `KrInfo.specs()` 有 1 小时缓存，正常只读进程内存；**失败不兜一个猜的精度**：
+    猜错 100 倍会让「张数够不够」两种结论都不可信（见 app/hl/stops.py 的数值纪律）。
+    """
+    out: dict = {}
+    fn = getattr(info, "specs", None)
+    if not callable(fn):
+        return out
+    try:
+        specs = dict(fn(list(coins)) or {})
+    except Exception:                                            # noqa: BLE001
+        return out
+    for c in coins:
+        try:
+            dec = (specs.get(c) or {}).get("sz_decimals")
+            if dec is not None:
+                out[c] = 10.0 ** -int(dec)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return out
 
 
 def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = False) -> List[str]:
@@ -119,17 +140,36 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     if snap is not None:
         ex_pos = {p["coin"]: p for p in snap.get("positions") or []}
         orders_trusted = bool(snap.get("orders_trusted", False))
+        ticks = _sz_ticks(info, ex_pos.keys())
         for p in ex_pos.values():
+            coin = str(p.get("coin"))
+            if coin in MR_LEG_COINS:
+                # MR 腿（QQQ 永续）设计上不挂交易所止损：退出由策略次日平仓负责。
+                # 算进「裸奔仓位」会让看守在每次 MR 持仓期误报，真裸仓会被噪声淹没。
+                add(f"{coin} 是 MR 腿持仓：策略设计不挂交易所止损，跳过止损检查", ok=True)
+                continue
             if not orders_trusted:
                 # 挂单接口回落（读不到 isTrigger）：与执行器同口径 —— 只提示、不判裸奔
-                add(f"{p['coin']} 仓位 {p['size']} @ {p['entry_px']:,.2f}，止损状态无法确认（挂单接口不可信）")
+                add(f"{coin} 仓位 {p.get('size')} @ {_f(p.get('entry_px')):,.2f}，"
+                    f"止损状态无法确认（挂单接口不可信）")
                 continue
-            has_stop = any(o.get("coin") == p["coin"] and o.get("reduce_only") and o.get("is_trigger")
-                           for o in snap.get("open_orders") or [])
-            if not has_stop:
-                add(f"{p['coin']} 有仓位但没有止损挂单（裸奔仓位，请立刻处理）")
+            # 止损判据**只有一份**（app/hl/stops.py::covering_stop_px，执行器/面板/探针
+            # 共用）：同 coin + reduce_only + is_trigger + 非止盈单 + trigger_px>0 +
+            # 方向相反 + 触发价在亏损侧 + 张数 ≥ 持仓−半 tick。
+            # 旧版只看前三项 → 盈利侧止盈单、只有 1 tick 的触发单都算「止损在场」，
+            # 真裸仓被漏报（2026-11-15 第十一轮复审实测）。
+            size = _f(p.get("size"))
+            covered = has_covering_stop(
+                snap.get("open_orders") or [], coin,
+                side=int(p.get("side") or 0) or None,
+                sz=(size if size > 0 else None),
+                entry_px=(_f(p.get("entry_px")) or None),
+                sz_tick=ticks.get(coin))
+            if not covered:
+                add(f"{coin} 有仓位但没有止损挂单（或现有挂单覆盖不足）——裸奔仓位，请立刻处理")
             else:
-                add(f"{p['coin']} 仓位 {p['size']} @ {p['entry_px']:,.2f}，止损单在场", ok=True)
+                add(f"{coin} 仓位 {p.get('size')} @ {_f(p.get('entry_px')):,.2f}，"
+                    f"止损单在场（覆盖量足够）", ok=True)
         for r in db.recent_positions(20):
             if (r["hl_status"] or "") == "mismatch":
                 add(f"仓位 #{r['id']} {r['symbol']} 处于 mismatch（本地与交易所不一致）")
@@ -144,7 +184,10 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
         local_open = [r for r in db.recent_positions(20)
                       if r["status"] == "open" and (r["hl_status"] or "") == "open"]
         for r in local_open:
-            coin = r["symbol"].split("_")[0]
+            coin = _coin_of(r["symbol"])
+            if coin is None:
+                add(f"本地显示 {r['symbol']} 持仓中（#{r['id']}），但该标的没有合约映射，无法与交易所对账")
+                continue
             if coin not in ex_pos:
                 add(f"本地显示 {r['symbol']} 持仓中（#{r['id']}），但交易所查不到该仓位")
 
@@ -158,15 +201,12 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     else:
         add("近 24h 无失败下单", ok=True)
 
-    # 6) 时钟偏差（nonce 依赖）
-    skew = check_clock_skew()
-    if skew is None:
-        add("时钟偏差检查失败（拿不到服务器时间）")
-    elif abs(skew) > CLOCK_SKEW_MAX_S:
-        add(f"本机与 Kraken 服务器时间偏差 {skew:+.1f} 秒（>2s 会影响请求时间戳对齐，"
-            f"签名请求可能被拒）")
-    else:
-        add(f"时钟偏差 {skew:+.2f} 秒", ok=True)
+    # 6) 时钟偏差：**没有这一项**（2026-11-15 第十一轮）。
+    #    本仓 Kraken v3 的签名是 `base64(HMAC-SHA512(secret, sha256(payload + "/api/v3/" + method)))`，
+    #    头里只有 APIKey/Authent —— 没有 nonce、也没有时间戳（见 app/kr/auth.py）。
+    #    因此「本机与交易所时间差 >2s 会让签名被拒」是 HL 时代的事实，在这里不成立；
+    #    留着只会在反代时钟抖动时推一条可证伪的假告警。真正的时钟问题（容器时钟漂移）
+    #    由平台/NTP 负责，且会先表现在「数据陈旧」这类判据上。
 
     # 7) 权益（Kraken 期货：只有一个衍生品钱包，不拆现货/合约）—— snap 可能因地址缺失/读取失败为 None
     if snap is not None and snap.get("unified") and address_free:

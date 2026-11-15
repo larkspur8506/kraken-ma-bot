@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from app.hl import (MODE_DRY, MODE_LIVE, MODE_OFF, PURPOSE_ENTRY, PURPOSE_EXIT, PURPOSE_EXIT_REHANG,
                     PURPOSE_STOP,
                     ST_CANCELLED, ST_FAILED, ST_FILLED, ST_INTENT, ST_PLANNED, ST_RESTING, ST_SENT,
-                    ST_SKIPPED,
+                    ST_SKIPPED, MR_LEG_COINS,
                     EV_DECISION, EV_DD, EV_ERROR, EV_HEARTBEAT, EV_KILL, EV_ORDER, EV_RECONCILE)
 from app.hl import sizing as hl_sizing
 from app.hl import pnl as hl_pnl
@@ -293,10 +293,9 @@ def _order_live(res: Any) -> bool:
     return res.get("status") in (STATUS_RESTING, STATUS_FILLED)
 
 
-# MR 腿标的（app.main._build_mr_leg 装配 HlMrConfig(coin="QQQ") → PF_QQQXUSD）。
+# MR 腿标的：**定义在 `app/hl/__init__.py::MR_LEG_COINS`**（与本文件的 `_registered_coins()`
+# 同一个理由 —— 看守/探针也要用同一份，别各写一套）。这里只保留名字供旧消费方 import。
 # 它们的仓位出现在同一账户里是**另一条腿**的，不是「本地无记录的人工单」。
-# XYZ100 是 HL 侧的 xStock 名，保留以兼容旧库/旧配置。
-MR_LEG_COINS = frozenset({"QQQ", "XYZ100"})
 
 
 def _registered_coins() -> frozenset:
@@ -2451,8 +2450,9 @@ class Executor:
           被判成有保护，真正的下行裸仓既不补挂也不告警（审计四轮 P2-C）；
         - 给了 ``side`` → 方向必须相反：多仓（side=1）要卖单（is_buy=False），
           空仓（side=-1）要买单（is_buy=True）；
-        - 给了 ``sz``（>0）→ 张数必须 ≥ sz − 1 tick（拿不到 tick 时退化成 sz*1e-6 的
-          相对噪声容差：浮点往返本来就会差几十个末位）；
+        - 给了 ``sz``（>0）→ 张数必须 ≥ sz − **半**个数量 tick（`stops._TICK_TOL_FRAC=0.5`；
+          完整差一个 tick 是真实裸量，不是浮点噪声）；拿不到 tick 时退化成 sz*1e-6 的
+          相对噪声容差。
         - 给了 ``entry_px``（>0，且给了 ``side``）→ 触发价必须位于**亏损侧**：
           多仓 trigger < entry、空仓 trigger > entry。盈利侧的 stp 是移动止盈/保护利润，
           不是这笔仓的策略止损（价格早已越过它时它也保护不了下行）。
@@ -5724,13 +5724,33 @@ class Executor:
         #    ⚠️ 它的副作用（执行器真停摆时仍会连止损一起撤）没有消失：这个功能默认关闭，
         #    开启前必须读 docs/HL_RUNBOOK.md 的「真机验证发现 #3」。
         if self.p.live and getattr(self.p, "use_schedule_cancel", False):
-            try:
-                r = self.ex.schedule_cancel(minutes=self.p.deadman_minutes)
-            except Exception as ex:                                   # noqa: BLE001
-                r = {"ok": False, "error": f"{type(ex).__name__}: {ex}"}
+            # 【venue 能力门闩（2026-11-15 第十一轮）】死手开关是 HL 原生能力；
+            # Kraken 的 `KrExchange.schedule_cancel` 是**空操作**（返 ok + raw.noop），
+            # 旧代码只看 ok → 会清 hl_deadman_err 并写「死手开关恢复可用」，让人以为
+            # 真有「失联就撤单」的保护。与 flows_supported / funding_supported /
+            # venue_address_free 同一口径：能力边界由 venue 显式声明，不靠 hasattr 猜。
+            # 未声明该属性的 info（HL 形状/测试桩）默认 True，行为不变。
+            if not bool(getattr(self.info, "deadman_supported", True)):
+                if not getattr(self, "_deadman_unsupported_logged", False):
+                    self._deadman_unsupported_logged = True
+                    logger.debug("[hl-exec] 该 venue 无死手开关（scheduleCancel），本轮跳过")
+                r = None
+            else:
+                try:
+                    r = self.ex.schedule_cancel(minutes=self.p.deadman_minutes)
+                except Exception as ex:                                   # noqa: BLE001
+                    r = {"ok": False, "error": f"{type(ex).__name__}: {ex}"}
+                # 防御：有些 venue 用「ok + raw.noop」表示「这条调用什么都不做」。
+                # 这不是「设置成功」，必须落进失败分支（否则同一句话又说了一遍假保护）。
+                if (isinstance(r, dict) and r.get("ok")
+                        and isinstance(r.get("raw"), dict) and r["raw"].get("noop")):
+                    r = {"ok": False,
+                         "error": f"venue 不支持死手开关（noop: {r['raw'].get('noop')}）"}
             flagged = str(self.db.get_config_str("hl_deadman_err") or "") == "1"
             try:
-                if r["ok"]:
+                if r is None:
+                    pass                                  # 能力不支持：不记账、不告警
+                elif r["ok"]:
                     if flagged:
                         self.db.set_config("hl_deadman_err", "0")
                         self._event(EV_ERROR, "死手开关恢复可用")

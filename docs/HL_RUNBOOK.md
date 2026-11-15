@@ -2,6 +2,19 @@
 
 > 面向「出事时照着做」的操作手册。设计背景见 `docs/HL_EXECUTOR_PLAN.md`。
 
+> **⚠️ Kraken 部署（现役，2026-11 起）与本文的差异**——照做前先看这四条：
+> 1. **没有钱包地址 / 没有代理钱包**：`HL_ACCOUNT_ADDRESS` 只是占位常量，`HL_PRIVATE_KEY` 不再使用；
+>    凭据是 Kraken API key/secret（`/opt/kraken-secrets.env` 或面板「更新 API」写入 DB）。
+> 2. **没有 API key 到期**：§8/§9 的「agent 授权到期 → 保护清仓」整条逻辑不适用（`_agent_check` 固定 ok）。
+> 3. **没有死手开关**（`scheduleCancel` 是空操作，`KrInfo.deadman_supported=False`）：§6.C ② 与
+>    §10 的「到点自动撤全部挂单」在这套部署里**不会发生**。仓位保护只有两条：交易所侧 reduce-only
+>    止损单 + 对账补挂。
+> 4. **没有出入金流水端点**：日程亏损（L1）与策略回撤（DD Guard）在 Kraken 上恒「未判」，
+>    累计亏损保护改由「近 30 天已实现净额 / 权益」（`realized_dd`）承担；§6.E 的数字要看
+>    `hl_fills.closed_pnl` 而不是流水口径。
+> 运维入口：面板 `https://kma.222677.xyz/admin`、探针 `/opt/dual-ma/probe_state.py`（2 分钟一轮）、
+> 值班 job `68f17e9e1f63`（5 分钟）。
+
 ## 1. 三种模式与切换
 
 | 模式 | 行为 | 切换方式 |
@@ -31,7 +44,7 @@
 | `HL_MAX_SIGNAL_AGE_MIN` | 信号时效闸：信号 bar 收盘超过这么多分钟就**拒绝开仓**（只拦开仓，离场/止损不读）。`0` = 关闭，负数/脏值退回 30 | 30 |
 | `HL_MAX_FAIL_STREAK` | 近 1h 失败多少次自动 kill | 3 |
 | `HL_MAX_DAILY_LOSS_PCT` | 当日亏损熔断线 | 0.05 |
-| `HL_DEADMAN_MINUTES` | 死手开关窗口（每分钟自动续期） | 30 |
+| `HL_DEADMAN_MINUTES` | 死手开关窗口（每分钟自动续期）。**Kraken 无此能力**（页首差异 3），设了也不生效 | 30 |
 | `HL_MIN_NOTIONAL` | 交易所最小名义 | 10.0 |
 | `HL_CHURN_MAX` | 同一 coin-side 10 分钟内撤单/改价重挂达这次数就停手（0 = 关闭熔断）。DB `hl_churn_max` 优先 | 5 |
 | `HL_FILL_CLOSE` | 交易所侧已平仓时按成交价自动关账（见 §6 B 前的「止损已成交」小节）。DB `hl_fill_close` 优先 | `1`（开） |
@@ -211,10 +224,10 @@ strike，再解除 kill 即可。
    永久熔断」的风险。
 
 ### C. 执行器卡死 / 心跳超 15 分钟
-① 先看容器是否活着；② 死手开关会在 `HL_DEADMAN_MINUTES` 后自动撤掉所有挂单（**止损单也会被撤 → 仓位裸奔**）→ 立刻人工挂回止损或平仓；③ 重启容器：`ssh oracle1 'cd /opt/1panel/docker/compose/crypto-ma-alert && sudo -n docker compose restart'`；④ 重启后先看 `hl_events` 确认对账通过。
+① 先看容器是否活着；②（**仅 HL 部署**）死手开关会在 `HL_DEADMAN_MINUTES` 后自动撤掉所有挂单（**止损单也会被撤 → 仓位裸奔**）→ 立刻人工挂回止损或平仓；Kraken 部署没有这一层（见页首差异 3），止损单不会因为执行器停摆被撤 —— 反而要确认它还在：`ssh oracle1 'sudo python3 /opt/dual-ma/probe_state.py'` 看 `stops_bad`；③ 重启容器：`ssh oracle1 'cd /opt/1panel/docker/compose/crypto-ma-alert && sudo -n docker compose restart'`；④ 重启后先看 `hl_events` 确认对账通过。
 
 ### D. API 大面积失败（连续 3 次）
-执行器会自动 kill 并推送。处理：① 确认 `api.hyperliquid.xyz` 可达（本机/服务器各测一次）；② 确认时钟偏差 <2s；③ 若交易所维护，保持 kill，等恢复后人工解除。
+执行器会自动 kill 并推送。处理：① 确认交易场所端点可达（Kraken：`futures.kraken.com/derivatives/api/v3/instruments`，本机/服务器各测一次）；② Kraken v3 签名**不含时间戳**，时钟偏差不影响签名（看守已不再检查这一项）；③ 若交易所维护，保持 kill，等恢复后人工解除。
 
 ### E. 当日亏损熔断
 推送里带实际百分比。这是**人工决定**：默认保持 kill 到次日（基线重置）。要看真实亏损：面板「当日已实现/累计」或 `hl_fills` 的 `closed_pnl` 之和。

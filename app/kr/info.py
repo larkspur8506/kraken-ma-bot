@@ -655,6 +655,13 @@ class KrInfo:
     #: 后者会把充提整笔当盈亏，提现就能误触发 kill。
     flows_supported = False
 
+    #: 本 venue 没有 HL 原生死手开关（scheduleCancel）。`KrExchange.schedule_cancel`
+    #: 是空操作（返 ok + raw.noop），executor 若只看 ok 会写「死手开关恢复可用」，
+    #: 让运维以为「失联 30 分钟就撤全部挂单」这层保护存在 —— 实际什么都没做。
+    #: 与 flows_supported / funding_supported 同一语义：**能力边界**，不是故障。
+    #: HL 版 info 不声明此属性，executor 用 getattr(..., True) 取值 → 行为不变。
+    deadman_supported = False
+
     def ledger_updates(self, address: str, start_ms: int = 0,
                        end_ms: Optional[int] = None,
                        deadline_ts: Optional[float] = None) -> List[dict]:
