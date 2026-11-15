@@ -384,8 +384,14 @@ class KrInfo:
             raise KrInfoError(f"openpositions 读取失败：{e}") from e
         for item in rows:
             sym = str(item.get("symbol") or "")
-            size = abs(_num(item.get("size")))
-            if size <= 0:
+            raw_size = item.get("size")
+            try:
+                size = float(raw_size)
+            except (TypeError, ValueError):
+                raise KrInfoError(f"{sym} 持仓 size 缺失或非法（fail-closed）") from None
+            if isinstance(raw_size, bool) or not math.isfinite(size) or size < 0:
+                raise KrInfoError(f"{sym} 持仓 size 非有限或负数（fail-closed）")
+            if size == 0:
                 # 0 张 = 没有敞口（对账/平仓后残留行），与认不认识这个合约无关
                 continue
             coin = registry.kr_coin(sym)
@@ -477,8 +483,13 @@ class KrInfo:
                 continue
             stop = _num(o.get("stopPrice"))
             otype = str(o.get("orderType") or "").strip().lower()
-            is_buy = str(o.get("side") or "").lower() == "buy"
-            reduce_only = bool(o.get("reduceOnly"))
+            side_txt = str(o.get("side") or "").strip().lower()
+            ro = o.get("reduceOnly")
+            if side_txt not in ("buy", "sell") or not isinstance(ro, bool):
+                unknown.append(sym + ":invalid side/reduceOnly")
+                continue
+            is_buy = side_txt == "buy"
+            reduce_only = ro
             sz = _num(o.get("unfilledSize"))
             if sz <= 0:
                 sz = _num(o.get("size") or o.get("qty"))

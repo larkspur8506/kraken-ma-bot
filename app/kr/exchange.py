@@ -16,6 +16,7 @@ _open_orders_checked + 模块级 make_cloid / parse_order_response / STATUS_*。
 from __future__ import annotations
 
 import hashlib
+import math
 import logging
 from typing import Any, Optional, Tuple
 
@@ -188,8 +189,9 @@ def parse_order_response(resp: dict) -> dict:
         if typ in ("EXECUTION", "FILL", "FILLED"):
             q = _f(e.get("amount") if e.get("amount") is not None else e.get("filledQty"))
             p = _f(e.get("price") if e.get("price") is not None else e.get("filledPricePrice"))
-            if q > 0:
-                fills.append((q, p))
+            if q <= 0 or p <= 0 or not math.isfinite(q) or not math.isfinite(p):
+                return _unknown("EXECUTION 缺失或非法成交量/价格", resp)
+            fills.append((q, p))
         elif typ in ("REJECT", "CANCEL", "CANCELLED"):
             rejects.append(str(e.get("reason") or typ))
     if fills:

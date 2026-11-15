@@ -18,6 +18,7 @@ HL/Binance 对照）：两源 4h 收盘价中位差 4 bps、最大 24 bps，97~9
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import urllib.error
@@ -237,7 +238,9 @@ def validate(symbol: str, bars: List[Bar], now_ms: Optional[int] = None) -> None
             raise FeedError(f"{symbol}: 时间非单调（第 {i} 根）")
         if (bars[i].open_ms - bars[i - 1].open_ms) != INTERVAL_MS:
             raise FeedError(f"{symbol}: 第 {i} 根间隔不是 4h（缺 bar）")
-    if any(b.close <= 0 or b.high < b.low for b in bars):
+    if any(not all(math.isfinite(x) and x > 0 for x in (b.open, b.high, b.low, b.close))
+           or b.low > min(b.open, b.close) or b.high < max(b.open, b.close)
+           or not math.isfinite(b.volume) or b.volume < 0 for b in bars):
         raise FeedError(f"{symbol}: 存在非法价格")
     last_closed_end = bars[-2].open_ms + INTERVAL_MS
     age = now_ms - last_closed_end

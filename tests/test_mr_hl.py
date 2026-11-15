@@ -654,8 +654,12 @@ class TestMrGuardsRound4(unittest.TestCase):
 
             leg._read_account = blind
             status = leg.tick(now_ms=EXIT_NOW_MS)
-            self.assertEqual(status["state"], "exit_not_filled")
+            self.assertEqual(status["state"], "action_required")
+            self.assertEqual(status["action_required"]["kind"], "exit_result_unknown")
             self.assertEqual(db.mr_open_trade()["state"], "OPEN")
+            attempts = db.conn.execute("SELECT status FROM hl_orders WHERE purpose='mr_exit'").fetchall()
+            self.assertTrue(attempts)
+            self.assertEqual(attempts[-1]["status"], "sent")
 
     def test_adoption_requires_matching_intent(self):
         with tempfile.TemporaryDirectory() as tmp:
