@@ -1575,7 +1575,12 @@ class HlMrLeg:
             self._shadow_finish(shadow, status=ST_PLANNED, error="dry_run")
             return status
         if not result.get("ok") or str(result.get("status") or "") not in (
-                "filled", "resting"):
+                "filled", "partially_filled", "resting"):
+            # `partially_filled` 必须走**正常建账**路径（下面 1621 那段按交易所实际持仓
+            # 记台账）：Kraken 对部分成交也回 partially_filled（不是失败）。旧集合只认
+            # filled/resting，把一次正常的部分成交塞进「回执丢失」通道 —— 台账虽会被
+            # `_adopt_entry` 补上，但会推一条「入场回执失败」的错告警、raw 里还标
+            # adopt_reason=fill_confirmation_lost。两者都是可证伪的假象（第十一轮）。
             # ok=false 有两个来源：明确拒单（invalidSize/资金不足）与**结果未知**
             # （回执丢失、无 EXECUTION 明细）。先用账户事实分辨，绝不盲目重发。
             err = str(result.get("error") or result.get("raw") or "unknown")

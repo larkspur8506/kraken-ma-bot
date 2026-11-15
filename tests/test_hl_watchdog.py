@@ -30,11 +30,8 @@ class Base(unittest.TestCase):
         self.info = FakeInfo(snap=_snap(positions=[], orders=[]))
         self.env = mock.patch.dict(os.environ, {"HL_ACCOUNT_ADDRESS": "0xabc"}, clear=False)
         self.env.start()
-        self.skew = mock.patch.object(watchdog, "check_clock_skew", return_value=0.4)
-        self.skew.start()
 
     def tearDown(self):
-        self.skew.stop()
         self.env.stop()
         self.tmp.cleanup()
 
@@ -161,18 +158,6 @@ class TestProblems(Base):
             notes = self.checks(force=True)
         self.assertIn("未配置 HL_ACCOUNT_ADDRESS", " ".join(notes))
 
-    def test_clock_skew_detected(self):
-        self.skew.stop()
-        self.skew = mock.patch.object(watchdog, "check_clock_skew", return_value=5.7)
-        self.skew.start()
-        self.assertIn("时间偏差", " ".join(self.bad(self.checks())))
-
-    def test_clock_skew_unknown(self):
-        self.skew.stop()
-        self.skew = mock.patch.object(watchdog, "check_clock_skew", return_value=None)
-        self.skew.start()
-        self.assertIn("拿不到服务器时间", " ".join(self.bad(self.checks())))
-
 
 class TestMain(Base):
     """main() 的输出契约：正常静默、异常带 ⚠️ 前缀。"""
@@ -181,7 +166,6 @@ class TestMain(Base):
         buf = io.StringIO()
         with mock.patch("app.db.DB", return_value=self.db), \
              mock.patch("app.kr.info.KrInfo", return_value=self.info), \
-             mock.patch.object(watchdog, "check_clock_skew", return_value=0.4), \
              contextlib.redirect_stdout(buf):
             rc = watchdog.main(argv or ["--mode", MODE_LIVE])
         return rc, buf.getvalue()
@@ -206,39 +190,11 @@ class TestMain(Base):
 
 
 class TestKrakenAdaptation(Base):
-    """PR-12 去 HL 残留：时钟检查打 Kraken 公开端点；Kraken key 无到期 → 跳过 agent 检查。"""
+    """PR-12 去 HL 残留：Kraken key 无到期 → 跳过 agent 检查。
 
-    def test_clock_skew_hits_kraken_public_endpoint(self):
-        seen = {}
-
-        class _Resp:
-            headers = {"Date": "Wed, 08 Nov 2026 00:00:00 GMT"}
-
-            def read(self):
-                return b"{}"
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        def fake_urlopen(req, timeout=None):
-            seen["url"] = req.full_url
-            seen["method"] = req.get_method()
-            return _Resp()
-
-        self.skew.stop()                      # Base 把 check_clock_skew 打了桩，这里要真跑
-        try:
-            with mock.patch("urllib.request.urlopen", fake_urlopen):
-                skew = watchdog.check_clock_skew(timeout=1.0)
-        finally:
-            self.skew = mock.patch.object(watchdog, "check_clock_skew", return_value=0.4)
-            self.skew.start()
-        self.assertIsNotNone(skew)
-        self.assertTrue(seen["url"].startswith(
-            "https://futures.kraken.com/derivatives/api/v3/instruments"), seen["url"])
-        self.assertEqual(seen["method"], "GET", "公开读不该再用 HL 的 POST /info")
+    时钟偏差检查已整段删除（2026-11-15 第十一轮）：Kraken v3 签名不含时间戳/nonce
+    （见 app/kr/auth.py），「>2s 会让签名被拒」在 Kraken 上不成立，留着只会推假告警。
+    """
 
     def test_agent_check_skipped_for_kraken_key_shape(self):
         """Kraken 下 KrInfo **实现了** agent_status，但返回
@@ -324,16 +280,6 @@ class TestVenueAddressFree(Base):
         self.assertNotIn("现货", joined, "Kraken 不拆现货/合约，别写不存在的结构")
         self.assertNotIn("浮动盈亏", joined)
 
-    def test_clock_skew_text_no_nonce_claim(self):
-        self._heartbeat()
-        self.skew.stop()
-        self.skew = mock.patch.object(watchdog, "check_clock_skew", return_value=5.7)
-        self.skew.start()
-        joined = " ".join(self.bad(self.checks()))
-        self.assertIn("时间戳对齐", joined)
-        self.assertNotIn("nonce", joined, "Kraken 签名请求没有 HL 的 nonce 概念")
-
-
 class TestAgentExpiry(Base):
     """agent（API 钱包）授权到期必须提前告警 —— 到期后所有下单会被拒。"""
 
@@ -361,3 +307,57 @@ class TestAgentExpiry(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStopCoverageSameSource(Base):
+    """止损判据必须与执行器/面板/探针**同源**（app/hl/stops.py::covering_stop_px）。
+
+    2026-11-15 第十一轮复审的实测缺陷：旧版只判 coin + reduce_only + is_trigger，
+    于是「盈利侧止盈单」和「只有 1 tick 的触发单」都被算成「止损在场」——
+    真裸仓被漏报；同时不排除 QQQ，MR 持仓每次都被报成裸奔。
+
+    这组用例把判据钉死在同一份实现上：**改判据只许改 app/hl/stops.py**。
+    """
+
+    def _notes(self, positions, orders, info=None):
+        self._heartbeat()
+        snap = _snap(positions=positions, orders=orders)
+        self.info = info or FakeInfo(snap=snap, specs={
+            "BTC": {"sz_decimals": 5}, "ETH": {"sz_decimals": 4}})
+        self.info._snap = snap
+        return watchdog.run_checks(self.db, info=self.info, mode=MODE_LIVE, force=True)
+
+    def test_covering_stop_is_quiet(self):
+        notes = self._notes([_pos(size=0.01, entry=100_000.0)],
+                            [dict(_stop_order(trigger=97_000.0), sz=0.01)])
+        self.assertEqual(self.bad(notes), [])
+        self.assertIn("止损单在场（覆盖量足够）", " ".join(notes))
+
+    def test_profit_side_take_profit_is_not_a_stop(self):
+        tp = dict(_stop_order(trigger=105_000.0), order_type="take_profit")
+        notes = self._notes([_pos(size=0.01, entry=100_000.0)], [tp])
+        self.assertIn("裸奔仓位", " ".join(self.bad(notes)))
+        self.assertNotIn("止损单在场", " ".join(notes))
+
+    def test_one_tick_stop_does_not_cover(self):
+        notes = self._notes([_pos(size=0.01, entry=100_000.0)],
+                            [dict(_stop_order(trigger=97_000.0), sz=0.0001)])
+        self.assertIn("裸奔仓位", " ".join(self.bad(notes)))
+
+    def test_wrong_side_trigger_does_not_cover(self):
+        # 多仓的止损必须在入场价**下方**；触发价在上方是移动止盈，不是止损
+        notes = self._notes([_pos(size=0.01, entry=100_000.0)],
+                            [dict(_stop_order(trigger=103_000.0), sz=0.01)])
+        self.assertIn("裸奔仓位", " ".join(self.bad(notes)))
+
+    def test_mr_leg_is_skipped_not_reported_naked(self):
+        qqq = _pos(coin="QQQ", size=0.05, entry=600.0)
+        notes = self._notes([qqq], [])
+        self.assertEqual(self.bad(notes), [], "MR 腿设计上不挂交易所止损，不许报裸奔")
+        self.assertIn("MR 腿持仓", " ".join(notes))
+
+    def test_coin_mapping_follows_registry(self):
+        self.assertEqual(watchdog._coin_of("BTC_USDT"), "BTC")
+        self.assertEqual(watchdog._coin_of("QQQ_USDT"), "QQQ")
+        self.assertIsNone(watchdog._coin_of("NOPE_USDT"),
+                          "未登记标的必须判 None（不许 split('_')[0] 猜一个合约名）")

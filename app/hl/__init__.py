@@ -24,6 +24,13 @@ PURPOSE_STOP = "stop"
 PURPOSE_EXIT = "exit"
 PURPOSE_EXIT_REHANG = "exit:rehang"   # 平仓未成交后重挂的止损（与开仓止损/补挂的 cloid 都不同源）
 
+# MR 腿（RSI2 超跌反弹）标的的 display coin：它们在同一个账户里出现是**另一条腿**的仓，
+# 不是「本地无记录的人工单」。执行器对账要排除它们（否则 MR 一开仓就 kill 主策略），
+# 看守/探针也不该要求它们挂交易所止损（MR 的退出是策略次日平仓，没有止损单）。
+# 唯一定义在这里：`app/hl/executor.py` 与 `app/hl/watchdog.py` 都从这里 import。
+# XYZ100 是 HL 时代 xStock 的旧名，保留以兼容旧库/旧配置。
+MR_LEG_COINS = frozenset({"QQQ", "XYZ100"})
+
 # hl_orders.status 状态机
 ST_INTENT = "intent"      # 已落库，尚未发请求（崩溃后据此判断「可能已发出」）
 ST_PLANNED = "planned"    # dry 模式
