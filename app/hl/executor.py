@@ -1839,9 +1839,9 @@ class Executor:
 
         def _within(a: dict) -> bool:
             net = hl_pnl.net_size(a)
-            # 容差 = 1 tick + 相对噪声（float→SQLite REAL 往返在数量大时会掉末位）
+            # 半 tick 仅吸收舍入；完整一 tick 是真实仓位差异。
             noise = 1e-9 * max(abs(net), abs(float(ex_pos.get("size") or 0.0)))
-            return _diff(a) <= tick + noise
+            return _diff(a) <= tick * 0.5 + noise
 
         key = f"{pid}:{coin}"
         if _within(agg):
@@ -2376,7 +2376,7 @@ class Executor:
             close = self.ex.place_order(coin, side != 1, sz, limit_px, reduce_only=True)
         except Exception as ex:                                     # noqa: BLE001
             close = {"ok": False, "status": STATUS_UNKNOWN, "error": f"{type(ex).__name__}: {ex}"}
-        ok_close = bool(close.get("ok")) and close.get("status") == STATUS_FILLED
+        ok_close = bool(close.get("ok")) and close.get("status") in (STATUS_FILLED, "partially_filled")
         remain: Optional[float] = None
         if ok_close:
             _filled, remain = self._filled_split(coin, sz, close)
@@ -2845,7 +2845,7 @@ class Executor:
             res2 = self.ex.place_order(coin, side != 1, ex_sz, close_px, reduce_only=True)
         except Exception as ex:                                      # noqa: BLE001
             res2 = {"ok": False, "status": STATUS_UNKNOWN, "error": f"{type(ex).__name__}: {ex}"}
-        if not (bool(res2.get("ok")) and res2.get("status") == STATUS_FILLED):
+        if not (bool(res2.get("ok")) and res2.get("status") in (STATUS_FILLED, "partially_filled")):
             self._mark_exit_unknown(position_id, symbol, coin, res2,
                                     "真实余量的兜底平仓未确认")
             return "unprotected"
@@ -2911,7 +2911,7 @@ class Executor:
             res = self.ex.place_order(coin, side != 1, sz, close_px, reduce_only=True)
         except Exception as ex:                                      # noqa: BLE001
             res = {"ok": False, "status": STATUS_UNKNOWN, "error": f"{type(ex).__name__}: {ex}"}
-        if not (bool(res.get("ok")) and res.get("status") == STATUS_FILLED):
+        if not (bool(res.get("ok")) and res.get("status") in (STATUS_FILLED, "partially_filled")):
             if self._outcome_unknown(res):
                 # 兜底平仓本身也可能「已成交但响应丢失」→ 同一套取证流程。
                 return self._recover_exit_unknown(position_id, row, coin, symbol, side, sz,
@@ -3432,7 +3432,7 @@ class Executor:
             return self._entry_failed(symbol, bar_ms, f"计算限价失败：{e}")
         res = self.ex.place_order(coin, side == 1, plan.sz, limit_px,
                                   cloid=self.ex._cloid(symbol, bar_ms, PURPOSE_ENTRY))
-        if not res["ok"] or res["status"] not in (STATUS_FILLED, STATUS_RESTING):
+        if not res["ok"] or res["status"] not in (STATUS_FILLED, "partially_filled", STATUS_RESTING):
             return self._entry_failed(symbol, bar_ms, f"入场失败：{res['error']}")
         if res.get("not_executed"):
             # 【venue 契约 B3】Kraken 把「IOC 未成交」（status=cancelled /
@@ -3490,7 +3490,7 @@ class Executor:
                 # 抛异常 = 请求已经发出去了（写通道只在发请求时抛）→ 结果未知。
                 close = {"ok": False, "status": STATUS_UNKNOWN,
                          "error": f"{type(ex).__name__}: {ex}"}
-            closed_ok = bool(close.get("ok")) and close.get("status") == STATUS_FILLED
+            closed_ok = bool(close.get("ok")) and close.get("status") in (STATUS_FILLED, "partially_filled")
             remain: Optional[float] = None
             if closed_ok:
                 _filled, remain = self._filled_split(coin, filled_sz, close)
@@ -4073,7 +4073,7 @@ class Executor:
                 tail = "止损挂回与兜底平仓都未成功——**仓位可能仍在交易所且无止损**，请立即人工处理！"
             self._alert(f"【Kraken】⚠️ {coin} 平仓失败：{res['error']}\n（止损单已撤）{tail}")
             return True
-        if res["status"] != STATUS_FILLED:
+        if res["status"] not in (STATUS_FILLED, "partially_filled"):
             # IOC 挂出未成（resting）≠ 已平仓。绝不能按限价关账 —— 交易所仓位还在，
             # 而止损单已被撤掉。处理：撤掉这张挂单、**立即挂回原止损**（保护仓位）、
             # 拉人工提醒；不关本地账，让下一轮 on_exit / 对账继续跟进。
@@ -4150,7 +4150,7 @@ class Executor:
             except Exception as ex:                                  # noqa: BLE001
                 close = {"ok": False, "status": STATUS_UNKNOWN,
                          "error": f"{type(ex).__name__}: {ex}"}
-            closed_ok = bool(close.get("ok")) and close.get("status") == STATUS_FILLED
+            closed_ok = bool(close.get("ok")) and close.get("status") in (STATUS_FILLED, "partially_filled")
             if closed_ok:
                 px = float(close.get("avg_px") or close_px)
                 _filled, remain = self._filled_split(coin, sz, close)
@@ -4306,7 +4306,7 @@ class Executor:
                 except Exception as ex:                              # noqa: BLE001
                     close2 = {"ok": False, "status": STATUS_UNKNOWN,
                               "error": f"{type(ex).__name__}: {ex}"}
-                c2_ok = bool(close2.get("ok")) and close2.get("status") == STATUS_FILLED
+                c2_ok = bool(close2.get("ok")) and close2.get("status") in (STATUS_FILLED, "partially_filled")
                 self._alert(f"【Kraken】🛑 {coin} 平仓部分成交且剩余量止损重挂失败，"
                             f"已尝试市价平剩余 {remain}（{'成功' if c2_ok else '结果异常，请立即人工核对'}）。")
                 _c2_filled, _c2_remain = (self._filled_split(coin, remain, close2) if c2_ok

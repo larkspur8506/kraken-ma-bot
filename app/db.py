@@ -1055,7 +1055,8 @@ class DB:
     def mr_resolve_exit_fragment(self, trade_id: int, key: Dict[str, Any], *,
                                  qty: float, price: float, ts: float,
                                  cloid: str, oid: Any = None,
-                                 fill_ids: Optional[List[str]] = None) -> None:
+                                 fill_ids: Optional[List[str]] = None,
+                                 price_source: str = "fills") -> None:
         """Atomically replace this order's cumulative fills and finish its shadow.
 
         Replays replace the same order aggregate; several executions of one order
@@ -1078,7 +1079,7 @@ class DB:
                 raise ValueError("cumulative fill evidence is smaller than recorded fragments")
             parts = [p for p in parts if p not in same]
             item = {"qty": float(qty), "price": float(price), "ts": float(ts),
-                    "price_source": "fills", "cloid": cloid,
+                    "price_source": price_source, "cloid": cloid,
                     "fill_ids": list(fill_ids or [])}
             if oid:
                 item["oid"] = str(oid)

@@ -1618,7 +1618,7 @@ class HlMrLeg:
             self._alert_throttled("entry_rejected", f"MR 入场被拒：{err[:200]}")
             return status
         # 「受理」不等于「成交」：IOC 只认 filled；再用 xyz dex 持仓核一遍实际数量
-        if str(result.get("status") or "") != "filled":
+        if str(result.get("status") or "") not in ("filled", "partially_filled"):
             not_executed = bool(result.get("not_executed"))
             status["state"] = "entry_not_filled"
             status["error"] = f"回执 status={result.get('status')!r}"
@@ -1981,8 +1981,25 @@ class HlMrLeg:
                                   evidence={"cloid": cloid, "oid": result.get("oid")})
             status["state"] = "action_required"
             return status
+        # A flat snapshot cannot upgrade a partial receipt into a full ledger close.
+        receipt_qty = _finite(result.get("filled_sz"))
+        ledger_remaining = max(float(open_row["qty"] or 0.0)
+                               - sum(abs(float(p.get("qty") or 0.0))
+                                     for p in _partial_exits(open_row)), 0.0)
+        if (left is None and (not math.isfinite(receipt_qty) or receipt_qty <= 0
+                or abs(receipt_qty - ledger_remaining) > max(ledger_remaining * 1e-9, 1e-9))):
+            self._shadow_finish(shadow, status=ST_SENT, oid=result.get("oid"),
+                                filled_sz=result.get("filled_sz"), avg_px=result.get("avg_px"),
+                                error="receipt quantity does not cover remaining MR ledger")
+            self._action_required(status, kind="exit_quantity_conflict",
+                                  reason="空仓快照与离场成交数量不守恒；保持OPEN等待成交核对",
+                                  signal_date=str(open_row["signal_date"]),
+                                  evidence={"cloid": cloid, "filled_sz": receipt_qty,
+                                            "remaining_ledger": ledger_remaining})
+            status["state"] = "action_required"
+            return status
         if (left is not None or not left_seen
-                or str(result.get("status") or "") != "filled"):
+                or str(result.get("status") or "") not in ("filled", "partially_filled")):
             filled_here = 0.0
             if left is not None and left_seen:
                 # 部分成交：先把已平掉的片段入账（优先真实成交价，其次限价，最后参考价
@@ -1990,12 +2007,43 @@ class HlMrLeg:
                 prev_sz = abs(float(pos["szi"])) if pos else float(open_row["qty"] or 0.0)
                 left_sz = abs(float(left.get("szi") or 0.0))
                 filled_here = prev_sz - left_sz
+                if receipt_qty > 0 and filled_here <= 1e-12:
+                    self._shadow_finish(shadow, status=ST_SENT, oid=result.get("oid"),
+                                        filled_sz=receipt_qty, avg_px=result.get("avg_px"),
+                                        error="execution receipt not yet reflected in position")
+                    self._action_required(status, kind="exit_quantity_conflict",
+                                          reason="已有成交回执但持仓尚未反映；保留未知订单待核对",
+                                          signal_date=str(open_row["signal_date"]))
+                    status["state"] = "action_required"
+                    return status
                 if filled_here > 1e-12:
+                    if abs(receipt_qty - filled_here) > max(filled_here * 1e-9, 1e-9):
+                        self._shadow_finish(shadow, status=ST_SENT, oid=result.get("oid"),
+                                            filled_sz=result.get("filled_sz"), avg_px=result.get("avg_px"),
+                                            error="receipt quantity disagrees with position delta")
+                        self._action_required(status, kind="exit_quantity_conflict",
+                                              reason="成交回执与持仓变化不符；本轮不补记、不重发",
+                                              signal_date=str(open_row["signal_date"]))
+                        status["state"] = "action_required"
+                        return status
                     frag_px, frag_src = self._fragment_price(result, limit_px, mark)
-                    self._append_fragment(
-                        int(open_row["id"]), qty=filled_here, price=frag_px,
-                        ts=now / 1000.0, price_source=frag_src,
-                        oid=result.get("oid"), cloid=cloid)
+                    try:
+                        self.db.mr_resolve_exit_fragment(
+                            int(open_row["id"]), shadow,
+                            qty=filled_here, price=frag_px, ts=now / 1000.0,
+                            price_source=frag_src, oid=result.get("oid"), cloid=cloid)
+                    except Exception:
+                        logger.exception("mr: 部分成交片段事务失败，保留未知订单")
+                        self._shadow_finish(shadow, status=ST_SENT, oid=result.get("oid"),
+                                            filled_sz=result.get("filled_sz"),
+                                            avg_px=result.get("avg_px"),
+                                            error="partial fragment transaction failed")
+                        self._action_required(status, kind="exit_fragment_uncommitted",
+                                              reason="部分成交片段未能原子落库；本轮不重发离场",
+                                              signal_date=str(open_row["signal_date"]),
+                                              evidence={"cloid": cloid, "qty": filled_here})
+                        status["state"] = "action_required"
+                        return status
                     try:
                         self.db.hl_log_event(
                             "mr_exit_partial",
