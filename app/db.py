@@ -593,6 +593,21 @@ class DB:
         return list(self.conn.execute(
             "SELECT * FROM positions WHERE status='closed' AND closed_at>=? ORDER BY closed_at", (since,)))
 
+    @_locked
+    def positions_missing_pnl(self, since: float, limit: int = 5) -> List[sqlite3.Row]:
+        """已关账、但净额还没算出来的仓位（按 closed_at 升序）。
+
+        三种状态都算「没算出来」：`pnl_source` 为 NULL（从没试过）、`no_exit_fills`
+        （关账那刻平仓成交还没同步进 hl_fills）、`no_fills`（一条成交都没查到）。
+        关账时 `_record_fill_pnl` 只调一次，之后没有任何路径会重算 —— 于是「平仓成交比
+        关账晚几十秒落库」这个常见时序会让该笔 net_pnl 永久 NULL（2026-11-16 全流程演练
+        实测）。执行器每轮取这批行补算，仍然缺腿的原样保留（不写半截数字）。
+        """
+        return list(self.conn.execute(
+            "SELECT * FROM positions WHERE status='closed' AND closed_at>=? "
+            "AND (pnl_source IS NULL OR pnl_source IN ('no_exit_fills','no_fills')) "
+            "ORDER BY closed_at LIMIT ?", (float(since), int(limit))))
+
     # ---------------- alert logs（幂等 + 成功后标记）
     @_locked
     def was_alerted(self, symbol: Optional[str], bar_ms: Optional[int], kind: str,
