@@ -111,6 +111,13 @@ PNL_SRC_FILLS = "fills"          # 有成交，net_pnl 来自 hl_fills 聚合
 PNL_SRC_NO_FILLS = "no_fills"    # 窗内查不到成交（net_pnl 为 NULL，不猜 0）
 PNL_SRC_NO_EXIT_FILLS = "no_exit_fills"   # 只有入场腿（平仓成交还没同步），不写半截净额
 
+# 关账后补算净额的窗口 / 每轮批量（2026-11-16 全流程真钱演练：entry→exit 只隔 101 秒，
+# 关账那一刻平仓成交还没落库 → pnl_source 停在 no_exit_fills，而 _record_fill_pnl 只在
+# _close_local 里调一次 → 该笔 net_pnl 永久 NULL、逐笔统计/R 缺失）。7 天窗口覆盖周末与
+# 执行器停摆；每轮最多补 5 条，够追上任何合理积压。
+PNL_BACKFILL_DAYS = 7.0
+PNL_BACKFILL_LIMIT = 5
+
 # ---------------------------------------------------------------- 宽限期（对账失败自动消化）
 # hl_status 的一个新取值：与 open/pending/mismatch/closed 并列。
 #   closing = 「交易所侧已无仓，但还没拿到足够成交证据」—— 既不是 open（不能在别的
@@ -5177,6 +5184,44 @@ class Executor:
                        f"本轮未判回撤。请人工核对出入金流水与账户权益。"))
 
 
+    def _backfill_missing_pnl(self) -> int:
+        """补算「关账时平仓成交还没落库」的净额；返回本轮补成的条数。
+
+        为什么需要：`_record_fill_pnl` 只在 `_close_local` 里调**一次**，而且「10 秒内
+        同步过就不再拉成交」；Kraken 的平仓成交常比关账晚几十秒才出现 → 那一刻只能标
+        `no_exit_fills`，之后没有任何路径重算，该笔净额/R 就永久缺（2026-11-16 全流程
+        演练实测：entry→exit 相隔 101 秒，关账后 net_pnl 一直 NULL）。
+
+        纪律（与 `_record_fill_pnl` 一致）：**仍然缺出场腿的行原样保留**，绝不为了把
+        数字填上而写半截净额；本方法只做观测，不影响任何交易动作、不产生告警。失败只
+        `logger.warning`，下一轮再试。
+        """
+        try:
+            rows = self.db.positions_missing_pnl(time.time() - PNL_BACKFILL_DAYS * 86400,
+                                                 PNL_BACKFILL_LIMIT)
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 读待补净额仓位失败（本轮跳过）：%s", e)
+            return 0
+        filled = 0
+        for r in rows or []:
+            pid = int(r["id"])
+            before = str(r["pnl_source"] or "")
+            try:
+                self._record_fill_pnl(pid)
+                row = self.db.position_by_id(pid)
+                after = str(row["pnl_source"] or "") if row is not None else before
+                if after == PNL_SRC_FILLS and before != PNL_SRC_FILLS:
+                    filled += 1
+                    self._event(EV_ORDER,
+                                f"补算仓位 {pid} 的净额（关账时平仓成交尚未落库）",
+                                symbol=str(r["symbol"]),
+                                data={"pid": pid, "pnl_source_before": before,
+                                      "net_pnl": float(row["net_pnl"]) if row is not None
+                                      and row["net_pnl"] is not None else None})
+            except Exception as e:                                   # noqa: BLE001
+                logger.warning("[hl-exec] 补算仓位 %s 净额失败（下轮再试）：%s", pid, e)
+        return filled
+
     def _r_multiple(self, row, exit_px: float) -> float:
         entry = float(row["actual_entry"] or row["entry_price"])
         stop = float(row["actual_stop"] or row["stop_price"])
@@ -5763,6 +5808,13 @@ class Executor:
                 logger.warning("[hl-exec] 死手开关记账失败（忽略）：%s", ex)
 
         # （出入金流水已提前到 1b 步：回撤判断要用本轮的流水，见 §4.4）
+        # 4b) 补算「关账时缺平仓腿」的净额（纯观测、幂等；2026-11-16 全流程演练发现的
+        #     永久 NULL 缺口）。放在心跳之前：它不该出现在任何交易动作的路径上。
+        try:
+            self._backfill_missing_pnl()
+        except Exception as ex:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 补算净额失败（不影响本轮）：%s", ex)
+
         # 5) 心跳（看守据此判断执行器存活）
         self._event(EV_HEARTBEAT,
                     f"executor 心跳（equity {snap.get('equity_total', snap.get('equity'))}）",
