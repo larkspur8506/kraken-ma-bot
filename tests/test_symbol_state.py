@@ -1,4 +1,4 @@
-"""面板「三标的动态」区块 + symbol_state 落库（feat/symbol-dynamics）。
+"""面板「标的动态」区块 + symbol_state 落库（feat/symbol-dynamics）。
 
 覆盖：
 a. 距离公式 views._need_pct：四方向（空离场/多离场/上破/下破）的符号与数值、
@@ -176,18 +176,18 @@ class TestRenderBlock(unittest.TestCase):
 
     def test_block_title_time_and_position(self):
         html = self.render([self.row()])
-        self.assertIn("三标的动态", html)
+        self.assertIn("标的动态", html)
         # 区块头时间：最新的 updated_at，北京时间 HH:MM（与面板其它时间同口径 _fmt_dt）
         expect = _fmt_dt(1760000000.0, "%H:%M")
-        self.assertIn(f'三标的动态<span class="muted">行情 {expect} · 每 30 分钟随信号 tick 更新</span>',
+        self.assertIn(f'标的动态<span class="muted">行情 {expect} · 每 30 分钟随信号 tick 更新</span>',
                       html)
         if os.environ.get("DISPLAY_TZ_OFFSET", "8").strip() in ("8", "8.0", ""):
             self.assertIn("行情 16:53 ·", html)   # 1760000000 = 2025-10-09 08:53:20 UTC = 北京 16:53
         # 位置：2026-10-29 起与「仓位」表对换 —— 仓位在最顶，本块在盈亏曲线之后
         # （P2 起 <style> 的注释里也有「账户」二字，锚点必须钉在卡片 sec 头上）
         self.assertLess(html.index("<h1>双均线交易台</h1>"), html.index("<h2>仓位</h2>"))
-        self.assertLess(html.index("<h2>仓位</h2>"), html.index("三标的动态"))
-        self.assertLess(html.index("<div class='sec'>账户</div>"), html.index("三标的动态"))
+        self.assertLess(html.index("<h2>仓位</h2>"), html.index("标的动态"))
+        self.assertLess(html.index("<div class='sec'>账户</div>"), html.index("标的动态"))
 
     def test_head_time_takes_newest_of_three(self):
         html = self.render([self.row(symbol="A_USDT", coin="A", updated_at=1760000000.0),
@@ -223,12 +223,12 @@ class TestRenderBlock(unittest.TestCase):
     def test_entry_row_formula_titles_and_line_prices(self):
         html = self.render([self.row()])           # 现价 100000，上轨 105000，下轨 94000
         card = sym_card(html, "BTC")
-        # ② 上破开多 = (105000-100000)/100000 = +5.0%
-        self.assertIn('<span class="fn" title="4h 收盘突破该线即入场（需均线密集满 6 根）">②</span>',
+        # 上破开多 = (105000-100000)/100000 = +5.0%；口径悬停在行标签上（脚注 ② 已随图例行删除）
+        self.assertIn('<span class="k" title="4h 收盘突破该线即入场（需均线密集满 6 根）">上破开多</span>',
                       card)
         self.assertIn("还差 <b>+5.0%</b> <span class=\"muted\">线 105,000.00</span>", card)
-        # ③ 下破开空 = (100000-94000)/100000 = +6.0%
-        self.assertIn('<span class="fn" title="收盘跌破该线且在 MA200 下方才开空">③</span>', card)
+        # 下破开空 = (100000-94000)/100000 = +6.0%
+        self.assertIn('<span class="k" title="收盘跌破该线且在 MA200 下方才开空">下破开空</span>', card)
         self.assertIn("还差 <b>+6.0%</b> <span class=\"muted\">线 94,000.00</span>", card)
 
     def test_near_trigger_gets_warn_class_and_title(self):
@@ -334,8 +334,8 @@ class TestRenderBlock(unittest.TestCase):
 
     def test_no_rows_no_block(self):
         html = self.render([])
-        self.assertNotIn("三标的动态", html)
-        # 无数据时图例也不渲染（图例只在有三标的动态区块时出现；CSS 里的 .sym-legend 不算）
+        self.assertNotIn("标的动态", html)
+        # 无数据时图例也不渲染（图例只在有标的动态区块时出现；CSS 里的 .sym-legend 不算）
         self.assertNotIn('<div class="sym-legend">', html)
         self.assertIn("<h2>仓位</h2>", html)
 
@@ -586,7 +586,7 @@ class TestPayloadSymbolState(unittest.TestCase):
         self.assertEqual([r["coin"] for r in p["symbol_state"]], ["BTC", "ETH", "SOL"])
         self.assertTrue(all(r["price"] is None for r in p["symbol_state"]))
         html = render_dashboard(p)
-        self.assertIn("三标的动态", html)
+        self.assertIn("标的动态", html)
         self.assertEqual(html.count('class="px-large">—</span>'), 3)
 
     def test_values_and_position_side(self):
@@ -623,7 +623,7 @@ class TestPayloadSymbolState(unittest.TestCase):
         p = status_payload(self.deps(db=BareDb()))
         self.assertEqual(len(p["symbol_state"]), 3)
         self.assertTrue(all(r["price"] is None for r in p["symbol_state"]))
-        self.assertIn("三标的动态", render_dashboard(p))
+        self.assertIn("标的动态", render_dashboard(p))
 
     def test_json_payload_is_serializable(self):
         import json

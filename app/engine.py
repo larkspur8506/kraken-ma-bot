@@ -602,7 +602,7 @@ def _exit_retry_step(db, cfg, notifier, symbol: str, executor, sent: List[str]) 
 
 
 # ------------------------------------------------- 面板缓存（symbol_state）
-# 「三标的动态」区块的数据源：每根 tick 把每标的的现价/触发线/密集根数 upsert 进
+# 「标的动态」区块的数据源：每根 tick 把每标的的现价/触发线/密集根数 upsert 进
 # symbol_state，面板只读库。**纯展示层，不参与任何信号或执行决策。**
 
 def _dense_run(band: Sequence[Optional[float]], cfg, i: int) -> int:
@@ -659,7 +659,7 @@ def symbol_snapshot(cfg, bars: Sequence[strategy.Bar], ind: Dict[str, List[Optio
 def _record_symbol_state(db, cfg, symbol: str, bars: Sequence[strategy.Bar],
                          ind: Dict[str, List[Optional[float]]], latest_closed_i: int,
                          has_position: bool) -> None:
-    """把本标的的快照 upsert 进 symbol_state（面板「三标的动态」读它）。
+    """把本标的的快照 upsert 进 symbol_state（面板「标的动态」读它）。
 
     只在 walk 走通（或被 pending 挡下，压根没走到 walk）之后调用 —— walk 抛异常时
     不写。调用点排在 set_last_bar 之后：即使这里失败也**不影响 bar 进度与信号推送**，

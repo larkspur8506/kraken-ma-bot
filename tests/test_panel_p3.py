@@ -357,7 +357,7 @@ class TestOverviewOrderSmoke(BaseCase):
         html = self.admin()
         # P1-2：账户横幅提到状态条之后、仓位之前（先给钱、再看监控）
         order = ["<div class='sec'>账户</div>", "<h2>仓位</h2>",
-                 "<h2>盈亏曲线（已剔除出入金）</h2>", "三标的动态", "<h2>执行器</h2>"]
+                 "<h2>盈亏曲线（已剔除出入金）</h2>", "标的动态", "<h2>执行器</h2>"]
         idx = [html.index(m) for m in order]
         self.assertEqual(idx, sorted(idx), f"总览块序错乱：{order}")
         # 2026-11-10（P1-3）：API 有效期卡与「管理」卡搬到 tab=settings，总览不再有
@@ -370,7 +370,7 @@ class TestOverviewOrderSmoke(BaseCase):
     def test_hl_overview_block_order(self):
         html = self.hl()
         order = [f"<h1>{PRODUCT}</h1>", "<div class='sec'>账户</div>", "<h2>仓位</h2>",
-                 "<h2>盈亏曲线（已剔除出入金）</h2>", "三标的动态", "<h2>执行器</h2>"]
+                 "<h2>盈亏曲线（已剔除出入金）</h2>", "标的动态", "<h2>执行器</h2>"]
         idx = [html.index(m) for m in order]
         self.assertEqual(idx, sorted(idx), f"/hl 块序错乱：{order}")
         self.assertNotIn("<summary>API 状态</summary>", html)

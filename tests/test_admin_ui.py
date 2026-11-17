@@ -219,8 +219,8 @@ class TestOverviewTab(BaseCase):
         # P3 R2：对账/熔断两行从「系统」（现「执行器」）卡删除 —— 状态条徽章是唯一出处
         self.assertNotIn("<summary>API 状态</summary>", html,
                          "API 有效期卡在 settings 页，不在总览")
-        # 三标的动态（用户钉死在 tabs 之后第一块）仍在
-        self.assertIn("三标的动态", html)
+        # 标的动态（用户钉死在 tabs 之后第一块）仍在
+        self.assertIn("标的动态", html)
 
     def test_overview_reuses_hl_body_without_duplicate_title(self):
         html = self.body(tab="overview")
