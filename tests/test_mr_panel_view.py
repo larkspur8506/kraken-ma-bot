@@ -80,10 +80,36 @@ class MrViewTests(unittest.TestCase):
         self.assertIsNone(v["exit_line"])
         self.assertIsNone(v["dist_to_exit_pct"])
 
-    def test_card_line_contents(self) -> None:
+    def test_holding_card_focuses_on_exit_and_avoids_position_duplicates(self) -> None:
         line = views._mr_card_line({"mr": mr_status(holding=True)})
-        for token in ("QQQ", "MR", "距入场", "RSI2", "离场线", "距离场", "持仓中"):
+        for token in ("QQQ", "MR", "持仓中", "RSI2", "入场条件已满足",
+                      "SMA5", "现价距离场线", "下次评估", "685.25", "北京时间"):
             self.assertIn(token, line)
+        for token in ("现价 28", "持仓 多", "距入场", "浮盈", "@", "28780", "28580"):
+            self.assertNotIn(token, line)
+
+    def test_flat_card_focuses_on_entry_condition(self) -> None:
+        line = views._mr_card_line({"mr": mr_status(phase="signal_ready")})
+        for token in ("QQQ", "信号已出", "RSI2", "阈值", "已满足超跌条件", "下次评估"):
+            self.assertIn(token, line)
+        self.assertNotIn("SMA5", line)
+        self.assertNotIn("浮盈", line)
+
+    def test_flat_card_shows_threshold_gap_without_price_language(self) -> None:
+        st = mr_status(phase="no_signal")
+        st["signal"]["rsi2"] = 12.4
+        line = views._mr_card_line({"mr": st})
+        self.assertIn("未触发", line)
+        self.assertIn("高于阈值 2.40", line)
+        self.assertNotIn("下跌", line)
+
+    def test_holding_anomaly_remains_visible(self) -> None:
+        line = views._mr_card_line({"mr": mr_status(holding=True, recon="err")})
+        self.assertIn("对账不平", line)
+
+    def test_missing_metrics_are_explicit(self) -> None:
+        line = views._mr_card_line({"mr": mr_status(with_signal=False)})
+        self.assertIn("—", line)
 
     def test_card_line_absent_when_disabled(self) -> None:
         self.assertEqual(views._mr_card_line({"mr": mr_status(enabled=False)}), "")
