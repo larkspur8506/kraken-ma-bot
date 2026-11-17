@@ -1701,8 +1701,18 @@ h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
    沿用 .grid；minmax(0,1fr) 让长数字/长标的名可收缩，不在 390px 上撑出横向滚动。
    .mrline（超跌腿 QQQ）的 grid-column:1/-1 因此横跨三列，语义不变。 */
 .sym-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
-.mrline{grid-column:1/-1;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line2);
-        font-size:12px}
+/* MR 策略状态行：用分区与键值排版替代长串文字；跨越三标的网格。 */
+.mrline{grid-column:1/-1;margin-top:8px;padding-top:10px;border-top:1px dashed var(--line2);
+        font-size:12px;min-width:0}
+.mrhead{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.mrtitle{font-size:13px}
+.mrstatus{padding:2px 8px;border:1px solid var(--line2);border-radius:10px;font-size:11px}
+.mrmetrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 18px;margin-top:8px}
+.mrmetric{display:flex;justify-content:space-between;align-items:baseline;gap:8px;min-width:0}
+.mrmetric .label{color:var(--muted);white-space:nowrap}
+.mrmetric .value{text-align:right;font-weight:600;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.mrfoot{margin-top:6px;padding-top:5px;border-top:1px solid var(--line2);font-size:11px;color:var(--muted)}
+@media(max-width:640px){.mrmetrics{grid-template-columns:1fr;gap:4px}}
 .kv{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:4px 0;
     border-bottom:1px solid var(--line2)}
 .kv:last-child{border-bottom:0}
@@ -2427,56 +2437,75 @@ def _mr_view(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _mr_card_line(p: Dict[str, Any]) -> str:
-    """「三标的动态」卡内的超跌腿行（QQQ）：现价/持仓/距入场/RSI2/离场线/距离场/结论。
-
-    与 crypto 三张 `_sym_card` 同卡不同列 —— RSI2 与「密集带宽」不是一套语义，
-    硬塞进同一组列会出现 6 个永远为「—」的格子。停用且空仓 → 空串（整行不出现）。
-    """
+    """MR 动态卡：空仓突出入场条件，持仓突出离场参考；仓位细节留给仓位表。"""
     mr = _mr_view(p)
     if mr is None:
         return ""
-    parts: List[str] = []
-    if mr.get("mark"):
-        parts.append(f"现价 {_fmt(mr['mark'])}")
+
+    def metric(label: str, value: str, css: str = "") -> str:
+        cls = f" value {css}" if css else "value"
+        return ("<div class='mrmetric'><span class='label'>" + _esc(label)
+                + "</span><span class='" + cls + "'>" + _esc(value) + "</span></div>")
+
+    metrics: List[str] = []
+    foot: List[str] = []
+    rsi = mr.get("rsi2")
+    threshold = mr.get("threshold")
+    entry_ok = rsi is not None and threshold is not None and rsi < threshold
+
     if mr["holding"]:
-        parts.append(f"持仓 多 {_fmt_sz(mr.get('qty'))} @ {_fmt(mr.get('entry'))}")
+        metrics.append(metric("离场参考线 · SMA5",
+                              _fmt(mr.get("exit_line")) if mr.get("exit_line") is not None else "—"))
+        if mr.get("dist_to_exit_pct") is not None:
+            distance = mr["dist_to_exit_pct"]
+            css = "warn" if distance < 0 else "muted"
+            metrics.append(metric("现价距离场线", f"{distance:+.2f}%", css))
+        else:
+            metrics.append(metric("现价距离场线", "—"))
+        if rsi is not None:
+            status = "入场条件已满足" if entry_ok else "当前未满足入场阈值"
+            foot.append(f"RSI2 {rsi:.2f}" + (f" · 阈值 <{threshold:g}" if threshold is not None else "")
+                        + " · " + status)
         if mr.get("from_ledger"):
-            # 台账来源（MR 未 tick/已停用）：价格/浮盈不是实时读数，必须标出来
-            parts.append("（台账）")
-        if mr.get("dist_to_entry_pct") is not None:
-            parts.append(f"距入场 {mr['dist_to_entry_pct']:+.2f}%")
-        upnl_txt, upnl_cls = _sign(mr.get("upnl"))
-        parts.append(f"浮盈 <span class='{upnl_cls}'>{upnl_txt}</span>")
-    if mr.get("rsi2") is not None:
-        thr = mr.get("threshold")
-        ok = thr is not None and mr["rsi2"] < thr
-        parts.append(f"RSI2 {mr['rsi2']:.2f}{' ✔' if ok else ''}"
-                     + (f"（阈 {thr:.0f}）" if thr is not None else ""))
-    # 离场线/距离场只在持仓时显示（空仓时是假想值，2026-11-02 用户指出）
-    if mr["holding"] and mr.get("exit_line"):
-        parts.append(f"离场线(SMA5) {_fmt(mr['exit_line'])}")
-    if mr["holding"] and mr.get("dist_to_exit_pct") is not None:
-        d = mr["dist_to_exit_pct"]
-        cls = "warn" if d < 0 else "muted"
-        parts.append(f"距离场 <span class='{cls}'>{d:+.2f}%</span>"
-                     + ("（已站上，等收盘）" if d < 0 else ""))
+            foot.append("持仓信息来自台账，非实时快照")
+    else:
+        metrics.append(metric("入场指标 · RSI2", f"{rsi:.2f}" if rsi is not None else "—"))
+        metrics.append(metric("入场阈值", f"< {threshold:g}" if threshold is not None else "—"))
+        if rsi is not None and threshold is not None:
+            if entry_ok:
+                foot.append("已满足超跌条件")
+            else:
+                foot.append(f"未触发 · 高于阈值 {rsi - threshold:.2f}")
+        elif mr.get("status"):
+            foot.append(str(mr["status"]))
+
     if mr.get("next_eval_et"):
-        parts.append(f"下一次评估 {_et_iso_local(mr['next_eval_et'])}")
-    # 运行时异常（需人工核对 / 闸门拦下 / 影子模式 / API 异常）：状态词不能只染成
-    # 灰色说明 —— 这三种状态下 MR 这一轮**没有按预期工作**，必须一眼看见。
+        foot.append("下次评估 " + _et_iso_local(mr["next_eval_et"]) + " 北京时间")
+
     if mr.get("action_required") or mr.get("recon") == "err" or mr.get("error"):
         status_css = "neg"
     elif mr.get("anomaly"):
         status_css = "warn"
     else:
         status_css = "muted"
-    detail_html = (f" <span class='{status_css}'>{_esc(mr['detail'])}</span>"
+    if mr.get("anomaly"):
+        status = mr["status"]
+    elif mr.get("action_required") or mr.get("recon") == "err":
+        status = "需人工核对" if mr.get("action_required") else "对账不平"
+    elif mr.get("error"):
+        status = "MR 异常"
+    else:
+        status = ("持仓中 · 多" if mr["holding"] else
+                  ("空仓" if mr.get("status") == "空仓" else mr.get("status") or "空仓"))
+    detail_html = (f"<div class='mrfoot {status_css}'>{_esc(mr['detail'])}</div>"
                    if mr.get("detail") else "")
+    status_html = f"<span class='mrstatus {status_css}'>{_esc(status)}</span>"
+    metrics_html = "<div class='mrmetrics'>" + "".join(metrics) + "</div>" if metrics else ""
+    foot_html = ("<div class='mrfoot'>" + _esc(" · ".join(foot)) + "</div>"
+                 if foot else "")
     return ("<div class='mrline'>"
-            "<b>超跌腿 · QQQ</b> <span class='muted'>MR</span> "
-            + "".join(f"{x} · " for x in parts)
-            + f"<b class='{status_css}'>{_esc(mr['status'])}</b>"
-            + detail_html + "</div>")
+            "<div class='mrhead'><b class='mrtitle'>QQQ · 超跌策略 MR</b>"
+            + status_html + "</div>" + metrics_html + foot_html + detail_html + "</div>")
 
 
 def _sign(v: Any, unit: str = " U") -> tuple:
