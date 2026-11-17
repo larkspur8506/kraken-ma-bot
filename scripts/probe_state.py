@@ -251,6 +251,67 @@ def stop_coverage(pos, orders, trusted):
     return sorted(bad), sorted(unknown)
 
 
+# ---- 权益分档（~10% 档宽自适应 + 迟滞）-----------------------------------
+# 只用于发现入金/提现/大亏这类量级变化，不是精确权益。旧实现 `int(eq//50)*50`
+# 两个问题：档宽固定 50U（权益 1 万时仅 0.5%，日常浮盈亏天天跨档）；档位边界
+# 上任何微小波动都整档翻转（2026-11-17 实例：500.47→499.97 标签 500→450 误报）。
+EQ_BUCKET_STATE = DIR + "/.eq_bucket.json"
+
+
+def _nice_step(x: float) -> int:
+    """把 ≈0.1×权益 的目标档宽吸附到 1-2-5×10^k，保证标签是整数且逐字节稳定。"""
+    if x <= 0:
+        return 50
+    cands, e = [], 1
+    while e <= x * 20 + 100:
+        for m in (1, 2, 5):
+            cands.append(m * e)
+        e *= 10
+    return min(cands, key=lambda c: (abs(c - x), -c))
+
+
+def _eq_bucket_prev():
+    """读上次档位；缺失/损坏返回 None，退化为无迟滞的普通分档（不影响其他字段）。"""
+    try:
+        with open(EQ_BUCKET_STATE, "r", encoding="utf-8") as f:
+            d = json.loads(f.read() or "{}")
+        b, s = float(d.get("bucket") or 0), float(d.get("step") or 0)
+        if b > 0 and s > 0:
+            return b, s
+    except Exception:
+        pass
+    return None
+
+
+def _eq_bucket_save(b, s):
+    try:
+        tmp = EQ_BUCKET_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"bucket": b, "step": s}))
+        os.replace(tmp, EQ_BUCKET_STATE)
+    except Exception:
+        pass  # 写失败只丢迟滞，下一轮重新分档
+
+
+def equity_bucket(eq: float) -> int:
+    """权益分档：档宽 ≈ 权益 10%（随规模自适应，下限 50U），标签取最近档。
+
+    迟滞：权益仍在上次档位 ±1 个档宽内时维持原档，防止档位边界随浮盈亏
+    反复翻档（2026-11-17 实例：500.47→499.97 整档翻转误报）。
+    """
+    if eq <= 0:
+        return 0
+    prev = _eq_bucket_prev()
+    if prev:
+        b, s = prev
+        if b - s <= eq < b + s:
+            return int(b)
+    step = max(50, _nice_step(eq * 0.1))
+    b = int(eq / step + 0.5) * step
+    _eq_bucket_save(b, step)
+    return int(b)
+
+
 def kraken():
     """Kraken 腿 + MR 腿的统一读数（来源：面板 /api/hl/status + DB）。"""
     out = {"mode": "unknown", "kill": None, "open": 0, "positions": [],
@@ -272,7 +333,7 @@ def kraken():
     out["reachable"] = bool(net.get("reachable"))
     out["api_key"] = "ok" if net.get("reachable") else ("missing" if "未配置" in str(net.get("error")) else "bad")
     eq = float(acct.get("equity") or 0.0)
-    out["equity_bucket"] = int(eq // 50) * 50        # 50U 一档：避免每轮浮点抖动误报
+    out["equity_bucket"] = equity_bucket(eq)   # 档宽≈权益10%自适应 + 迟滞（见函数 docstring）
 
     pos = d.get("positions") or []
     out["open"] = len(pos)
