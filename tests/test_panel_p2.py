@@ -6,7 +6,7 @@
    从账户卡删除（每仓浮盈/资金费由仓位表唯一承载）。
 2. 仓位表浮盈加 ROE%（浮盈 ÷ 保证金，对齐 HL 网页习惯；保证金 0 只显 U）+
    窄屏关键列（media query 隐藏列，被隐藏字段以 tr.subm muted 小字行补足，零 JS）。
-3. 三标的动态 + 数据源健康 + 已处理到 合并为一张三标的卡（每标的加数据源/最后成功/
+3. 标的动态 + 数据源健康 + 已处理到 合并为一张三标的卡（每标的加数据源/最后成功/
    已处理到小字行；两个旧区块标题整页 0 处）。
 4. 记录页两个过滤池扩到 max(n*6, 2000)：池外真实事件重新可见。
 
@@ -115,7 +115,7 @@ class BaseCase(unittest.TestCase):
         """账户卡片段（顶层/次级/重复词断言只看这块，避免命中仓位表同名列）。
 
         P1-2 起账户卡提到状态条之后、仓位之前 → 段末切在「仓位」标题（不再是盈亏曲线，
-        否则仓位表/三标的动态会被算进这段）。
+        否则仓位表/标的动态会被算进这段）。
         """
         return html.split("<div class='sec'>账户</div>", 1)[1].split("<h2>仓位</h2>", 1)[0]
 
@@ -266,7 +266,7 @@ class TestSymbolCardMerge(BaseCase):
             self.assertNotIn("<div class='sec'>已处理到</div>", html,
                              "「已处理到」旧表已删（整页 0 处）")
             # 区块标题锚点不动、头部小字保留
-            self.assertIn("<h2>三标的动态", html)
+            self.assertIn("<h2>标的动态", html)
             self.assertIn("每 30 分钟随信号 tick 更新", html)
 
     def test_feed_failure_is_prominent(self):
@@ -288,7 +288,7 @@ class TestSymbolCardMerge(BaseCase):
                           "字段缺失如实显示，不编「正常」")
 
     def account_seg_and_sym(self, html):
-        return html.split("三标的动态", 1)[1]
+        return html.split("标的动态", 1)[1]
 
 
 # ---------------------------------------------------------------- 功能四：过滤池扩容

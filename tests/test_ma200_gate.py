@@ -1,6 +1,6 @@
 """下破开空行（③）第三重门槛：现价 < SMA200（fix/ma200-gate）。
 
-背景：面板「三标的动态」的下破开空行琥珀原先只判「距线 <1% 且密集 ≥6」两重，
+背景：面板「标的动态」的下破开空行琥珀原先只判「距线 <1% 且密集 ≥6」两重，
 但开空实际要三重（收盘跌破下轨 + 密集满 6 根 + **收盘 < MA200**）。价格回升到
 MA200 上方而距下轨仍 <1% 时，琥珀会误导「今晚可能开空」。
 
@@ -292,7 +292,7 @@ class TestPayloadSma200(unittest.TestCase):
     def test_bare_db_still_renders_with_null_sma200(self):
         p = status_payload(self.deps(db=BareDb()))
         self.assertTrue(all(r["sma200"] is None for r in p["symbol_state"]))
-        self.assertIn("三标的动态", render_dashboard(p))
+        self.assertIn("标的动态", render_dashboard(p))
 
 
 # ================================================================ f/g. 琥珀判定

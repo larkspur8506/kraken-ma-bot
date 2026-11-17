@@ -1549,7 +1549,7 @@ def _overview_body(deps: AdminDeps, payload: dict, cfg: Any = None) -> str:
     总览只回答「现在什么行情、我有什么仓」。``cfg`` 形参保留，仅为调用点/测试签名稳定
     （本函数不再用它）。
 
-    「为什么没开仓」（/why）已经并进 views._render_body 的「三标的动态」板块（原因行 /
+    「为什么没开仓」（/why）已经并进 views._render_body 的「标的动态」板块（原因行 /
     闸门异常行），数据源是这里现算并注入 payload["why"] —— 见 PR-5：面板不重算判定，
     只喂数据；`why_rows_fn` 可注入（测试用固定行，绝不触网）。
     """
@@ -1591,7 +1591,7 @@ def _why_rows_for(deps: AdminDeps) -> List[Dict[str, Any]]:
     """总览的 /why 行：优先用注入的函数，否则走 app.why.build_rows（只读）。
 
     单独一层的原因：运维只想看面板时不该因为「取行情失败」看到 500 —— 任何异常都
-    退回空列表（区块整体不渲染），与三标的动态的 fail-soft 同口径。
+    退回空列表（区块整体不渲染），与标的动态的 fail-soft 同口径。
     """
     fn = getattr(deps, "why_rows_fn", None)
     if callable(fn):

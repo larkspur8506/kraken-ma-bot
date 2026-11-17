@@ -1,4 +1,4 @@
-"""面板合并：把「三标的动态」与「为什么没开仓」合成一个板块（feat/panel-merge-dynamics）。
+"""面板合并：把「标的动态」与「为什么没开仓」合成一个板块（feat/panel-merge-dynamics）。
 
 为什么合并：两块回答同一个问题（现在能不能动），分开渲染时同一屏出现两个现价（缓存 vs
 现取，数字还不一样）、两套状态词（「均线未密集」/「均线不密集」）、两处密集根数，
@@ -7,7 +7,7 @@
 断言全部针对 ``render_dashboard`` / ``_symbol_dynamics`` 渲染出的 **HTML 字符串**
 （不看源码文本），逐条对应验收清单：
 
-1. 只渲染一个区块（`<h2>三标的动态` 在、`为什么没开仓` 不在）
+1. 只渲染一个区块（`<h2>标的动态` 在、`为什么没开仓` 不在）
 2. 每标的现价在整页只出现 1 次（合并前是两个数字打架的核心症状）
 3. 闸门全 ok → 连「闸门放行」字样都不渲染
 4. 闸门 settle / churn → 对应卡片一行 `⚠️ 静置剩余` / `⚠️ churn n/m`
@@ -98,7 +98,7 @@ class PanelMergeBase(unittest.TestCase):
 class TestSingleBlock(PanelMergeBase):
     def test_only_one_block_and_no_old_title(self):
         html = self.render({"symbol_state": [_st()], "why": [_why()]})
-        self.assertEqual(html.count("<h2>三标的动态"), 1)
+        self.assertEqual(html.count("<h2>标的动态"), 1)
         self.assertEqual(html.count("为什么没开仓"), 0,
                          "旧区块标题必须彻底消失（合并后只剩一个板块）")
         # 旧表格的表头（标的/现价/信号态/闸门）不该再出现

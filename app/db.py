@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS feed_health (
     last_error TEXT,
     error_at REAL
 );
--- symbol_state：面板「三标的动态」区块的每标的快照（引擎每次 tick 成功后按 symbol upsert）。
+-- symbol_state：面板「标的动态」区块的每标的快照（引擎每次 tick 成功后按 symbol upsert）。
 -- 纯展示缓存：面板只读它，**不参与任何信号/执行决策**（触发线与密集根数由 strategy 的
 -- 现成序列算出，见 engine.symbol_snapshot）。
 CREATE TABLE IF NOT EXISTS symbol_state (
@@ -299,7 +299,7 @@ class DB:
             if name not in cols:
                 self.conn.execute(ddl)
                 logger.info("[db] 迁移：positions 新增 %s 列", name)
-        # 面板「三标的动态」：老库的 symbol_state 建表时还没有 sma200 列
+        # 面板「标的动态」：老库的 symbol_state 建表时还没有 sma200 列
         # （CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）。
         sscols = {r["name"] for r in self.conn.execute("PRAGMA table_info(symbol_state)")}
         if sscols and "sma200" not in sscols:
@@ -751,7 +751,7 @@ class DB:
     def feed_status(self) -> List[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM feed_health ORDER BY symbol"))
 
-    # ---------------- symbol_state（面板「三标的动态」的展示缓存）
+    # ---------------- symbol_state（面板「标的动态」的展示缓存）
     @_locked
     def set_symbol_state(self, symbol: str, price: Optional[float] = None,
                          sma20: Optional[float] = None, long_trigger: Optional[float] = None,

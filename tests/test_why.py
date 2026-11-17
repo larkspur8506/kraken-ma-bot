@@ -745,7 +745,7 @@ class TestWhyRows(WhyRowsBase):
 
 
 class TestPanels(WhyRowsBase):
-    """面板渲染：/why 的数据现在长在「三标的动态」卡片里（原「为什么没开仓」表格已合并掉）。"""
+    """面板渲染：/why 的数据现在长在「标的动态」卡片里（原「为什么没开仓」表格已合并掉）。"""
 
     @classmethod
     def setUpClass(cls):
@@ -767,7 +767,7 @@ class TestPanels(WhyRowsBase):
         rows = why_mod.build_rows(self.db, self.cfg, symbols=["BTC_USDT", "ETH_USDT"],
                                   fetch=lambda sym, now=None: self._feed(bars))
         html = _symbol_dynamics({"why": rows})
-        self.assertIn("三标的动态", html)
+        self.assertIn("标的动态", html)
         self.assertNotIn("为什么没开仓", html)
         self.assertIn('class="nm">BTC', html)
         self.assertIn('class="nm">ETH', html)
@@ -835,7 +835,7 @@ class TestPanels(WhyRowsBase):
                               "long_trigger": None, "short_trigger": None,
                               "updated_at": None, "position_side": None}],
         })
-        self.assertIn("三标的动态", html)
+        self.assertIn("标的动态", html)
         self.assertIn("行情读取失败", html)      # error 行退了缓存/或标红，但整块照常
         self.assertIn("SOL", html)               # symbol_state 补上的标的也在
         self.assertIn("MA200 过滤拦下", html)
@@ -850,7 +850,7 @@ class TestPanels(WhyRowsBase):
                                     "steps": []},
                             "gates": {}, "gate": {}}]}
         html = _render_body(payload)
-        self.assertIn("<h2>三标的动态", html)
+        self.assertIn("<h2>标的动态", html)
         self.assertNotIn("为什么没开仓", html)
         self.assertNotIn("闸门（动作前置）", html)
         self.assertIn("收盘价没破线", html)
@@ -875,7 +875,7 @@ class TestPanels(WhyRowsBase):
                          mode_fn=lambda: "off", token_fn=lambda: "t",
                          why_rows_fn=lambda: rows)
         html = _overview_body(deps, {"mode": "off", "ts": 1_760_000_000.0})
-        self.assertIn("三标的动态", html)
+        self.assertIn("标的动态", html)
         self.assertNotIn("为什么没开仓", html)
         self.assertIn("止损距离 12.00% 不在 1.5%~10.0% 之间", html)
         self.assertIn("⚠️ 静置剩余 12s", html)
@@ -889,7 +889,7 @@ class TestPanels(WhyRowsBase):
         deps = AdminDeps(db=self.db, config_fn=lambda: self.cfg, hl_deps=self._deps(),
                          mode_fn=lambda: "off", token_fn=lambda: "t", why_rows_fn=boom)
         html = _overview_body(deps, {"mode": "off", "ts": 1_760_000_000.0})
-        self.assertNotIn("三标的动态", html)        # 没有任何标的读数 → 整块略去
+        self.assertNotIn("标的动态", html)        # 没有任何标的读数 → 整块略去
         self.assertIn("账户", html, "总览其余部分照常渲染")
 
     def test_churn_line_says_how_it_trips(self):

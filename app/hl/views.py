@@ -812,7 +812,7 @@ def _reconcile(reachable: bool, snap_positions: List[dict], snap_orders: List[di
 
 def _symbol_state_rows(deps: DashboardDeps, db_rows: List[Any],
                        symbols: List[str]) -> List[dict]:
-    """symbol_state 表 → 「三标的动态」每标的一条（缺行/缺字段一律 None，永不抛异常）。
+    """symbol_state 表 → 「标的动态」每标的一条（缺行/缺字段一律 None，永不抛异常）。
 
     顺序与配置的标的顺序一致；`position_side` 只看 status='open' 的仓位行
     （pending 不算仓位，与「仓位」表同口径）。
@@ -1315,7 +1315,7 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
             "source": d.get("source"),
             "last_ok_at": _opt_num(d.get("last_ok_at")),
             "last_error": d.get("last_error"),
-            # 最后一次失败的时间（P2 合并后「三标的动态」的失败小字行要用它显示
+            # 最后一次失败的时间（P2 合并后「标的动态」的失败小字行要用它显示
             # 「最后错误 HH:MM」；老 payload 没带，读不到就如实显示 —）
             "error_at": _opt_num(d.get("error_at")),
             "ok": ok,
@@ -1335,7 +1335,7 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
         v = _db_call(deps.db, "get_last_bar", s)
         last_bar[s] = int(v) if v else None
 
-    # ---------------- 三标的动态（纯读 symbol_state 缓存）----------------
+    # ---------------- 标的动态（纯读 symbol_state 缓存）----------------
     symbol_state_out = _symbol_state_rows(deps, db_rows, symbols)
 
     stuck = _db_call(deps.db, "hl_stuck_orders", 180.0) or []
@@ -1835,7 +1835,7 @@ tr.subm td{white-space:normal;font-size:11px;line-height:1.4;color:var(--muted);
 """ + SYMBOL_CSS + "</style>"
 
 
-# ---------------------------------------------------------------- 三标的动态区块
+# ---------------------------------------------------------------- 标的动态区块
 # 位置：总览页最顶部（tabs 之后第一个区块、在「账户」卡片之前）。每标的一张卡，自上而下：
 #   名称 · 状态词 · 现价 → 距离行 → 原因行 → 闸门异常行 → （区块底部一句可见脚注）
 #
@@ -1893,17 +1893,20 @@ def _sym_state_word(side: Any, dense: Any) -> tuple:
             f"6 均线已连续 {n} 根密集，满 {_SQUEEZE_CAP} 根后收盘突破即入场")
 
 
-def _sym_row(label: str, mark: str, title: str, need: Optional[float], line: Any,
+def _sym_row(label: str, title: str, need: Optional[float], line: Any,
              allow_warn: bool = True) -> str:
     """距离行：`还差 +X.X%`（0<need<1% 且 allow_warn 时标 warn + 悬停「接近触发」）/
     `待收盘判定`，百分比之后跟触发线价格（价格格式复用面板 _fmt 口径）。
 
     allow_warn 的语义 =「距离近 = 今晚可能动作」是否成立：
-      ① 离场行（持仓）只看 4h 收盘破线，距离近确实意味着可能动作 → 恒 True；
-      ② 上破开多行只需密集满 6 根（做多无 MA200 过滤），由调用方传
+      距自动离场线（持仓）只看 4h 收盘破线，距离近确实意味着可能动作 → 恒 True；
+      上破开多行只需密集满 6 根（做多无 MA200 过滤），由调用方传
         `dense_cnt >= _SQUEEZE_CAP`（缺 dense_cnt → False）；
-      ③ 下破开空行是三重的：密集满 6 根 **且** sma200 非 None **且** 现价 < sma200；
+      下破开空行是三重的：密集满 6 根 **且** sma200 非 None **且** 现价 < sma200；
         任一不成立（含 sma200 缺失 = 无法核实过滤条件）都不亮琥珀 → fail-closed。
+
+    口径细节原来靠脚注数字 ①②③ 指向图例行；图例行删除（2026-10-29）后脚注失去
+    指向，悬停解释移到行标签自身，数字不再渲染。
     """
     line_txt = f" <span class=\"muted\">线 {_fmt(line)}</span>"
     if need is None or need <= 0:
@@ -1912,9 +1915,8 @@ def _sym_row(label: str, mark: str, title: str, need: Optional[float], line: Any
         cls = (f" class=\"warn\" title=\"{_NEAR_TITLE}\"" if allow_warn and need < 1.0
                else "")
         val = f"还差 <b{cls}>{need:+.1f}%</b>{line_txt}"
-    return (f"<div class=\"kv\"><span class=\"k\">{label} "
-            f"<span class=\"fn\" title=\"{_esc(title)}\">{mark}</span></span>"
-            f"<span class=\"v\">{val}</span></div>")
+    return (f"<div class=\"kv\"><span class=\"k\" title=\"{_esc(title)}\">{label}"
+            f"</span><span class=\"v\">{val}</span></div>")
 
 
 def _pos_of(r: Dict[str, Any]) -> tuple:
@@ -2191,12 +2193,12 @@ def _sym_card(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]] = None,
         elif status == "open":
             need = _need_pct("exit_short" if side < 0 else "exit_long", price, r.get("sma20"))
             if need is not None:
-                o.append(_sym_row("距自动离场线", "①", _EXIT_TITLE[-1 if side < 0 else 1],
+                o.append(_sym_row("距自动离场线", _EXIT_TITLE[-1 if side < 0 else 1],
                                   need, r.get("sma20")))
         else:
-            # 入场行（②③）的琥珀门槛：
-            #   ② 上破开多：密集满 6 根（做多无 MA200 过滤）。
-            #   ③ 下破开空：密集满 6 根 且 现价 < sma200（严格小于，与
+            # 入场行的琥珀门槛：
+            #   上破开多：密集满 6 根（做多无 MA200 过滤）。
+            #   下破开空：密集满 6 根 且 现价 < sma200（严格小于，与
             #      strategy.evaluate_entry 做空过滤同向）；sma200 缺失 = 无法核实
             #      过滤条件 → fail-closed 不亮琥珀。只有三重都成立，「距离近」才代表
             #      「今晚可能开空」。
@@ -2205,11 +2207,11 @@ def _sym_card(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]] = None,
             short_ok = dense_ok and ma200 is not None and price < ma200
             need = _need_pct("break_up", price, r.get("long_trigger"))
             if need is not None:
-                o.append(_sym_row("上破开多", "②", _LONG_TITLE, need, r.get("long_trigger"),
+                o.append(_sym_row("上破开多", _LONG_TITLE, need, r.get("long_trigger"),
                                   allow_warn=dense_ok))
             need = _need_pct("break_down", price, r.get("short_trigger"))
             if need is not None:
-                o.append(_sym_row("下破开空", "③", _SHORT_TITLE, need, r.get("short_trigger"),
+                o.append(_sym_row("下破开空", _SHORT_TITLE, need, r.get("short_trigger"),
                                   allow_warn=short_ok))
     o.append(_reason_line(r))
     o.extend(_gate_lines(r))
@@ -2243,7 +2245,8 @@ def _feed_line(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]],
 
 
 def _symbol_dynamics(p: dict) -> str:
-    """「三标的动态」区块（2026-10-29 起与「仓位」表对换：仓位在最顶，本块在其后）。
+    """「标的动态」区块（2026-10-29 起与「仓位」表对换：仓位在最顶，本块在其后；
+    均线腿 + QQQ 超跌腿共四张卡，标题不再带「三」）。
 
     合并后这里同时回答「离触发线多远」（距离行）和「卡在哪一步 / 被闸门挡了吗」
     （原因行 / 闸门异常行）—— 原「为什么没开仓」区块已删除。P2 再吸收「数据源健康」
@@ -2266,7 +2269,7 @@ def _symbol_dynamics(p: dict) -> str:
     last_bar = _as_dict(system.get("last_bar"))
     stamps = [t for t in (_opt_num(r.get("updated_at")) for r in rows) if t]
     when = _fmt_dt(max(stamps), "%H:%M") if stamps else "—"
-    o = [f"<h2>三标的动态<span class=\"muted\">行情 {when} · 每 30 分钟随信号 tick 更新</span></h2>",
+    o = [f"<h2>标的动态<span class=\"muted\">行情 {when} · 每 30 分钟随信号 tick 更新</span></h2>",
          # 桌面端 3 列横排（.sym-grid，见 DASH_CSS）；≤640px 由 media query 降为 1 列。
          "<div class=\"card\"><div class=\"grid sym-grid\">"]
     for r in rows:
@@ -2821,7 +2824,7 @@ def _empty_positions_html(p: dict, reachable: bool) -> str:
     （把「不知道」说成「没有」）；此时 symbol_state 缓存也可能过期，距离一概不展示。
 
     距离口径复用 ``_need_pct``（上破 = (线−现价)/现价、下破 = (现价−线)/现价），
-    与「三标的动态」卡里的 ②③ 两行同一套算法，不做第二套算术。
+    与「标的动态」卡里的上破/下破两行同一套算法，不做第二套算术。
 
     现价（N2/N3）：距离里的现价取 ``_merged_cards`` 的同源值（与三标的大字卡同一个数，
     不再读 signal tick 缓存的 price）；本卡**只答「还差多远」，不再单独显示现价** ——
@@ -2838,7 +2841,7 @@ def _empty_positions_html(p: dict, reachable: bool) -> str:
 
     rows = [_as_dict(x) for x in _as_list(p.get("symbol_state"))]
     # 现价同源（N2）：_merged_cards 是「why 现价优先、symbol_state 兜底」的收敛点，
-    # 也就是「三标的动态」大字卡显示的那个数 —— 从这里取，同屏才不会出现
+    # 也就是「标的动态」大字卡显示的那个数 —— 从这里取，同屏才不会出现
     # 74,407（why） vs 74,416（signal tick 缓存）两个现价。
     # 触发线仍然只取 symbol_state 的 long/short_trigger（策略唯一出处，不从这里换源）。
     px_by_sym: Dict[str, Optional[float]] = {}
@@ -3220,7 +3223,7 @@ def _render_body(p: dict) -> str:
         o.append("<h2>策略绩效</h2>")
         o.append(_perf_block_html(p))
 
-    # ---------------- 三标的动态（含 /why 原因行与闸门） ----------------
+    # ---------------- 标的动态（含 /why 原因行与闸门） ----------------
     # 2026-10-29 用户要求与「仓位」表对换：仓位移到最顶，本块跟在盈亏曲线之后。
     # 距离行 + 原因行 + 闸门异常行都在这一块里 —— 原「为什么没开仓」表格已合并进来。
     # 数据由调用方注入 payload（why 由 admin_ui 现算，symbol_state 来自 DB 缓存），
@@ -3228,7 +3231,7 @@ def _render_body(p: dict) -> str:
     try:
         o.append(_symbol_dynamics(p))
     except Exception as e:                                        # noqa: BLE001
-        logger.warning("[hl-views] 三标的动态区块渲染失败：%s", e)
+        logger.warning("[hl-views] 标的动态区块渲染失败：%s", e)
 
 
     # ---------------- 挂单（按需渲染，P3 R1）----------------
@@ -3274,7 +3277,7 @@ def _render_body(p: dict) -> str:
     o.append(f"<div class='muted'>交易所 {_esc(base_txt)} · "
              f"{'测试网' if net.get('testnet') else '主网'}</div>")
     # P2：原「数据源健康」「已处理到」两张表已整块删除（不是折叠）—— 每标的数据源
-    # 状态由「三标的动态」卡在该标的名下的小字行承载（见 _feed_line，2026-10-29 起
+    # 状态由「标的动态」卡在该标的名下的小字行承载（见 _feed_line，2026-10-29 起
     # 正常态不渲染、仅源失败时出现）。
     o.append("</div>")
 

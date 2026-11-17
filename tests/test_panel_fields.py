@@ -160,7 +160,7 @@ class TestFeeLabel(PanelFieldsBase):
 # ---------------------------------------------------------------- 3/4. 表头
 class TestTableHeaders(PanelFieldsBase):
     def test_feed_status_merged_into_symbol_card(self):
-        """P2 合并：数据源健康表已删，每标的的数据源行进「三标的动态」卡。"""
+        """P2 合并：数据源健康表已删，每标的的数据源行进「标的动态」卡。"""
         self.db.mark_feed("BTC_USDT", "binance", True)
         self.db.set_symbol_state("BTC_USDT", price=100.0)   # 让三标的卡渲染出该标的
         html = self.html()
