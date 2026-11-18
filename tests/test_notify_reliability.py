@@ -403,6 +403,66 @@ class TestMrPartialExitNotification(unittest.TestCase):
             self.assertEqual(len(_failed(db, "mr_fill_exit_partial")), 1)
 
 
+
+class TestRecoveryPartialNotification(unittest.TestCase):
+    """`_resolve_exit_unknown` 按成交补记片段 → 与正常部分离场同一事件口径。"""
+
+    def test_recovery_notifies_persisted_fragment_once_across_restart(self):
+        from tests.test_review7_mr import (NOW as R_NOW, Info as RInfo, fill,
+                                           make_leg, mr_entry)
+        from app.hl import mr as M
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/rec.db"
+            db = DB(path)
+            trade_id = mr_entry(db, qty=10, entry=100)
+            rec_fill = fill(t=R_NOW - 1000, px=109.9, sz=4, cloid="c", tid="f1")
+            info = RInfo(szi=10, entry=100, mid=110, fills=[rec_fill])
+            leg = make_leg(db, info)
+            n = FakeNotifier(ok=True)
+            leg.notifier = n
+            key = leg._shadow_begin(M.MR_PURPOSE_EXIT, side=-1, sz=10, px=110,
+                                    reduce_only=True, cloid="c",
+                                    signal_date="2026-11-05", now_ms=R_NOW - 60000)
+            leg._shadow_finish(key, status="sent")
+            pending = leg._mr_attempts(M.MR_PURPOSE_EXIT, "2026-11-05",
+                                       ("intent", "sent"))
+            self.assertTrue(pending)
+
+            status = leg._resolve_exit_unknown(db.mr_open_trade(), {"szi": 6},
+                                               R_NOW + 300000, pending, {})
+            self.assertEqual(status, "clear")
+            msgs = [m for m in n.messages if "离场部分成交（按成交补记）" in m]
+            self.assertEqual(len(msgs), 1)
+            msg = msgs[0]
+            for want in ("【Kraken·MR】", "本次补记  4 张",
+                         "累计已补记 4 / 台账 10 张", "109.90", "来源 fills",
+                         "补记时间", "信号日    2026-11-05"):
+                self.assertIn(want, msg, f"补记回报缺 {want}")
+            self.assertNotIn("净盈亏    ", msg, "未结算不得编造净盈亏")
+            rows = [r for r in db.recent_alerts(50)
+                    if str(r["kind"] or "").startswith("mr_fill_exit_partial")]
+            self.assertEqual(len(rows), 1)
+            self.assertIn(f":{trade_id}:", str(rows[0]["kind"]))
+            parts = json.loads(db.mr_open_trade()["raw"])["partial_exits"]
+            self.assertEqual(len(parts), 1)
+            self.assertAlmostEqual(parts[0]["qty"], 4.0, places=6)
+
+            # 重启 + 重复回执（同一张单的旧 pending 再走一遍）：不重复补记、不重复推送
+            db.conn.close()
+            db2 = DB(path)
+            info2 = RInfo(szi=6, entry=100, mid=110, fills=[rec_fill])
+            leg2 = make_leg(db2, info2)
+            n2 = FakeNotifier(ok=True)
+            leg2.notifier = n2
+            leg2._resolve_exit_unknown(db2.mr_open_trade(), {"szi": 6},
+                                       R_NOW + 300000, pending, {})
+            self.assertEqual([m for m in n2.messages if "部分成交" in m], [],
+                             "同一 trade_id+oid/cloid 不得重复推送")
+            parts2 = json.loads(db2.mr_open_trade()["raw"])["partial_exits"]
+            self.assertEqual(len(parts2), 1, "重复回执不得改写台账片段")
+            self.assertAlmostEqual(sum(p["qty"] for p in parts2), 4.0, places=6)
+
+
 class TestRetryFailedAlerts(unittest.TestCase):
     """补推通道：成功后同一 MR 事件的**所有**失败行一起了结，别的 event 不动。"""
 
@@ -560,7 +620,8 @@ class TestMrAdoptionNotifications(unittest.TestCase):
             msgs = [m for m in n.messages if "补记" in m]
             self.assertEqual(len(msgs), 1)
             self.assertIn("【Kraken·MR】", msgs[0])
-            self.assertIn("2026-04-16 21:45:00 北京时间", msgs[0])
+            self.assertIn("补记时间  2026-04-16 21:45:00 北京时间", msgs[0])
+            self.assertNotIn("成交时间", msgs[0], "补记不能伪装成成交时刻")
             rows = [r for r in db.recent_alerts(50)
                     if str(r["kind"] or "").startswith("mr_fill_entry_adopt")]
             self.assertEqual(len(rows), 1)
@@ -586,6 +647,29 @@ class TestMrAdoptionNotifications(unittest.TestCase):
                     if str(r["kind"] or "").startswith("mr_fill_exit_adopt")]
             self.assertEqual(len(rows), 1)
             self.assertEqual(int(rows[0]["sent_successfully"]), 1)
+
+    def test_adoption_exit_note_and_time_are_truthful_for_mark_estimate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=True)
+            leg, db, ex, info = _leg(tmp, notifier=n, mr_szi="2.68", mid=95.5)
+            db.set_config("mr_enabled", "1")
+            db.set_config("fill_push", "1")
+            db.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.68,
+                qty_int=26800, entry_price=93.0, entry_order_id="100",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=2.68 * 93.0, margin=249.24,
+                equity_at_entry=500.0)
+            ex.fill = False
+            leg.tick(now_ms=EXIT_NOW_MS)
+            info.mr_szi = "0"
+            status = leg.tick(now_ms=EXIT_NOW_MS + 300_000)
+            self.assertEqual(status.get("adopted"), "exit")
+            msg = [m for m in n.messages if "离场成交" in m][-1]
+            self.assertIn("补记时间", msg)
+            self.assertNotIn("成交时间", msg, "补记不能伪装成成交时刻")
+            self.assertIn("按当前证据补记台账", msg)
+            self.assertIn("价格来源 all_mids", msg)
+            self.assertIn("未完成", msg, "估算价关账必须保留未完成口径")
 
 
 class TestTelegramPlainText(unittest.TestCase):

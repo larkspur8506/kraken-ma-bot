@@ -181,7 +181,7 @@ def _exec_time(ts_s: Any) -> str:
 def _mr_entry_text(*, coin: str, qty: float, price: float, notional: float,
                    signal_date: str, trade_id: Any, exec_ts: Any = 0.0,
                    planned_qty: Optional[float] = None,
-                   note: str = "") -> str:
+                   note: str = "", time_label: str = "成交时间") -> str:
     """MR 入场成交回报（纯文本：Telegram 通道不带 parse_mode，不能有 Markdown）。
 
     `planned_qty` 与成交量不同时明写「成交 X / 计划 Y（部分成交）」—— 只看成交量
@@ -200,7 +200,7 @@ def _mr_entry_text(*, coin: str, qty: float, price: float, notional: float,
     lines.append(f"成交价    {float(price):,.2f} USD")
     stamp = _exec_time(exec_ts)
     if stamp:
-        lines.append(f"成交时间  {stamp}")
+        lines.append(f"{time_label}  {stamp}")
     lines += [
         f"信号日    {signal_date}",
         f"台账      #{trade_id}",
@@ -216,7 +216,7 @@ def _mr_exit_text(*, coin: str, filled: float, ledger_qty: float,
                   net_pnl: float, fee_est: float, complete: bool,
                   funding_paid: Optional[float], price_source: str,
                   signal_date: str, exec_ts: Any = 0.0,
-                  note: str = "") -> str:
+                  note: str = "", time_label: str = "成交时间") -> str:
     """MR 离场成交回报：数量/价格/持仓时长/费用与净利口径一次说清。
 
     - 成交数量与台账数量分开写：部分成交/缺口不许被读成「整笔已平」；
@@ -237,7 +237,7 @@ def _mr_exit_text(*, coin: str, filled: float, ledger_qty: float,
         lines.append(f"持仓      {hold}")
     stamp = _exec_time(exec_ts or now_s)
     if stamp:
-        lines.append(f"成交时间  {stamp}")
+        lines.append(f"{time_label}  {stamp}")
     if float(gap_qty or 0.0) > 1e-9:
         lines.append(f"缺口      {float(gap_qty):g} 张按标记价估算，未计入成交")
     if complete:
@@ -290,6 +290,43 @@ def _mr_partial_exit_text(*, coin: str, filled: float, remaining: float,
     stamp = _exec_time(exec_ts)
     if stamp:
         lines.append(f"成交时间  {stamp}")
+    lines += [
+        f"信号日    {signal_date}",
+        f"台账      #{trade_id}",
+        "盈亏      未结算（本片段单独不计净盈亏）",
+    ]
+    return "\n".join(lines)
+
+
+def _partial_event_key(trade_id: Any, oid: Any, cloid: Any) -> str:
+    """部分离场事件键：台账 #id + 本单身份（oid 优先，其次 cloid）。
+
+    正常部分成交与「结果未知→按成交补记」共用这套键，同一张单的重复回执
+    （含重启后的重放）只会命中同一个 alert_logs kind，不会被推两次。
+    """
+    return f"{int(trade_id)}:{oid or cloid}"
+
+
+def _mr_partial_exit_recovery_text(*, coin: str, filled: float, cum_qty: float,
+                                   ledger_qty: float, price: float,
+                                   price_source: str, signal_date: str,
+                                   trade_id: Any, recorded_ts: Any = 0.0) -> str:
+    """「结果未知 → 按成交补记」的部分离场回报（与正常部分成交同一事件口径）。
+
+    数字全部取**已落库的片段**（qty/price/price_source），累计量 = raw.partial_exits
+    之和：这是台账真正的入账口径，回执/估算值不参与展示。时间标「补记时间」——
+    成交实际发生在此前，这里不能伪造成交时刻。**不写净盈亏**（整笔未结算）。
+    """
+    lines = [
+        f"{MR_TITLE}离场部分成交（按成交补记） · {coin} 平多",
+        "状态      部分成交，未全部平仓（台账保持 OPEN）",
+        f"本次补记  {float(filled):g} 张 · 累计已补记 {float(cum_qty):g} / "
+        f"台账 {float(ledger_qty):g} 张",
+        f"价格      {float(price):,.2f} USD（来源 {price_source}）",
+    ]
+    stamp = _exec_time(recorded_ts)
+    if stamp:
+        lines.append(f"补记时间  {stamp}")
     lines += [
         f"信号日    {signal_date}",
         f"台账      #{trade_id}",
@@ -1215,7 +1252,7 @@ class HlMrLeg:
         self._alert(_mr_entry_text(
             coin=self.config.coin, qty=filled_sz, price=entry_px,
             notional=filled_sz * entry_px, signal_date=signal_date,
-            trade_id=trade_id, exec_ts=now_s,
+            trade_id=trade_id, exec_ts=now_s, time_label="补记时间",
             note=("入场确认丢失，按交易所持仓补记台账（未重复下单）"
                   + ("，含成交证据" if raw_extra.get("fill_ids") else ""))),
             kind="mr_fill_entry_adopt", key=trade_id, fill=True, dedupe=True)
@@ -1424,8 +1461,9 @@ class HlMrLeg:
             now_s=now_s, net_pnl=st["net_pnl"], fee_est=st["fee_est"],
             complete=bool(st["net_pnl_complete"]),
             funding_paid=None, price_source=source, signal_date=signal_date,
-            exec_ts=now_s,
-            note="离场确认丢失，按成交/回执证据补记台账（未重复下单）"),
+            exec_ts=now_s, time_label="补记时间",
+            note=(f"离场确认丢失，按当前证据补记台账（价格来源 {source}，"
+                  "未重复下单）")),
             kind="mr_fill_exit_adopt", key=int(open_row["id"]),
             fill=True, dedupe=True)
         return True
@@ -2103,6 +2141,37 @@ class HlMrLeg:
                         f"（cloid {cloid or '?'}，fill_ids {ids[:3]}）")
                 except Exception:                             # noqa: BLE001
                     logger.warning("mr: 写补记片段事件失败", exc_info=True)
+                # 与正常部分离场**同一事件口径**（kind + trade_id:oid/cloid）：
+                # 数字取刚落库的片段（qty/price/price_source）与累计片段量，
+                # 不用回执/估算值；重复回执（含重启后重放）靠同一键去重。
+                frag, cum = None, float(qty)
+                try:
+                    trade = self.db.mr_open_trade()
+                except Exception:                             # noqa: BLE001
+                    trade = None
+                if trade is not None and int(trade["id"]) == int(open_row["id"]):
+                    parts = _partial_exits(trade)
+                    cum = sum(abs(float(part.get("qty") or 0.0)) for part in parts)
+                    for part in parts:
+                        if ((str(row["oid"] or "") and str(part.get("oid") or "")
+                             == str(row["oid"] or ""))
+                                or (cloid and str(part.get("cloid") or "") == str(cloid))):
+                            frag = part
+                    if frag is None and parts:
+                        frag = parts[-1]
+                frag = frag or {}
+                self._alert(_mr_partial_exit_recovery_text(
+                    coin=self.config.coin,
+                    filled=float(frag.get("qty") or qty),
+                    cum_qty=cum,
+                    ledger_qty=float(open_row["qty"] or 0.0),
+                    price=float(frag.get("price") or px),
+                    price_source=str(frag.get("price_source") or "fills"),
+                    signal_date=sd, trade_id=int(open_row["id"]),
+                    recorded_ts=now / 1000.0),
+                    kind="mr_fill_exit_partial",
+                    key=_partial_event_key(open_row["id"], row["oid"], cloid),
+                    fill=True, dedupe=True)
                 continue
             # 成交查询可用且为空：上一张 IOC 已不在场
             self._shadow_finish(self._key_of(row), status=ST_FAILED,
@@ -2344,7 +2413,7 @@ class HlMrLeg:
                         signal_date=str(open_row["signal_date"]),
                         trade_id=int(open_row["id"]), exec_ts=now / 1000.0),
                         kind="mr_fill_exit_partial",
-                        key=f"{int(open_row['id'])}:{result.get('oid') or cloid}",
+                        key=_partial_event_key(open_row["id"], result.get("oid"), cloid),
                         fill=True, dedupe=True)
             remain = (left or {}).get("szi", "?") if isinstance(left, dict) else "?"
             self._shadow_finish(
