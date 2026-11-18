@@ -1722,6 +1722,9 @@ h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
    整句折行、不抢现价的视觉重量。 */
 .whyline{margin-top:4px;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
 .pos{color:var(--pos)}.neg{color:var(--neg)}.warn{color:var(--warn)}.muted{color:var(--muted);font-size:12px}
+.kv[data-role='sym-conclusion']{margin-top:7px;padding:5px 0;border-top:1px solid var(--line2);border-bottom:1px solid var(--line2)}
+.kv[data-role='sym-conclusion'] .k{font-weight:600;color:var(--fg)}
+.kv[data-role='sym-conclusion'] .v b{font-weight:700}
 .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;
             border:1px solid var(--line);border-radius:10px;background:var(--card)}
 /* 右缘渐隐提示可横滚（2026-11-07）：渐隐层挂在包一层 .tscroll 的 ::after 上
@@ -1751,7 +1754,7 @@ tr:last-child td{border-bottom:0}
 .chartbox .axlbl{position:absolute;right:4px;transform:translateY(-50%);font-size:10px;
                  line-height:1;color:var(--muted);font-variant-numeric:tabular-nums;
                  pointer-events:none}
-svg.chart{display:block;width:100%;height:160px}
+svg.chart{display:block;width:100%;height:160px;min-height:160px}
 svg.chart .gtext{fill:var(--muted)}
 svg.chart .gline{stroke:var(--line)}
 svg.chart .gbase{stroke:var(--muted)}
@@ -1762,9 +1765,10 @@ svg.chart .gneg{stroke:var(--neg)}
 svg.chart .gtwr{stroke:var(--link);stroke-dasharray:5 4;opacity:.9}
 /* 末点圆点已改成 round-cap 短线段（抗非等比拉伸），所以走 stroke 不走 fill。 */
 svg.chart .gdot{stroke:var(--link);fill:none}
-.btn{display:inline-block;background:var(--btn);color:#fff;border-radius:6px;padding:5px 11px;
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:34px;background:var(--btn);color:#fff;border-radius:6px;padding:5px 11px;
      font-size:12px;text-decoration:none;white-space:nowrap}
 .btn.gray{background:var(--btn-gray)}
+a:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid var(--link);outline-offset:2px}
 .foot{margin:18px 0 6px;color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;
       gap:8px;align-items:center}
 .foot .spacer{flex:1}
@@ -1793,6 +1797,15 @@ details.card>summary{font-size:12px;color:var(--h2)}
 .acct-banner .acct-top{gap:2px 30px;align-items:baseline;padding:0 0 6px}
 .acct-banner .acct-top b{font-size:20px}
 .acct-banner details.acct-details>summary{padding:4px 0 2px}
+/* 主数字和行动提示是首屏扫描锚点；异常时不依赖悬停才看得懂。 */
+.acct-banner .acct-top span:first-child{flex:1 1 180px}
+.acct-banner .acct-top span:first-child b{font-size:24px}
+.action-note{display:flex;align-items:flex-start;gap:7px;margin:-3px 0 9px;padding:7px 9px;
+             border-left:3px solid var(--banner-line);background:var(--banner-bg);
+             color:var(--banner-fg);font-size:12.5px;line-height:1.45}
+.action-note b{font-weight:650}
+.pos-table{min-width:720px}
+.pos-mobile-summary{display:none}
 /* 横幅窄屏（≤640px）：单独成块，不与下面那块公共窄屏规则混在一起 ——
    横幅的尺寸只属于横幅，改横幅时不必动别的区块的 media query。
    不加任何 nowrap / 固定宽度，靠 .acct-top 的 flex-wrap 自然折行，390px 不横向溢出。 */
@@ -1831,7 +1844,15 @@ tr.subm td{white-space:normal;font-size:11px;line-height:1.4;color:var(--muted);
     .card-empty-state{padding:18px 12px}.empty-icon{font-size:40px}
     .empty-triggers{gap:8px}
     .trigger-item{flex:1 1 96px;min-width:88px;padding:8px 10px}
-    .trigger-val{font-size:15px}}
+    .trigger-val{font-size:15px}
+    .acct-banner{padding:9px 11px 5px}
+    .acct-banner .acct-top{gap:0 18px}
+    .acct-banner .acct-top b{font-size:17px}
+    .acct-banner .acct-top span:first-child b{font-size:21px}
+    .action-note{margin:-2px 0 8px;padding:7px 8px;font-size:12px}
+    .pos-table{min-width:0}
+    .pos-mobile-summary{display:block;white-space:normal;font-size:11.5px;line-height:1.55;color:var(--muted)}
+    .pos-mobile-summary b{color:var(--fg);font-weight:600}}
 """ + SYMBOL_CSS + "</style>"
 
 
@@ -1915,7 +1936,7 @@ def _sym_row(label: str, title: str, need: Optional[float], line: Any,
         cls = (f" class=\"warn\" title=\"{_NEAR_TITLE}\"" if allow_warn and need < 1.0
                else "")
         val = f"还差 <b{cls}>{need:+.1f}%</b>{line_txt}"
-    return (f"<div class=\"kv\"><span class=\"k\" title=\"{_esc(title)}\">{label}"
+    return (f"<div class=\"kv\" data-role=\"sym-conclusion\"><span class=\"k\" title=\"{_esc(title)}\">{label}"
             f"</span><span class=\"v\">{val}</span></div>")
 
 
@@ -2215,7 +2236,7 @@ def _sym_card(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]] = None,
                                   allow_warn=short_ok))
     o.append(_reason_line(r))
     o.extend(_gate_lines(r))
-    # 数据源 / 已处理到小字行（P2 合并）：放在该标的块末尾、原因/闸门行之后。
+    # 数据源 / 已处理到小字行（P2 合并）：放在该标的块末尾、原因/闸门异常行之后。
     o.append(_feed_line(r, feed_map or {}, last_bar or {}))
     o.append("</div>")
     return "".join(o)
@@ -2235,14 +2256,11 @@ def _feed_line(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]],
     bar_txt = _fmt_dt((last_bar or {}).get(sym), "%m-%d %H:%M")
     if fd is None:
         return _whyline(f"数据源 无记录 · 已处理到 {bar_txt}", "muted")
-    # 失败行的 source 可能为空（引擎 mark_feed 失败路径不写源名）；本系统信号源
-    # 固定 kr-chart（fail-closed、不换源），空缺时兜底写实名，不算编造。
     src = str(fd.get("source") or "kr-chart")
     if fd.get("ok"):
         return ""
     err_at = _fmt_dt(fd.get("error_at"), "%H:%M") if fd.get("error_at") else "—"
     return _whyline(f"数据源 {src} 失败（最后错误 {err_at}） · 已处理到 {bar_txt}", "neg")
-
 
 def _symbol_dynamics(p: dict) -> str:
     """「标的动态」区块（2026-10-29 起与「仓位」表对换：仓位在最顶，本块在其后；
@@ -2909,6 +2927,24 @@ def _empty_positions_html(p: dict, reachable: bool) -> str:
             "</div>")
 
 
+def _action_note(p: dict) -> str:
+    """主屏可见的最短行动提示；只读既有状态，不推断交易动作。"""
+    net = _as_dict(p.get("network"))
+    system = _as_dict(p.get("system"))
+    if not net.get("reachable"):
+        return "交易所数据暂不可读，当前持仓、挂单和账户金额无法确认。"
+    if bool(p.get("kill")):
+        reason = str(p.get("kill_reason") or "").strip()
+        return "系统已熔断，自动开仓暂停。" + (f"原因：{reason}" if reason else "")
+    if system.get("mismatch") is True:
+        return "本地记录与交易所快照不一致，请先核对，不要继续手工操作。"
+    if system.get("mismatch") is None:
+        return "暂时无法完成对账，止损和仓位状态不能视为已确认。"
+    if p.get("orders_trusted") is not True:
+        return "交易所挂单状态无法确认，止损覆盖情况暂不能判定。"
+    return ""
+
+
 def _render_body(p: dict) -> str:
     mode = str(p.get("mode") or "off")
     # 该 venue 有没有出入金流水端点（Kraken 期货 = 没有）。面板据此整块不画
@@ -2969,8 +3005,14 @@ def _render_body(p: dict) -> str:
     o.append("</div>")
 
     if not reachable:
-        o.append(f"<div class='banner'>&#9888;&#65039; 未配置 / 读取失败：{_esc(error or '未知原因')}<br>"
-                 f"<span class='muted'>交易所侧数据暂不可用；信号 / 下单 / 成交记录见「记录」页。</span></div>")
+        note = _action_note(p)
+        detail = error or "未知原因"
+        o.append(f"<div class='banner'><b>需要注意</b> 未配置 / 读取失败：{_esc(detail)}<br>"
+                 f"<span class='muted'>{_esc(note)} · 信号 / 下单 / 成交记录见「记录」页。</span></div>")
+    else:
+        note = _action_note(p)
+        if note:
+            o.append(f"<div class='action-note'><b>处理提示</b><span>{_esc(note)}</span></div>")
 
     # ---------------- 账户横幅（P1-2：只搬位置 + 换壳）----------------
     # 位置（用户钉死）：H1 → 状态条 →（不可达横幅）→ 账户横幅 → 仓位 → 曲线 → …
@@ -3048,7 +3090,7 @@ def _render_body(p: dict) -> str:
     else:
         show_fund_col = not no_flows
         ncol = 13 if show_fund_col else 12
-        o.append("<div class='tscroll'><div class='tablewrap'><table><thead><tr>"
+        o.append("<div class='tscroll'><div class='tablewrap'><table class='pos-table'><thead><tr>"
                  "<th>币种</th><th>方向</th><th class='num hidem'>数量</th><th class='num'>入场</th>"
                  "<th class='num'>标记</th><th class='num'>浮盈浮亏</th><th class='num'>R</th>"
                  "<th class='num'>止损</th><th class='num'>止损距离</th><th class='num hidem'>杠杆</th>"
