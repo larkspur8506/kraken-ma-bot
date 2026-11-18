@@ -105,6 +105,8 @@ _ALERT_KIND_PREFIX_TXT = (
     ("mr_fill_exit", "MR 离场成交"),
     ("mr_action_required", "MR 需人工核对"),
     ("mr_alert", "MR 告警"),
+    # 带 `:suppressed` 后缀的成交回报（用户关掉推送）也归到对应中文名
+    ("exec_alert_fills", "执行器成交回报"),
 )
 
 
@@ -117,6 +119,17 @@ def _alert_kind_text(kind) -> str:
         if k.startswith(prefix):
             return label
     return k
+
+
+#: 「用户关掉推送」的提醒用 kind 后缀标记（见 app.hl.mr.SUPPRESSED_SUFFIX）。
+_ALERT_SUPPRESSED_SUFFIX = ":suppressed"
+
+
+def _alert_state(kind, sent_ok: bool) -> str:
+    """提醒状态列：故意不推 ≠ 已送达。"""
+    if str(kind or "").endswith(_ALERT_SUPPRESSED_SUFFIX):
+        return "未推送（已关闭）"
+    return "已送达" if sent_ok else "失败"
 
 
 # 执行器事件里同样属例行行的：心跳；「对账一致」是每小时一次的正常回执（reconcile
@@ -861,8 +874,8 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
                  # 标的列与消息正文都走交易所侧显示名（记录页不得出现内部合约名，2026-11-07）；
                  # DB 原值不动，只在渲染层换。
                  f"<td>{_esc(_disp(r.get('symbol')) or _coin('', r.get('symbol')) or '—')}</td>"
-                 f"<td><span class='{'pos' if ok else 'neg'}'>"
-                 f"{'已送达' if ok else '失败'}</span></td>"
+                 f"<td><span class='{'muted' if _kind.endswith(_ALERT_SUPPRESSED_SUFFIX) else ('pos' if ok else 'neg')}'>"
+                 f"{_esc(_alert_state(_kind, ok))}</span></td>"
                  f"<td>{_msg_cell(_disp_text(msg))}</td></tr>")
     # 空表文案区分「真没有」和「被滤光了」：不让人误以为系统没在跑。
     _alert_empty = ("暂无提醒日志" if _alert_raw_n == 0
@@ -1130,8 +1143,8 @@ def _subpage_rows_html(slug: str, rows: List[Dict[str, Any]],
             out += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
                     f"<td>{_esc(_alert_kind_text(_kind))}</td>"
                     f"<td>{_esc(_disp(r.get('symbol')) or _coin('', r.get('symbol')) or '—')}</td>"
-                    f"<td><span class='{'pos' if ok else 'neg'}'>"
-                    f"{'已送达' if ok else '失败'}</span></td>"
+                    f"<td><span class='{'muted' if _kind.endswith(_ALERT_SUPPRESSED_SUFFIX) else ('pos' if ok else 'neg')}'>"
+                    f"{_esc(_alert_state(_kind, ok))}</span></td>"
                     f"<td>{_msg_cell(_disp_text(str(r.get('message') or '')))}</td></tr>")
         return out
     if slug == "events":

@@ -733,6 +733,26 @@ class DB:
         return int(cur.rowcount or 0)
 
     @_locked
+    def mark_alert_suppressed(self, aid: int) -> bool:
+        """把「用户关掉推送」的提醒就地了结：sent=1 + kind 加 `:suppressed`。
+
+        这不是「发送成功」：不进补推队列（sent=1），也不让面板显示「已送达」；
+        kind 后缀就是给渲染层的标记（无 schema 迁移）。
+        """
+        row = self.conn.execute("SELECT kind FROM alert_logs WHERE id=?",
+                                (int(aid),)).fetchone()
+        if row is None:
+            return False
+        kind = str(row["kind"] or "")
+        if not kind.endswith(":suppressed"):
+            kind += ":suppressed"
+        self.conn.execute(
+            "UPDATE alert_logs SET sent_successfully=1, sent_at=?, kind=? WHERE id=?",
+            (now(), kind, int(aid)))
+        self.conn.commit()
+        return True
+
+    @_locked
     def prune_alert_logs(self, keep_days: float = 60.0, keep_rows: int = 5000) -> None:
         """清 alert_logs：bar_ms=NULL 的超期行 + 超出 keep_rows 的旧行。
 

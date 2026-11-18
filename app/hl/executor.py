@@ -439,8 +439,10 @@ def fmt_exit_alert(coin: str, side: int, entry_px: float, exit_px: float, sz: fl
         "",
         f"离场原因  {why}",
         f"平仓价    {_fmt_u(exit_px)}（开仓 {_fmt_u(entry_px)}）",
-        f"本次盈亏  {net:+,.2f} USD（{r_multiple:+.2f}R）",
-        f"盈亏构成  价差 {gross_pnl:+,.2f} USD · 手续费 {_fmt_u(fees)} USD",
+        # 手续费是按费率估的、资金费根本没进这套算法 —— 说清楚，别让「本次盈亏」
+        # 被读成对账后的净额。
+        f"本次盈亏  ≈{net:+,.2f} USD（估算：已扣估算手续费，未计资金费；{r_multiple:+.2f}R）",
+        f"盈亏构成  价差 {gross_pnl:+,.2f} USD · 手续费估算 {_fmt_u(fees)} USD",
     ]
     if hold:
         lines.append(f"持仓时长  {hold}")
@@ -731,12 +733,15 @@ class Executor:
     def _alert_fill(self, text: str) -> None:
         """成交回报（开仓/平仓成功）。受面板「成交回报推送」开关控制；异常类提醒一律走 _alert。
 
-        开关关闭时也落库（kind=exec_alert_fills，不进补推白名单——开关是用户意图），
-        这样 alert_logs 里有完整审计轨迹，且开关重新打开后可见历史。
+        开关关闭时也落库（kind=exec_alert_fills:suppressed，不进补推白名单——开关是用户意图），
+        这样 alert_logs 里有完整审计轨迹，面板按 `:suppressed` 显示「未推送（已关闭）」，
+        且开关重新打开后可见历史。
         """
         if not getattr(self.p, "notify_fills", True):
             try:
-                self.db.log_alert(None, None, "exec_alert_fills", text, True)
+                # `:suppressed` 后缀 = 用户关掉了推送（不是发送成功）：面板据此显示
+                # 「未推送（已关闭）」，补推仍按基名 exec_alert_fills 排除。
+                self.db.log_alert(None, None, "exec_alert_fills:suppressed", text, True)
             except Exception as e:                                   # noqa: BLE001
                 logger.error("[hl-exec] 成交回报落库失败：%s", e)
             return

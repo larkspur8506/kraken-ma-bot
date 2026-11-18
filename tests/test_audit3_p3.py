@@ -153,8 +153,9 @@ class TestMinBars(unittest.TestCase):
 
 class TestRetryDedup(unittest.TestCase):
     def test_dedup_in_source(self):
-        src = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
-        self.assertIn("_seen.add(key)", src)
+        # 去重逻辑在通知边界（app.notify.retry_failed_alerts），main 只做装配
+        src = (ROOT / "app" / "notify.py").read_text(encoding="utf-8")
+        self.assertIn("seen.add(key)", src)
 
 
 class TestRehearseScript(unittest.TestCase):

@@ -42,10 +42,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, time as _at_time, timedelta, timezone
@@ -132,6 +134,11 @@ MR_TITLE = "【Kraken·MR】"
 #: 绝不能折算成 `funding 0.0%` —— 那是在说「没花钱」，而事实是「不知道」。
 FUNDING_UNAVAILABLE = "不可用（交易所未提供资金费流水，未计入净盈亏）"
 
+#: 「用户关掉成交推送」的行用 kind 后缀标记（alert_logs 无状态列，也不加迁移）：
+#: sent_successfully=1 只表示「这笔不用再管」，面板据此显示「未推送（已关闭）」，
+#: 不再误导成「已送达」。
+SUPPRESSED_SUFFIX = ":suppressed"
+
 
 def _fmt_hold(seconds: float) -> str:
     """持仓时长（秒）→ 「1 天 2 小时 / 3 小时 5 分钟 / 12 分钟」。"""
@@ -149,16 +156,58 @@ def _fmt_hold(seconds: float) -> str:
     return f"{mins} 分钟"
 
 
+def _exec_time(ts_s: Any) -> str:
+    """成交时间戳 → 「YYYY-MM-DD HH:MM:SS 北京时间」（显式 Asia/Shanghai）。
+
+    用户看的是北京时间；机器/日志仍是 UTC 时间戳，这里只做展示换算（不做任何
+    交易时间口径计算）。tzdata 缺失时退回固定 +8（上海无夏令时，等价）。
+    """
+    try:
+        t = float(ts_s)
+    except (TypeError, ValueError):
+        return ""
+    if t <= 0:
+        return ""
+    try:
+        tz = ZoneInfo("Asia/Shanghai")
+    except Exception:                                         # noqa: BLE001
+        tz = timezone(timedelta(hours=8))
+    try:
+        return datetime.fromtimestamp(t, tz).strftime("%Y-%m-%d %H:%M:%S") + " 北京时间"
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
 def _mr_entry_text(*, coin: str, qty: float, price: float, notional: float,
-                   signal_date: str, trade_id: Any) -> str:
-    """MR 入场成交回报（纯文本：Telegram 通道不带 parse_mode，不能有 Markdown）。"""
-    return "\n".join([
-        f"{MR_TITLE}入场成交 · {coin} 做多",
-        f"成交价    {float(price):,.2f} USD",
-        f"数量      {float(qty):g} 张（名义 {float(notional):,.2f} USD）",
+                   signal_date: str, trade_id: Any, exec_ts: Any = 0.0,
+                   planned_qty: Optional[float] = None,
+                   note: str = "") -> str:
+    """MR 入场成交回报（纯文本：Telegram 通道不带 parse_mode，不能有 Markdown）。
+
+    `planned_qty` 与成交量不同时明写「成交 X / 计划 Y（部分成交）」—— 只看成交量
+    会把部分成交读成按计划满仓。
+    """
+    lines = [f"{MR_TITLE}入场成交 · {coin} 做多"]
+    planned = None if planned_qty is None else float(planned_qty)
+    partial = (planned is not None and planned > 0
+               and abs(float(qty) - planned) > max(1e-9, planned * 1e-9))
+    if partial:
+        lines.append(
+            f"数量      成交 {float(qty):g} / 计划 {planned:g} 张"
+            f"（部分成交，名义 {float(notional):,.2f} USD）")
+    else:
+        lines.append(f"数量      {float(qty):g} 张（名义 {float(notional):,.2f} USD）")
+    lines.append(f"成交价    {float(price):,.2f} USD")
+    stamp = _exec_time(exec_ts)
+    if stamp:
+        lines.append(f"成交时间  {stamp}")
+    lines += [
         f"信号日    {signal_date}",
         f"台账      #{trade_id}",
-    ])
+    ]
+    if note:
+        lines.append(f"说明      {note}")
+    return "\n".join(lines)
 
 
 def _mr_exit_text(*, coin: str, filled: float, ledger_qty: float,
@@ -166,11 +215,13 @@ def _mr_exit_text(*, coin: str, filled: float, ledger_qty: float,
                   exit_px: float, entry_ts: float, now_s: float,
                   net_pnl: float, fee_est: float, complete: bool,
                   funding_paid: Optional[float], price_source: str,
-                  signal_date: str) -> str:
+                  signal_date: str, exec_ts: Any = 0.0,
+                  note: str = "") -> str:
     """MR 离场成交回报：数量/价格/持仓时长/费用与净利口径一次说清。
 
     - 成交数量与台账数量分开写：部分成交/缺口不许被读成「整笔已平」；
     - funding 不可用（Kraken 无流水）→ 明说不可用，不写 0.0%；
+    - 有值时按 `_funding_paid` 既有契约（正=已付出）写「净付/净收」，不改数值；
     - `complete=False`（估算价或缺成交证据）→ 净利标「未完成」并提示核对。
     """
     qty_line = f"数量      成交 {float(filled):g} / 台账 {float(ledger_qty):g} 张"
@@ -184,25 +235,66 @@ def _mr_exit_text(*, coin: str, filled: float, ledger_qty: float,
     hold = _fmt_hold(float(now_s or 0.0) - float(entry_ts or 0.0))
     if hold:
         lines.append(f"持仓      {hold}")
+    stamp = _exec_time(exec_ts or now_s)
+    if stamp:
+        lines.append(f"成交时间  {stamp}")
     if float(gap_qty or 0.0) > 1e-9:
         lines.append(f"缺口      {float(gap_qty):g} 张按标记价估算，未计入成交")
     if complete:
-        pnl_tail = "估算：手续费按 taker 费率计"
+        pnl_tail = ("估算：已扣估算手续费，"
+                    + ("资金费未计入" if funding_paid is None else "含资金费"))
     else:
-        pnl_tail = (f"估算，未完成：离场价来自 {price_source}，"
-                    "请核对真实成交价")
+        pnl_tail = (f"估算，未完成：离场价来自 {price_source}，请核对真实成交价；"
+                    "已扣估算手续费，"
+                    + ("资金费未计入" if funding_paid is None else "含资金费"))
     if funding_paid is None:
         funding_line = FUNDING_UNAVAILABLE
-    elif float(funding_paid) >= 0:
-        funding_line = f"已付 {float(funding_paid):,.2f} USD（已计入净盈亏）"
     else:
-        funding_line = f"已收 {-float(funding_paid):,.2f} USD（已计入净盈亏）"
+        # `_funding_paid` 的既有契约是「已付出为正」（正=我们付出去的钱）。
+        # Kraken 无资金费流水，无法独立证实方向 ⇒ 只按该契约写「净付/净收」，
+        # 不改数值、不改台账口径。
+        value = float(funding_paid)
+        if value > 0:
+            funding_line = f"净付 {value:,.2f} USD（按交易所流水口径，已计入净盈亏）"
+        elif value < 0:
+            funding_line = f"净收 {-value:,.2f} USD（按交易所流水口径，已计入净盈亏）"
+        else:
+            funding_line = "0.00 USD（已计入净盈亏）"
     lines.extend([
-        f"净盈亏    {float(net_pnl):+,.2f} USD（{pnl_tail}）",
+        f"净盈亏    ≈{float(net_pnl):+,.2f} USD（{pnl_tail}）",
         f"费用      ≈{float(fee_est):,.2f} USD（按 taker 费率估算）",
         f"资金费    {funding_line}",
         f"信号日    {signal_date}",
     ])
+    if note:
+        lines.append(f"说明      {note}")
+    return "\n".join(lines)
+
+
+def _mr_partial_exit_text(*, coin: str, filled: float, remaining: float,
+                          entry_px: float, exit_px: float,
+                          price_source: str, signal_date: str,
+                          trade_id: Any, exec_ts: Any = 0.0) -> str:
+    """MR 部分离场成交回报：只报了这次平掉多少、交易所还剩多少。
+
+    **不写净盈亏**：本笔只是片段，费用/资金费与整笔结算还没定，任何数字都会
+    被当成「这笔已结算」。台账保持 OPEN，下一轮继续离场。
+    """
+    lines = [
+        f"{MR_TITLE}离场部分成交 · {coin} 平多",
+        "状态      部分成交，未全部平仓（台账保持 OPEN，下轮继续离场）",
+        f"本次成交  {float(filled):g} 张 · 交易所剩余 {float(remaining):g} 张",
+        f"价格      开仓 {float(entry_px):,.2f} → 本次 {float(exit_px):,.2f} USD"
+        f"（来源 {price_source}）",
+    ]
+    stamp = _exec_time(exec_ts)
+    if stamp:
+        lines.append(f"成交时间  {stamp}")
+    lines += [
+        f"信号日    {signal_date}",
+        f"台账      #{trade_id}",
+        "盈亏      未结算（本片段单独不计净盈亏）",
+    ]
     return "\n".join(lines)
 
 
@@ -369,7 +461,8 @@ class HlMrLeg:
         - `fill=True`：成交回报，受面板 fill_push 控制。关掉 → 只落库并记成「已了结」
           （sent_successfully=1），不进补推队列 —— 那是用户意图，不是发送失败。
         - `key`：事件标识，拼进 kind 才是 alert_logs 里的事件键（`bar_ms=NULL` 时
-          UNIQUE 不生效，不同事件全靠 kind 区分，绝不能共用同一个 kind）。
+          UNIQUE 不生效，不同事件全靠 kind 区分，绝不能共用同一个 kind）。未显式给
+          时按「正文归一化哈希 + 小时桶」自动派生，避免所有无名告警挤进同一个事件。
         - `dedupe=True`：**已送达**的事件不再发；没送达（sent=0）照常重试 ——
           「事件去重」只覆盖成功送达，不能把失败推送一起吞掉。
         """
@@ -386,11 +479,21 @@ class HlMrLeg:
         clean = _clean_alert_text(MR_TITLE + body, limit=800).replace("**", "")
         logger.warning("%s", clean)
         k = "" if key is None else str(key)
-        event_kind = f"{kind}:{k}" if k else kind
+        if not k:
+            # 每条告警都要有自己的事件键：`(symbol, kind, NULL)` 若共用，补推只会发
+            # 其中一条，成功后还会把同组别的消息一起标「已送达」（等于静默丢消息）。
+            # 正文归一化 + 小时桶 = 不同事件不同键、同一事件（含重复失败）同一键。
+            norm = re.sub(r"\s+", " ", body).strip()
+            digest = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+            bucket = int(float(self.clock()) // 3600.0)
+            k = f"auto:{digest}:{bucket}"
+        event_kind = f"{kind}:{k}"
+        suppressed_kind = event_kind + SUPPRESSED_SUFFIX
         if dedupe:
             # 先判「已送达」再落事件行：重复进入同一事件时别把 hl_events 也刷一遍。
             try:
-                if self.db.was_alerted(self.config.coin, None, event_kind):
+                if (self.db.was_alerted(self.config.coin, None, event_kind)
+                        or self.db.was_alerted(self.config.coin, None, suppressed_kind)):
                     return True
             except Exception:                                 # noqa: BLE001
                 logger.warning("mr: 读 alert_logs 失败，按未推送处理", exc_info=True)
@@ -400,7 +503,8 @@ class HlMrLeg:
             pass
         if fill and not self._fills_on():
             try:
-                self.db.log_alert(self.config.coin, None, event_kind, clean, True)
+                # sent=1 = 这笔不用再管；kind 后缀让面板显示「未推送（已关闭）」
+                self.db.log_alert(self.config.coin, None, suppressed_kind, clean, True)
             except Exception:                                 # noqa: BLE001
                 logger.error("MR 成交回报落库失败（审计缺失）", exc_info=True)
             return True
@@ -429,7 +533,10 @@ class HlMrLeg:
             logger.warning("mr: %s（同类告警已去重）", text)
             return
         self._order_alerted_at[key] = now_s
-        self._alert(text, key=f"throttle:{key}")
+        # 事件键带节流窗口桶：同一类问题隔几小时再发生是**新事件**，不能被上一轮
+        # 的事件键吞掉（补推分组/「已送达」都按 kind 计）。
+        bucket = int(now_s // max(float(interval_s), 60.0))
+        self._alert(text, key=f"throttle:{key}:{bucket}")
 
     def _await_position(self, address: str, *, want: bool,
                         confirm_s: Optional[float] = None
@@ -1014,16 +1121,17 @@ class HlMrLeg:
                                      f"MR 需人工核对（{kind}）：{reason}", data=payload)
             except Exception:                                 # noqa: BLE001
                 logger.warning("mr: 写 mr_action_required 失败", exc_info=True)
+        # 这些 caller 里有些同 tick 就按估算关账、有些保留 OPEN 等证据，**没有**
+        # 一条对所有 caller 都成立的「自动下一步」；所以只写普遍为真的现状：
+        # 差异/证据已记录、本条不是成交确认、由人核对。原因放最前面。
         lines = [
             f"需人工核对（{kind}）",
-            "已做      停手 + 记录证据，未重复下单",
-            "状态      交易所与台账未能自动对齐，本次结论不完整",
-            "自动      下一轮 tick 继续核对；不重复下单、不按估算价补单",
-            "人工      核对交易所持仓/成交，必要时改台账",
+            f"原因      {reason}",
+            "现状      差异与证据已记录（事件/提醒记录可查），本结论可能不完整",
+            "说明      本条不是成交确认；未消除时请人工核对交易所持仓与成交",
         ]
         if payload["signal_date"]:
             lines.append(f"信号日    {payload['signal_date']}")
-        lines.append(f"原因      {reason}")
         self._alert("\n".join(lines), kind="mr_action_required",
                     key=f"{kind}:{payload['signal_date'] or '-'}", dedupe=True)
 
@@ -1103,9 +1211,14 @@ class HlMrLeg:
                                 error="按交易所持仓补记台账")
         status["state"] = "entered"
         status["adopted"] = "entry"
-        self._alert(f"MR 入场确认丢失，已按交易所持仓补记台账 #{trade_id}："
-                    f"{self.config.coin} {filled_sz} @≈{entry_px:.2f}（信号 {signal_date}"
-                    f"{'，含成交证据' if filled_sz and raw_extra.get('fill_ids') else ''}）")
+        # 补记也是一条真实成交：按成交回报口径推送（受 fill_push 控制、可补推、同事件不重发）
+        self._alert(_mr_entry_text(
+            coin=self.config.coin, qty=filled_sz, price=entry_px,
+            notional=filled_sz * entry_px, signal_date=signal_date,
+            trade_id=trade_id, exec_ts=now_s,
+            note=("入场确认丢失，按交易所持仓补记台账（未重复下单）"
+                  + ("，含成交证据" if raw_extra.get("fill_ids") else ""))),
+            kind="mr_fill_entry_adopt", key=trade_id, fill=True, dedupe=True)
         return True
 
     def _adopt_exit(self, open_row, now: int, status: Dict[str, Any]) -> bool:
@@ -1301,13 +1414,20 @@ class HlMrLeg:
         status["adopted"] = "exit"
         status["net_pnl"] = st["net_pnl"]
         status["net_pnl_complete"] = st["net_pnl_complete"]
-        self._alert(
-            f"MR 离场补记 CLOSED（台账 #{open_row['id']}，净 {st['net_pnl']:+.2f} USD，"
-            f"价格来源 {source}"
-            + ("，价格为估算、净利未完成" if not st["net_pnl_complete"]
-               else "（有成交证据）")
-            + (f"，含已记录部分平仓 {partial_qty:g}" if partials else "")
-            + (f"，缺口 {gap_qty:g} 张按 mark 估算" if gap_qty > 1e-9 else "") + "）")
+        # 补记关账也是成交类通知：受 fill_push 控制、可补推、同事件不重发。
+        # funding 未参与本次补记（adopt 路径不读资金费流水）→ 明说未计入。
+        self._alert(_mr_exit_text(
+            coin=self.config.coin, filled=covered, ledger_qty=qty,
+            partial_qty=partial_qty, gap_qty=gap_qty,
+            entry_px=float(open_row["entry_price"] or 0.0),
+            exit_px=covered_px, entry_ts=float(open_row["entry_ts"] or 0.0),
+            now_s=now_s, net_pnl=st["net_pnl"], fee_est=st["fee_est"],
+            complete=bool(st["net_pnl_complete"]),
+            funding_paid=None, price_source=source, signal_date=signal_date,
+            exec_ts=now_s,
+            note="离场确认丢失，按成交/回执证据补记台账（未重复下单）"),
+            kind="mr_fill_exit_adopt", key=int(open_row["id"]),
+            fill=True, dedupe=True)
         return True
 
     def _exit_order_evidence(self, signal_date: str) -> Tuple[float, float, str]:
@@ -1847,7 +1967,8 @@ class HlMrLeg:
         status["last_fill_at"] = now / 1000.0
         self._alert(_mr_entry_text(coin=cfg.coin, qty=filled_sz, price=entry_px,
                                    notional=filled_sz * entry_px,
-                                   signal_date=signal_date, trade_id=trade_id),
+                                   signal_date=signal_date, trade_id=trade_id,
+                                   exec_ts=now / 1000.0, planned_qty=sz),
                     kind="mr_fill_entry", key=trade_id, fill=True, dedupe=True)
         return status
 
@@ -2213,6 +2334,18 @@ class HlMrLeg:
                             f"片段价 {frag_px:.2f}（来源 {frag_src}）")
                     except Exception:                     # noqa: BLE001
                         logger.warning("mr: 写 mr_exit_partial 事件失败", exc_info=True)
+                    # 片段已原子落库 → 给用户一条成交回报（旧实现只写事件，用户看不到
+                    # 「平掉多少、还剩多少」）。事件键 = 台账 #id + 本单 oid/cloid：
+                    # 同一张单的重复回执落到同一键，不会重复推送。
+                    self._alert(_mr_partial_exit_text(
+                        coin=cfg.coin, filled=filled_here, remaining=left_sz,
+                        entry_px=entry_px, exit_px=frag_px,
+                        price_source=frag_src,
+                        signal_date=str(open_row["signal_date"]),
+                        trade_id=int(open_row["id"]), exec_ts=now / 1000.0),
+                        kind="mr_fill_exit_partial",
+                        key=f"{int(open_row['id'])}:{result.get('oid') or cloid}",
+                        fill=True, dedupe=True)
             remain = (left or {}).get("szi", "?") if isinstance(left, dict) else "?"
             self._shadow_finish(
                 shadow, status=ST_FILLED if filled_here > 1e-12 else ST_FAILED,

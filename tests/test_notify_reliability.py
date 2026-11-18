@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime
@@ -39,8 +40,12 @@ class FakeNotifier:
         return self.ok
 
 
+def _db_path(tmpdir: str) -> str:
+    return f"{tmpdir}/notify_{abs(hash(tmpdir)) % 99999}.db"
+
+
 def _leg(tmpdir: str, *, notifier=None, **kw):
-    db = DB(f"{tmpdir}/notify_{abs(hash(tmpdir)) % 99999}.db")
+    db = DB(_db_path(tmpdir))
     info = FakeInfo(**kw)
     ex = FakeExchange()
     ex.info = info
@@ -103,15 +108,17 @@ class TestActionRequiredDurability(unittest.TestCase):
                                   reason="片段未能原子落库", signal_date="2026-04-15")
             self.assertEqual(len(_failed(db, "mr_action_required")), 1)
 
-            # 进程重启：内存去重全清，但 DB 里事件行还在 —— 旧实现会在这里 return，
-            # 推送永远补不回来。
+            # 进程重启：关连接、重新打开同一 DB 文件；内存去重全清，但事件行还在 ——
+            # 旧实现会在这里 return，推送永远补不回来。
+            db.conn.close()
+            db2 = DB(_db_path(tmp))
             n = FakeNotifier(ok=True)
-            leg2 = _rebuild(db, tmp, notifier=n)
+            leg2 = _rebuild(db2, tmp, notifier=n)
             leg2._action_required({}, kind="exit_fragment_uncommitted",
                                   reason="片段未能原子落库", signal_date="2026-04-15")
             self.assertEqual(len(n.messages), 1)
-            self.assertEqual(_failed(db, "mr_action_required"), [])
-            self.assertEqual(len(db.hl_recent_events(10, kind=ACTION_REQUIRED_KIND)), 1)
+            self.assertEqual(_failed(db2, "mr_action_required"), [])
+            self.assertEqual(len(db2.hl_recent_events(10, kind=ACTION_REQUIRED_KIND)), 1)
 
     def test_distinct_events_are_not_suppressed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,7 +140,7 @@ class TestActionRequiredDurability(unittest.TestCase):
             msg = n.messages[-1]
             self.assertIn("【Kraken·MR】", msg)
             self.assertIn("需人工核对", msg)
-            for want in ("已做", "自动", "人工", "缺口 0.5 张"):
+            for want in ("原因", "现状", "说明", "缺口 0.5 张", "不是成交确认"):
                 self.assertIn(want, msg)
             self.assertNotIn("**", msg)
 
@@ -229,7 +236,8 @@ class TestMrCloseAlertContent(unittest.TestCase):
             self._exit(leg, db, info)
             msg = n.messages[-1]
             for want in ("数量", "2.68", "开仓", "93.00", "离场", "持仓",
-                         "1 天 6 小时 30 分钟", "净盈亏", "费用", "信号日"):
+                         "1 天 6 小时 30 分钟", "净盈亏", "费用", "信号日",
+                         "成交时间", "已扣估算手续费"):
                 self.assertIn(want, msg, f"离场文案缺 {want}")
             self.assertNotIn("**", msg)
             self.assertNotIn("MR: MR", msg)
@@ -301,10 +309,438 @@ class TestMainLegFillTitles(unittest.TestCase):
             self.assertIn("【Kraken·主腿】", txt)
             self.assertNotIn("**", txt)
             self.assertNotIn("USDC", txt)
+            # 主腿净额是估算口径：手续费为估算、资金费未计入
+            self.assertIn("已扣估算手续费", txt)
+            self.assertIn("未计资金费", txt)
+            self.assertIn("手续费估算", txt)
 
     def test_stop_exit_title_is_main_leg(self):
         txt = self._exit("stop", -1)
         self.assertIn("【Kraken·主腿】🛑 止损离场", txt)
+
+
+class TestMrPartialExitNotification(unittest.TestCase):
+    """确认过的部分离场：片段已原子落库 → 必须有一条「部分成交」成交回报。
+
+    旧实现只写 `mr_exit_partial` 事件 + 一条「下轮重试」告警，用户看不到「已经平掉
+    多少、还剩多少」；这条推送按成交回报口径（受 fill_push 控制、可补推、同单不重发）。
+    """
+
+    def _setup(self, tmp, *, notifier, fill_push="1"):
+        leg, db, ex, info = _leg(tmp, notifier=notifier, mr_szi="2.68", mid=95.5)
+        db.set_config("mr_enabled", "1")
+        db.set_config("fill_push", fill_push)
+        db.mr_record_entry(
+            signal_date="2026-04-15", entry_session="2026-04-16", qty=2.68,
+            qty_int=26800, entry_price=93.0, entry_order_id="100",
+            entry_ts=ENTRY_NOW_MS / 1000.0, notional=2.68 * 93.0, margin=249.24,
+            equity_at_entry=500.0)
+        real_place = ex.place_order
+
+        def place(coin, is_buy, sz, limit_px, **kw):
+            res = real_place(coin, is_buy, sz, limit_px, **kw)
+            if not is_buy:
+                info.mr_szi = "1.48"           # 交易所只剩 1.48 张
+                res.update(filled_sz=1.2, avg_px=limit_px, status="filled")
+            return res
+
+        ex.place_order = place
+        return leg, db, ex, info
+
+    def test_partial_exit_notifies_qty_remaining_and_no_pnl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=True)
+            leg, db, ex, info = self._setup(tmp, notifier=n)
+            status = leg.tick(now_ms=EXIT_NOW_MS)
+            self.assertEqual(status["state"], "exit_not_filled")
+            row = db.mr_open_trade()
+            self.assertEqual(row["state"], "OPEN", "部分成交不得写出 CLOSED")
+            partials = json.loads(row["raw"])["partial_exits"]
+            self.assertAlmostEqual(partials[0]["qty"], 1.2, places=6)
+
+            msgs = [m for m in n.messages if "离场部分成交" in m]
+            self.assertEqual(len(msgs), 1, "片段落库后必须有一条部分成交回报")
+            msg = msgs[0]
+            for want in ("【Kraken·MR】", "部分成交", "本次成交  1.2 张 · 交易所剩余 1.48 张",
+                         "未全部平仓", "93.00", "95.36", "来源 avg_px",
+                         "信号日    2026-04-15", "2026-04-18 04:10:00 北京时间"):
+                self.assertIn(want, msg, f"部分成交文案缺 {want}")
+            self.assertNotIn("净盈亏    ", msg, "部分成交不能编造净盈亏")
+            self.assertNotIn("**", msg)
+
+            rows = [r for r in db.recent_alerts(50)
+                    if str(r["kind"] or "").startswith("mr_fill_exit_partial")]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(int(rows[0]["sent_successfully"]), 1)
+            kind = str(rows[0]["kind"])
+            self.assertIn(f":{row['id']}:", kind, "事件键必须含 trade_id")
+            self.assertIn(":101", kind, "事件键必须含本单 oid/cloid")
+
+            # 同一单的重复回执：同 kind+key 不得再发
+            key = kind.split("mr_fill_exit_partial:", 1)[1]
+            before = len(n.messages)
+            leg._alert("离场部分成交（重复回执）", kind="mr_fill_exit_partial",
+                       key=key, fill=True, dedupe=True)
+            self.assertEqual(len(n.messages), before)
+
+    def test_partial_exit_notification_respects_fill_push(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=True)
+            leg, db, ex, info = self._setup(tmp, notifier=n, fill_push="0")
+            leg.tick(now_ms=EXIT_NOW_MS)
+            self.assertEqual([m for m in n.messages if "离场部分成交" in m], [])
+            rows = [r for r in db.recent_alerts(50)
+                    if str(r["kind"] or "").startswith("mr_fill_exit_partial")]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(int(rows[0]["sent_successfully"]), 1,
+                             "关掉是用户意图 → 记成功，不进补推队列")
+
+    def test_partial_exit_notification_failure_is_retryable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=False)
+            leg, db, ex, info = self._setup(tmp, notifier=n)
+            leg.tick(now_ms=EXIT_NOW_MS)
+            self.assertEqual(len(_failed(db, "mr_fill_exit_partial")), 1)
+
+
+class TestRetryFailedAlerts(unittest.TestCase):
+    """补推通道：成功后同一 MR 事件的**所有**失败行一起了结，别的 event 不动。"""
+
+    EVENT_A = "mr_action_required:exit_settle_gap:2026-04-17"
+    EVENT_B = "mr_action_required:exit_result_unknown:2026-04-17"
+
+    def _db(self, tmp):
+        return DB(f"{tmp}/retry_{abs(hash(tmp)) % 99999}.db")
+
+    def test_retry_once_then_clears_all_rows_of_same_event(self):
+        from app.notify import retry_failed_alerts
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            db.log_alert("QQQ", None, self.EVENT_A, "event A", False)
+            db.log_alert("QQQ", None, self.EVENT_A, "event A", False)
+            db.log_alert("QQQ", None, self.EVENT_B, "event B", False)
+            n = FakeNotifier(ok=True)
+            sent = retry_failed_alerts(db, n, max_age_h=24.0, limit=1)   # 最新事件 B
+            self.assertEqual(n.messages, ["event B"])
+            self.assertEqual(len(sent), 1)
+            rows = db.recent_alerts(20)
+            a_rows = [r for r in rows if r["kind"] == self.EVENT_A]
+            self.assertEqual([int(r["sent_successfully"]) for r in a_rows], [0, 0],
+                             "补推 B 不得把 A 标已送达")
+
+            sent2 = retry_failed_alerts(db, n, max_age_h=24.0, limit=5)  # A 的两行
+            self.assertEqual(n.messages, ["event B", "event A"],
+                             "同事件两行只补推一条")
+            self.assertEqual(len(sent2), 1)
+            a_rows = [r for r in db.recent_alerts(20) if r["kind"] == self.EVENT_A]
+            self.assertTrue(all(int(r["sent_successfully"]) == 1 for r in a_rows),
+                            "同一事件的两条失败行都必须了结，否则下轮重放")
+            retry_failed_alerts(db, n, max_age_h=24.0, limit=5)
+            self.assertEqual(n.messages, ["event B", "event A"], "不得重放")
+            self.assertEqual(_failed(db), [])
+
+    def test_fill_push_off_settles_fill_rows_as_suppressed(self):
+        from app.notify import retry_failed_alerts
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            db.log_alert("QQQ", None, "mr_fill_exit:7", "fill failed", False)
+            db.log_alert("QQQ", None, self.EVENT_A, "action failed", False)
+            n = FakeNotifier(ok=True)
+            retry_failed_alerts(db, n, fill_push=False)
+            self.assertEqual(n.messages, ["action failed"])
+            fill_row = [r for r in db.recent_alerts(20) if r["kind"].startswith("mr_fill_exit:7")][0]
+            self.assertEqual(int(fill_row["sent_successfully"]), 1,
+                             "关着开关的待补推成交要就地了结")
+            self.assertTrue(str(fill_row["kind"]).endswith(":suppressed"),
+                            "kind 后缀让面板显示「未推送（已关闭）」")
+            self.assertEqual(_failed(db), [], "不能把用户不想看的旧成交留成待补推")
+
+            n2 = FakeNotifier(ok=True)
+            retry_failed_alerts(db, n2, fill_push=True)
+            self.assertEqual(n2.messages, [], "重新打开后不得补发已关闭的旧成交")
+
+    def test_suppressed_fill_row_is_never_retried(self):
+        from app.notify import retry_failed_alerts
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            db.log_alert("QQQ", None, "mr_fill_entry:9", "fill suppressed by user", True)
+            n = FakeNotifier(ok=True)
+            retry_failed_alerts(db, n, fill_push=True)
+            self.assertEqual(n.messages, [], "用户关掉时已记成功，之后不得补发旧成交")
+
+
+class TestActionRequiredWording(unittest.TestCase):
+    def test_copy_is_conditional_not_a_promise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=True)
+            leg, db, ex, info = _leg(tmp, notifier=n)
+            leg._action_required({}, kind="exit_adopt_stale_no_evidence",
+                                 reason="查不到可归属的成交", signal_date="2026-04-17")
+            msg = n.messages[-1]
+            self.assertIn("原因      查不到可归属的成交", msg)
+            self.assertIn("不是成交确认", msg)
+            self.assertIn("人工核对", msg)
+            # 不许对全部 caller 做「停手 / 下轮自动解决」的承诺（有的同 tick 就估算关账）
+            for forbidden in ("停手", "下一轮", "自动核对", "自愈", "改台账"):
+                self.assertNotIn(forbidden, msg)
+
+
+class TestExecTimestamp(unittest.TestCase):
+    """成交时间固定用 Asia/Shanghai，且与信号日分开。"""
+
+    def test_entry_and_exit_show_beijing_timestamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=True)
+            leg, db, ex, info = _leg(tmp, notifier=n)
+            info.now_ms = ENTRY_NOW_MS
+            db.set_config("mr_enabled", "1")
+            leg.tick(now_ms=ENTRY_NOW_MS)
+            entry_msg = [m for m in n.messages if "入场成交" in m][0]
+            self.assertIn("2026-04-16 21:40:00 北京时间", entry_msg)
+            self.assertIn("信号日", entry_msg)
+
+            db.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.68,
+                qty_int=26800, entry_price=93.0, entry_order_id="100",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=2.68 * 93.0, margin=249.24,
+                equity_at_entry=500.0)
+            info.mr_szi = "2.68"
+            leg.tick(now_ms=EXIT_NOW_MS)
+            exit_msg = [m for m in n.messages if "离场成交" in m][0]
+            self.assertIn("2026-04-18 04:10:00 北京时间", exit_msg)
+            self.assertIn("信号日    2026-04-17", exit_msg)
+
+
+class TestFundingCashflowLabel(unittest.TestCase):
+    def test_positive_value_is_labelled_net_pay_per_existing_contract(self):
+        from app.hl.mr import _mr_exit_text
+        msg = _mr_exit_text(
+            coin="QQQ", filled=2.68, ledger_qty=2.68, partial_qty=0.0, gap_qty=0.0,
+            entry_px=93.0, exit_px=95.0, entry_ts=ENTRY_NOW_MS / 1000.0,
+            now_s=EXIT_NOW_MS / 1000.0, net_pnl=5.0, fee_est=0.14, complete=True,
+            funding_paid=0.03, price_source="avg_px", signal_date="2026-04-17")
+        # `_funding_paid` 的既有契约：正 = 已付出；不改数值，只把标签写清楚
+        self.assertIn("净付 0.03 USD", msg)
+        self.assertIn("按交易所流水口径", msg)
+        self.assertNotIn("已付", msg)
+        # 净额一侧必须带估算口径
+        self.assertIn("≈+5.00 USD", msg)
+        self.assertIn("已扣估算手续费", msg)
+
+
+class TestMrAdoptionNotifications(unittest.TestCase):
+    """恢复/补记也是成交类通知：跟随 fill_push + 可补推 + 同事件不重发。"""
+
+    def _adopt_entry(self, tmp, *, notifier, fill_push):
+        leg, db, ex, info = _leg(tmp, notifier=notifier)
+        info.now_ms = ENTRY_NOW_MS
+        db.set_config("mr_enabled", "1")
+        db.set_config("fill_push", fill_push)
+        ex.fill = False
+        leg.tick(now_ms=ENTRY_NOW_MS)
+        info.mr_szi = "2.68"
+        status = leg.tick(now_ms=ENTRY_NOW_MS + 300_000)
+        return status, leg, db, ex, info
+
+    def test_adoption_entry_respects_fill_push_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=True)
+            status, leg, db, ex, info = self._adopt_entry(tmp, notifier=n, fill_push="0")
+            self.assertEqual(status.get("adopted"), "entry")
+            self.assertEqual([m for m in n.messages if "补记" in m], [])
+            rows = [r for r in db.recent_alerts(50)
+                    if str(r["kind"] or "").startswith("mr_fill_entry_adopt")]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(int(rows[0]["sent_successfully"]), 1)
+
+    def test_adoption_entry_pushes_with_timestamp_when_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=True)
+            status, leg, db, ex, info = self._adopt_entry(tmp, notifier=n, fill_push="1")
+            msgs = [m for m in n.messages if "补记" in m]
+            self.assertEqual(len(msgs), 1)
+            self.assertIn("【Kraken·MR】", msgs[0])
+            self.assertIn("2026-04-16 21:45:00 北京时间", msgs[0])
+            rows = [r for r in db.recent_alerts(50)
+                    if str(r["kind"] or "").startswith("mr_fill_entry_adopt")]
+            self.assertEqual(len(rows), 1)
+
+    def test_adoption_exit_respects_fill_push_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=True)
+            leg, db, ex, info = _leg(tmp, notifier=n, mr_szi="2.68", mid=95.5)
+            db.set_config("mr_enabled", "1")
+            db.set_config("fill_push", "0")
+            db.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.68,
+                qty_int=26800, entry_price=93.0, entry_order_id="100",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=2.68 * 93.0, margin=249.24,
+                equity_at_entry=500.0)
+            ex.fill = False
+            leg.tick(now_ms=EXIT_NOW_MS)
+            info.mr_szi = "0"
+            status = leg.tick(now_ms=EXIT_NOW_MS + 300_000)
+            self.assertEqual(status.get("adopted"), "exit")
+            self.assertEqual([m for m in n.messages if "补记" in m], [])
+            rows = [r for r in db.recent_alerts(50)
+                    if str(r["kind"] or "").startswith("mr_fill_exit_adopt")]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(int(rows[0]["sent_successfully"]), 1)
+
+
+class TestTelegramPlainText(unittest.TestCase):
+    """通知边界统一去 `**`：engine._emit 等路径也经过 notifier，不靠各调用点自觉。"""
+
+    def test_plain_text_only_strips_bold_markers(self):
+        from app.notify import plain_text
+        self.assertEqual(plain_text("a *b* **c**"), "a *b* c")
+        self.assertEqual(plain_text("【Kraken】🛑 **未能自动处理**"), "【Kraken】🛑 未能自动处理")
+
+    def test_telegram_payload_has_no_markdown_bold(self):
+        from unittest import mock
+        from app.notify import TelegramNotifier
+        payloads = []
+
+        def fake_post(url, payload, timeout=10):
+            payloads.append(payload)
+            return True, '{"ok": true}'
+
+        with mock.patch("app.notify._post_json", side_effect=fake_post):
+            ok = TelegramNotifier("tok", "42").send_message(
+                "【Kraken】🛑 止损单丢失，**未能自动处理**\n第二行")
+        self.assertTrue(ok)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["text"],
+                         "【Kraken】🛑 止损单丢失，未能自动处理\n第二行")
+        self.assertNotIn("parse_mode", payloads[0])
+
+
+class TestAlertEventKeys(unittest.TestCase):
+    """每条 MR 告警都要有自己的事件键（`mr_alert` 不能全挤进一个事件）。"""
+
+    def test_distinct_unkeyed_warnings_retry_separately(self):
+        from app.notify import retry_failed_alerts
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=False)
+            leg, db, ex, info = _leg(tmp, notifier=n)
+            leg._alert("读账户失败：503")
+            leg._alert("读合约规格失败：timeout")
+            rows = [r for r in db.recent_alerts(20)
+                    if str(r["kind"] or "").startswith("mr_alert:auto:")]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(len({r["kind"] for r in rows}), 2, "不同告警不得共用事件键")
+
+            n2 = FakeNotifier(ok=True)
+            retry_failed_alerts(db, n2, limit=1)
+            self.assertEqual(len(n2.messages), 1)
+            left = [r for r in _failed(db) if str(r["kind"]).startswith("mr_alert")]
+            self.assertEqual(len(left), 1, "清一条不得把另一条也标已送达")
+            retry_failed_alerts(db, n2, limit=5)
+            self.assertEqual(len(n2.messages), 2)
+            self.assertEqual(_failed(db), [])
+
+    def test_same_text_in_next_hour_is_a_new_event(self):
+        from app.notify import retry_failed_alerts
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=False)
+            leg, db, ex, info = _leg(tmp, notifier=n)
+            t = {"v": EXIT_NOW_MS / 1000.0}
+            leg.clock = lambda: t["v"]
+            leg._alert("退避重试仍失败：交易所 503")
+            t["v"] += 3600.0
+            leg._alert("退避重试仍失败：交易所 503")
+            kinds = {r["kind"] for r in db.recent_alerts(20)
+                     if str(r["kind"]).startswith("mr_alert:auto:")}
+            self.assertEqual(len(kinds), 2, "跨小时再发生是另一个事件")
+            n2 = FakeNotifier(ok=True)
+            retry_failed_alerts(db, n2, limit=5)
+            self.assertEqual(len(n2.messages), 2)
+            self.assertEqual(_failed(db), [])
+
+
+class TestSuppressedDisplay(unittest.TestCase):
+    def test_suppressed_row_is_not_shown_as_delivered(self):
+        from app.admin_ui import _alert_kind_text, _alert_state
+        self.assertEqual(_alert_state("mr_fill_exit:7:suppressed", True), "未推送（已关闭）")
+        self.assertEqual(_alert_state("mr_fill_exit:7", True), "已送达")
+        self.assertEqual(_alert_state("mr_fill_exit:7", False), "失败")
+        self.assertEqual(_alert_kind_text("exec_alert_fills:suppressed"), "执行器成交回报")
+
+    def test_suffixed_exec_alert_fills_is_still_not_retried(self):
+        from app.notify import retry_failed_alerts
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DB(f"{tmp}/sup_{abs(hash(tmp)) % 99999}.db")
+            db.log_alert(None, None, "exec_alert_fills:suppressed", "成交回报", True)
+            db.log_alert(None, None, "exec_alert_fills:suppressed", "成交回报", False)
+            n = FakeNotifier(ok=True)
+            retry_failed_alerts(db, n, fill_push=True)
+            self.assertEqual(n.messages, [])
+
+
+class TestEntryPartialFill(unittest.TestCase):
+    def test_entry_message_shows_planned_vs_actual(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = FakeNotifier(ok=True)
+            leg, db, ex, info = _leg(tmp, notifier=n)
+            info.now_ms = ENTRY_NOW_MS
+            db.set_config("mr_enabled", "1")
+            ex.fill_sz = 1.25                     # 计划 2.68，只成交 1.25
+            leg.tick(now_ms=ENTRY_NOW_MS)
+            msg = [m for m in n.messages if "入场成交" in m][0]
+            self.assertIn("成交 1.25 / 计划 2.68", msg)
+            self.assertIn("部分成交", msg)
+            self.assertIn("成交时间", msg)
+
+
+class TestMainRetryWiring(unittest.TestCase):
+    """直接跑真实的 `main._retry_failed_alerts`（临时 DB + 假 notifier + 重启）。"""
+
+    _ENV = ("DB_PATH", "ENABLE_SCHEDULER", "ADMIN_TOKEN", "TOKEN_SECRET",
+            "BASE_URL", "DRY_RUN", "HL_EXEC_MODE")
+
+    def test_real_retry_clears_same_event_and_survives_restart(self):
+        import importlib
+        import os
+        saved = {k: os.environ.get(k) for k in self._ENV}
+        try:
+            import fastapi                                          # noqa: F401
+        except ImportError:
+            self.skipTest("fastapi 未安装（CI 会跑）")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                os.environ.update(
+                    DB_PATH=f"{tmp}/main.db", ENABLE_SCHEDULER="false",
+                    ADMIN_TOKEN="test-admin", TOKEN_SECRET="test-secret",
+                    BASE_URL="https://test.example", DRY_RUN="true")
+                main = importlib.reload(importlib.import_module("app.main"))
+                main.db.log_alert("QQQ", None,
+                                  "mr_action_required:exit_settle_gap:2026-04-17", "A", False)
+                main.db.log_alert("QQQ", None,
+                                  "mr_action_required:exit_settle_gap:2026-04-17", "A", False)
+                main.db.log_alert("QQQ", None,
+                                  "mr_action_required:exit_result_unknown:2026-04-17", "B", False)
+                first = FakeNotifier(ok=True)
+                main.notifier = first
+                main._retry_failed_alerts(limit=1)      # 最新事件 = B
+                self.assertEqual(first.messages, ["B"])
+
+                # 进程重启：关连接、重新装配模块（同一 DB 文件）
+                main.db.conn.close()
+                main = importlib.reload(main)
+                second = FakeNotifier(ok=True)
+                main.notifier = second
+                main._retry_failed_alerts(limit=1)      # 同事件两行 → 只补一次
+                self.assertEqual(second.messages, ["A"])
+                main._retry_failed_alerts(limit=1)      # 不能重放
+                self.assertEqual(second.messages, ["A"])
+                self.assertEqual(main.db.failed_alerts_since(0), [])
+                main.db.conn.close()
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":
