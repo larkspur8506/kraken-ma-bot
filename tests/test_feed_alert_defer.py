@@ -213,6 +213,20 @@ class TestRetryExcludesPending(_Base):
     用一条真正发送失败的 data_error 行做对照，防止断言「 vacuously 通过」。
     """
 
+    def setUp(self):
+        super().setUp()
+        # app.main 在 import 时按 DB_PATH 建库：指向本测试的临时目录，
+        # 否则本地（无 /app 写权限）会在 import 阶段就炸。
+        self._db_path = os.environ.get("DB_PATH")
+        os.environ["DB_PATH"] = str(Path(self.tmp.name) / "main_import.db")
+
+    def tearDown(self):
+        if self._db_path is None:
+            os.environ.pop("DB_PATH", None)
+        else:
+            os.environ["DB_PATH"] = self._db_path
+        super().tearDown()
+
     def test_retry_skips_pending_but_retries_data_error(self):
         from app import main as cma_main
         self.db.log_alert(SYM, None, "data_error_pending", "观察中的行（不该补推）", False)

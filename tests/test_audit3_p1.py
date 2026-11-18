@@ -250,15 +250,20 @@ class TestH2AlertPersistence(P3Base):
         self.p.notify_fills = False
         ex = self.executor()
         ex._alert_fill("【HL执行】✅ 已开仓（成交回报）")
-        rows = [dict(r) for r in self.db.recent_alerts(10) if r["kind"] == "exec_alert_fills"]
+        rows = [dict(r) for r in self.db.recent_alerts(10)
+                if str(r["kind"]).startswith("exec_alert_fills")]
         self.assertTrue(rows, "开关关闭也应落库（审计轨迹）")
         self.assertEqual(rows[0]["sent_successfully"], 1)
+        self.assertTrue(str(rows[0]["kind"]).endswith(":suppressed"),
+                        "关掉推送的成交行要能区别于「已送达」")
 
     def test_retry_whitelist_parsing(self):
-        """main._retry_failed_alerts 的排除名单含 exec_alert_fills（读源码，不 import main）。"""
-        main_py = Path(__file__).resolve().parent.parent / "app" / "main.py"
-        src = main_py.read_text(encoding="utf-8")
-        self.assertIn("exec_alert_fills", src)
+        """补推排除名单在通知边界（app.notify），main 只做装配（读源码，不 import main）。"""
+        root = Path(__file__).resolve().parent.parent / "app"
+        notify_src = (root / "notify.py").read_text(encoding="utf-8")
+        main_src = (root / "main.py").read_text(encoding="utf-8")
+        self.assertIn("exec_alert_fills", notify_src)
+        self.assertIn("retry_failed_alerts", main_src)
 
 
 class TestH3PartialFill(P3Base):

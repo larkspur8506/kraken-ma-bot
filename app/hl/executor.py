@@ -389,18 +389,18 @@ def fmt_entry_alert(coin: str, side: int, sz: float, entry_px: float, stop: floa
     stop_pct = ((stop - entry_px) / entry_px * 100) if entry_px else 0.0
     pct = (risk_u / equity * 100) if equity else 0.0
     return "\n".join([
-        (f"【Kraken】✅ 已开仓 · {coin} {_side_word(side)} 全仓"
+        (f"【Kraken·主腿】✅ 已开仓 · {coin} {_side_word(side)} 全仓"
          if leverage is None else
-         f"【Kraken】✅ 已开仓 · {coin} {_side_word(side)} {leverage:g}x 逐仓"),
+         f"【Kraken·主腿】✅ 已开仓 · {coin} {_side_word(side)} {leverage:g}x 逐仓"),
         "",
         f"成交价    {_fmt_u(entry_px)}",
-        f"数量      {sz:g} {coin}（名义 {_fmt_u(notional, 1)} U）",
+        f"数量      {sz:g} {coin}（名义 {_fmt_u(notional, 1)} USD）",
         f"止损价    {_fmt_u(stop)}（{stop_pct:+.2f}%）",
         ("保证金    — （以交易所为准）" if margin is None
-         else f"保证金    ≈{_fmt_u(margin, 1)} U"),
+         else f"保证金    ≈{_fmt_u(margin, 1)} USD"),
         ("强平价    — （以交易所为准）" if liq is None
          else f"强平价    {_fmt_u(liq)}"),
-        f"风险      {_fmt_u(risk_u)} U（权益的 {pct:.1f}%）",
+        f"风险      {_fmt_u(risk_u)} USD（权益的 {pct:.1f}%）",
         _drift_line(drift, signal_px, signal_age_min),
         f"时间      {when.strftime('%m-%d %H:%M')} {tz_label}",
         f"单号      开仓 {oid} · 止损 {stop_oid}",
@@ -415,7 +415,9 @@ def fmt_exit_alert(coin: str, side: int, entry_px: float, exit_px: float, sz: fl
     if reason == "stop":
         head, why = "🛑 止损离场", "止损单被触发"
     elif reason == "ma20":
-        head = "📈 策略止盈" if net > 0 else ("📉 策略离场" if net < 0 else "➖ 策略离场")
+        # 策略离场是**规则触发**（收盘跌破/站上 SMA20），不是「赚了就叫止盈」：
+        # 标题跟盈亏符号无关，赚亏一律「策略离场」，盈亏另起一行。
+        head = "📉 策略离场"
         why = "收盘跌破 SMA20" if int(side or 1) >= 0 else "收盘站上 SMA20"
     else:
         head, why = "已平仓", str(reason)
@@ -433,12 +435,14 @@ def fmt_exit_alert(coin: str, side: int, entry_px: float, exit_px: float, sz: fl
     except (TypeError, ValueError):
         pass
     lines = [
-        f"【Kraken】{head} · {coin} {_side_word(side)}",
+        f"【Kraken·主腿】{head} · {coin} {_side_word(side)}",
         "",
         f"离场原因  {why}",
         f"平仓价    {_fmt_u(exit_px)}（开仓 {_fmt_u(entry_px)}）",
-        f"本次盈亏  {net:+,.2f} U（{r_multiple:+.2f}R）",
-        f"盈亏构成  价差 {gross_pnl:+,.2f} U · 手续费 {_fmt_u(fees)} U",
+        # 手续费是按费率估的、资金费根本没进这套算法 —— 说清楚，别让「本次盈亏」
+        # 被读成对账后的净额。
+        f"本次盈亏  ≈{net:+,.2f} USD（估算：已扣估算手续费，未计资金费；{r_multiple:+.2f}R）",
+        f"盈亏构成  价差 {gross_pnl:+,.2f} USD · 手续费估算 {_fmt_u(fees)} USD",
     ]
     if hold:
         lines.append(f"持仓时长  {hold}")
@@ -729,12 +733,15 @@ class Executor:
     def _alert_fill(self, text: str) -> None:
         """成交回报（开仓/平仓成功）。受面板「成交回报推送」开关控制；异常类提醒一律走 _alert。
 
-        开关关闭时也落库（kind=exec_alert_fills，不进补推白名单——开关是用户意图），
-        这样 alert_logs 里有完整审计轨迹，且开关重新打开后可见历史。
+        开关关闭时也落库（kind=exec_alert_fills:suppressed，不进补推白名单——开关是用户意图），
+        这样 alert_logs 里有完整审计轨迹，面板按 `:suppressed` 显示「未推送（已关闭）」，
+        且开关重新打开后可见历史。
         """
         if not getattr(self.p, "notify_fills", True):
             try:
-                self.db.log_alert(None, None, "exec_alert_fills", text, True)
+                # `:suppressed` 后缀 = 用户关掉了推送（不是发送成功）：面板据此显示
+                # 「未推送（已关闭）」，补推仍按基名 exec_alert_fills 排除。
+                self.db.log_alert(None, None, "exec_alert_fills:suppressed", text, True)
             except Exception as e:                                   # noqa: BLE001
                 logger.error("[hl-exec] 成交回报落库失败：%s", e)
             return
@@ -750,7 +757,8 @@ class Executor:
         main._retry_failed_alerts 会照常补推。
         """
         ok = False
-        text = _clean_alert_text(text)
+        # Telegram 通道不带 parse_mode：`**粗体**` 会原样显示成星号，推送前统一去掉。
+        text = _clean_alert_text(text).replace("**", "")
         try:
             ok = bool(self.notifier is not None and self.notifier.send_message(text))
         except Exception as e:                                       # noqa: BLE001
@@ -3834,7 +3842,7 @@ class Executor:
         self._event(EV_DECISION,
                     f"{symbol} 止损单在离场撤单时已成交，按成交价 {px:,.2f} 关账",
                     symbol=symbol, data={**event_data, "px": px, "sz": sz})
-        self._alert(f"【Kraken】🛑 止损离场 · {coin} {'做多' if side == 1 else '做空'}\n"
+        self._alert(f"【Kraken·主腿】🛑 止损离场 · {coin} {'做多' if side == 1 else '做空'}\n"
                     f"离场撤单时确认止损单已成交 @ {px:,.2f}，本地已按成交价关账"
                     f"（R {r:+.2f}），未再发平仓单。")
         return True
@@ -3906,7 +3914,7 @@ class Executor:
             # 可能还挂着 stop:fix / exit:rehang 的另一张，仓位没了它们会咬下一笔新仓。
             self._verify_no_residual_stops(row, coin)
             r = self._r_multiple(row, px or ref_price)
-            self._alert(f"【Kraken】🛑 止损离场 · {coin} {'做多' if side == 1 else '做空'}\n"
+            self._alert(f"【Kraken·主腿】🛑 止损离场 · {coin} {'做多' if side == 1 else '做空'}\n"
                         f"止损单已由交易所触发 @ {px or ref_price:,.2f}，本地已关账（R {r:+.2f}）")
             return True
         if reason == "stop" and snap is None:

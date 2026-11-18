@@ -21,6 +21,83 @@ SEND_BACKOFF = (1.0, 3.0)
 WECOM_MAX_BYTES = 1900
 TELEGRAM_MAX_BYTES = 3800
 
+#: 补推白名单的排除项：这些 kind 不是「发送失败」，不该被补推。
+#: （heartbeat/weekly 有各自的静默口径；exec_alert_fills 受面板开关控制；
+#: data_error_pending 是观察期中间态。）
+RETRY_EXCLUDED_KINDS = ("heartbeat", "heartbeat_local", "weekly", "weekly_local",
+                        "exec_alert_fills",
+                        # 观察中的数据源告警：故意不发，不是发送失败，不得补推
+                        "data_error_pending")
+
+
+def plain_text(message: str) -> str:
+    """推送纯文本：`**粗体**` 在 Telegram/企微（都没有 parse_mode）会原样显示星号。
+
+    只去 `**` 这一种 Markdown 强调标记 —— 不改写其它 `*`/`_`/反引号，避免把
+    「2*3」「ETH_USDT」这类正文误伤。
+    """
+    return str(message or "").replace("**", "")
+
+
+def retry_failed_alerts(db, notifier, *, max_age_h: float = 24.0, limit: int = 5,
+                        fill_push: bool = True) -> List[int]:
+    """补推近 `max_age_h` 小时内发送失败的提醒（最多 limit 条/轮），返回成功的行 id。
+
+    - `bar_ms=NULL` 的行不受 UNIQUE 约束，同一事件失败 N 次会留 N 行；按
+      (symbol, kind, bar_ms) 只补推最新一条。
+    - MR 事件（kind 以 `mr_` 开头，事件键就在 kind 里）补推成功后，用
+      `db.mark_alert_kind_sent` 把**同一事件**的旧失败行一起了结：只标本次那一行的话，
+      下一轮补推会把同一条消息再发一遍。
+    - `fill_push=False`：成交回报（`mr_fill*`）不补推 —— 开关是用户意图，不是失败。
+    """
+    sent: List[int] = []
+    rows = db.failed_alerts_since(time.time() - float(max_age_h) * 3600.0)
+
+    def _base(kind) -> str:
+        # `exec_alert_fills:suppressed` 这类带状态后缀的 kind 仍按基名归类
+        return str(kind or "").split(":", 1)[0]
+
+    retry = [r for r in rows if _base(r["kind"]) not in RETRY_EXCLUDED_KINDS]
+    if not fill_push:
+        # 用户此刻关着成交推送：待补推的成交记录就地了结（标 :suppressed），
+        # 否则开关重新打开后会把「用户当时不想看」的旧成交全部补发。
+        for r in retry:
+            if str(r["kind"] or "").startswith("mr_fill"):
+                try:
+                    db.mark_alert_suppressed(int(r["id"]))
+                except Exception:                                # noqa: BLE001
+                    logger.exception("[retry] 成交提醒标记关闭失败：id=%s", r["id"])
+        retry = [r for r in retry if not str(r["kind"] or "").startswith("mr_fill")]
+    seen = set()
+    dedup = []
+    for r in retry:
+        key = (r["symbol"], r["kind"], r["bar_ms"])
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(r)
+    for r in dedup[:max(int(limit), 0)]:
+        text = r["message"] or ""
+        if not text:
+            continue
+        try:
+            ok = bool(notifier and notifier.send_message(plain_text(text)))
+        except Exception:                                        # noqa: BLE001
+            logger.exception("[retry] 补推发送失败")
+            ok = False
+        if not ok:
+            continue
+        db.mark_alert_sent(int(r["id"]))
+        kind = str(r["kind"] or "")
+        if kind.startswith("mr_"):
+            try:
+                db.mark_alert_kind_sent(r["symbol"], kind)
+            except Exception:                                    # noqa: BLE001
+                logger.exception("[retry] 同事件失败行了结失败：%s", kind)
+        sent.append(int(r["id"]))
+        logger.info("补推失败提醒成功：id=%s kind=%s", r["id"], kind)
+    return sent
+
 
 def split_message_chunks(message: str, max_bytes: int) -> List[str]:
     """按行切分，单行超长则硬切（按字节边界安全解码）。"""
@@ -78,7 +155,8 @@ class WeChatNotifier:
     def send_message(self, message: str) -> bool:
         if not self.webhook_url:
             return False
-        for chunk in split_message_chunks(message, WECOM_MAX_BYTES):
+        # 纯文本通道（无 parse_mode）：统一去掉 `**`，别把 Markdown 星号发给用户。
+        for chunk in split_message_chunks(plain_text(message), WECOM_MAX_BYTES):
             if not self._post_chunk(chunk):
                 return False
         return True
@@ -118,7 +196,8 @@ class TelegramNotifier:
     def send_message(self, message: str) -> bool:
         if not self:
             return False
-        for chunk in split_message_chunks(message, TELEGRAM_MAX_BYTES):
+        # 纯文本通道（payload 不带 parse_mode）：统一去掉 `**`，否则星号原样显示。
+        for chunk in split_message_chunks(plain_text(message), TELEGRAM_MAX_BYTES):
             if not self._post_chunk(chunk):
                 return False
         return True

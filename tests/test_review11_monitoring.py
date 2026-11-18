@@ -26,6 +26,24 @@ from tests.test_hl_executor import Base as EntryBase
 from tests.test_review7_mr import (ENTRY_SESSIONS, NOW, Ex, Info, MrBase, make_leg)
 
 
+class AlertSpy:
+    """通知器替身：记录 `_alert` 真正发出去的文本。
+
+    别用 `leg._alert = alerts.append` 做「回调」：`_alert` 是生产告警入口，带
+    `kind/key/fill/dedupe` 等关键字参数，用位置参数签名顶替它 → 一加参数就
+    TypeError，而真实发送路径（落 `alert_logs`、事件键去重、fill_push 开关）
+    反而一行都没被覆盖。走 `notifier` 这个正式注入点，既记文本又跑完整流程。
+    """
+
+    def __init__(self, ok: bool = True):
+        self.ok = ok
+        self.messages = []
+
+    def send_message(self, text):
+        self.messages.append(str(text))
+        return self.ok
+
+
 class DeadmanCapability(EntryBase):
     """死手开关只在 venue 真的支持时才续期/记账。"""
 
@@ -89,20 +107,32 @@ class MrPartialEntry(MrBase):
 
         ex = Ex(info, entry=partial_entry)
         leg = make_leg(self.db, info, ex, clock_ms=NOW)
-        alerts = []
-        leg._alert = alerts.append
+        spy = AlertSpy()
+        leg.notifier = spy
         with patch.object(leg, "_candles", return_value=[{"c": "100"}]), \
                 patch("app.hl.mr.mr_signal.aggregate_sessions_ex",
                       return_value=(ENTRY_SESSIONS, [])):
             res = leg.tick(now_ms=NOW)
 
         self.assertEqual(res["state"], "entered")
+        alerts = spy.messages
         row = self.db.mr_open_trade()
         self.assertIsNotNone(row, "部分成交也必须建台账")
         self.assertAlmostEqual(float(row["qty"]), 6.0, places=9,
                               msg="台账数量取交易所实际持仓，不是计划量")
         self.assertFalse(any("回执失败" in str(a) for a in alerts),
                          "部分成交不是「回执失败」，不许推错告警")
+        # 正常路径必须**推一条成交回报**，且把「计划 vs 实际」写明（只报 6 张
+        # 会被读成按计划满仓）。按文案筛成交回报：夹具的限价离 mid 正好 20bp，
+        # 会额外触发一条滑点停用告警（与本缺陷无关）。
+        fills = [a for a in alerts if "入场成交" in a]
+        self.assertEqual(len(fills), 1, f"部分成交只该有一条成交回报：{alerts}")
+        msg = fills[0]
+        self.assertIn("成交 6", msg)
+        self.assertIn("部分成交", msg)
+        kinds = [str(r["kind"] or "") for r in self.db.recent_alerts(50)]
+        self.assertTrue(any(k.startswith("mr_fill_entry:") for k in kinds),
+                        f"成交回报要落 alert_logs（补推依据）：{kinds}")
         raw = json.loads(row["raw"] or "{}")
         self.assertNotEqual(raw.get("adopt_reason"), "fill_confirmation_lost",
                             "正常部分成交不许被标成「确认丢失后补记」")

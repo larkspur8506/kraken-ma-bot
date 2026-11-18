@@ -592,35 +592,14 @@ def _retry_failed_alerts(max_age_h: float = 24.0, limit: int = 5) -> None:
     背景：_emit 失败不标记幂等，但 set_last_bar 已推进 —— 旧行为下那条 entry/exit
     提醒永久丢失（离场提醒丢 = 闷亏）。这里按 alert_logs 里的失败记录补推，成功后
     更新 sent_successfully（下次不再推）。
+
+    实现放在 `app.notify.retry_failed_alerts`（通知边界）：同一 MR 事件的多条失败行
+    在补推成功后会一起了结，且 fill_push 关着时成交回报不补推。
     """
     try:
-        import time as _time
-        rows = db.failed_alerts_since(_time.time() - max_age_h * 3600)
-        retry = [r for r in rows if (r["kind"] or "") not in ("heartbeat", "heartbeat_local",
-                                                              "weekly", "weekly_local",
-                                                              "exec_alert_fills",
-                                                              # 观察中的数据源告警：故意不发，
-                                                              # 不是发送失败，不得补推
-                                                              "data_error_pending")]
-        # bar_ms=NULL 的行不受 UNIQUE 约束（NULL 互不相等），同一故障可能累积多条
-        # 失败行 —— 按 (symbol, kind) 只补推最新一条，避免同一告警被连发 N 次。
-        _seen: set = set()
-        _dedup = []
-        for r in retry:
-            key = (r["symbol"], r["kind"], r["bar_ms"])
-            if key in _seen:
-                continue
-            _seen.add(key)
-            _dedup.append(r)
-        retry = _dedup
-        for r in retry[:limit]:
-            text = r["message"] or ""
-            if not text:
-                continue
-            ok = bool(notifier and notifier.send_message(text))
-            if ok:
-                db.mark_alert_sent(int(r["id"]))
-                logger.info("补推失败提醒成功：id=%s kind=%s", r["id"], r["kind"])
+        from app.notify import retry_failed_alerts
+        retry_failed_alerts(db, notifier, max_age_h=max_age_h, limit=limit,
+                            fill_push=push_on("fill_push"))
     except Exception as e:                                    # noqa: BLE001
         logger.exception("补推失败提醒异常: %s", e)
 

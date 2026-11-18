@@ -718,6 +718,41 @@ class DB:
         self.conn.commit()
 
     @_locked
+    def mark_alert_kind_sent(self, symbol: Optional[str], kind: str) -> int:
+        """同一事件（symbol+kind）送达后，把它之前的失败行一起了结。
+
+        `bar_ms IS NULL` 的行不受 UNIQUE 约束（NULL 互不相等），同一条事件失败 N 次
+        就会留 N 行 sent=0；后来补发成功时只标记当次那行，旧行仍会被
+        `_retry_failed_alerts` 捞出来再推一遍。这里按事件键一次收口。
+        """
+        cur = self.conn.execute(
+            "UPDATE alert_logs SET sent_successfully=1, sent_at=? "
+            "WHERE symbol IS ? AND kind=? AND sent_successfully=0",
+            (now(), symbol, kind))
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    @_locked
+    def mark_alert_suppressed(self, aid: int) -> bool:
+        """把「用户关掉推送」的提醒就地了结：sent=1 + kind 加 `:suppressed`。
+
+        这不是「发送成功」：不进补推队列（sent=1），也不让面板显示「已送达」；
+        kind 后缀就是给渲染层的标记（无 schema 迁移）。
+        """
+        row = self.conn.execute("SELECT kind FROM alert_logs WHERE id=?",
+                                (int(aid),)).fetchone()
+        if row is None:
+            return False
+        kind = str(row["kind"] or "")
+        if not kind.endswith(":suppressed"):
+            kind += ":suppressed"
+        self.conn.execute(
+            "UPDATE alert_logs SET sent_successfully=1, sent_at=?, kind=? WHERE id=?",
+            (now(), kind, int(aid)))
+        self.conn.commit()
+        return True
+
+    @_locked
     def prune_alert_logs(self, keep_days: float = 60.0, keep_rows: int = 5000) -> None:
         """清 alert_logs：bar_ms=NULL 的超期行 + 超出 keep_rows 的旧行。
 
