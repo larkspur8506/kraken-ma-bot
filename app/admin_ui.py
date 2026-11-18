@@ -98,6 +98,27 @@ _ALERT_KIND_TXT = {
 # （全部可看），所以这里只影响 render_records 的取数切片，不碰 DB 层。
 _ALERT_NOISE_KINDS = ("heartbeat", "heartbeat_local")
 
+# MR 腿的 alert_logs.kind 带事件键（`mr_fill_entry:<trade_id>`、
+# `mr_action_required:<kind>:<signal_date>`）：按前缀给中文名，别把原始 kind 甩给用户。
+_ALERT_KIND_PREFIX_TXT = (
+    ("mr_fill_entry", "MR 入场成交"),
+    ("mr_fill_exit", "MR 离场成交"),
+    ("mr_action_required", "MR 需人工核对"),
+    ("mr_alert", "MR 告警"),
+)
+
+
+def _alert_kind_text(kind) -> str:
+    """alert_logs.kind → 中文（精确映射优先，其次事件键前缀，都没有就原样）。"""
+    k = str(kind or "")
+    if k in _ALERT_KIND_TXT:
+        return _ALERT_KIND_TXT[k]
+    for prefix, label in _ALERT_KIND_PREFIX_TXT:
+        if k.startswith(prefix):
+            return label
+    return k
+
+
 # 执行器事件里同样属例行行的：心跳；「对账一致」是每小时一次的正常回执（reconcile
 # kind 下其余消息都是异常/升级/观察期，必须照常显示），只按消息原文精确匹配。
 _RECONCILE_OK_MSG = "对账一致"
@@ -836,7 +857,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
         msg = str(r.get("message") or "")
         _kind = str(r.get("kind") or "—")
         rows += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
-                 f"<td>{_esc(_ALERT_KIND_TXT.get(_kind, _kind))}</td>"
+                 f"<td>{_esc(_alert_kind_text(_kind))}</td>"
                  # 标的列与消息正文都走交易所侧显示名（记录页不得出现内部合约名，2026-11-07）；
                  # DB 原值不动，只在渲染层换。
                  f"<td>{_esc(_disp(r.get('symbol')) or _coin('', r.get('symbol')) or '—')}</td>"
@@ -1107,7 +1128,7 @@ def _subpage_rows_html(slug: str, rows: List[Dict[str, Any]],
             ok = bool(r.get("sent_successfully"))
             _kind = str(r.get("kind") or "—")
             out += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
-                    f"<td>{_esc(_ALERT_KIND_TXT.get(_kind, _kind))}</td>"
+                    f"<td>{_esc(_alert_kind_text(_kind))}</td>"
                     f"<td>{_esc(_disp(r.get('symbol')) or _coin('', r.get('symbol')) or '—')}</td>"
                     f"<td><span class='{'pos' if ok else 'neg'}'>"
                     f"{'已送达' if ok else '失败'}</span></td>"

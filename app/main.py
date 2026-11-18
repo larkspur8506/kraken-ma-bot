@@ -602,6 +602,11 @@ def _retry_failed_alerts(max_age_h: float = 24.0, limit: int = 5) -> None:
                                                               # 观察中的数据源告警：故意不发，
                                                               # 不是发送失败，不得补推
                                                               "data_error_pending")]
+        if not push_on("fill_push"):
+            # MR 成交回报（kind=mr_fill_entry:<id> / mr_fill_exit:<id>）：用户此刻关掉了
+            # 成交推送 → 补推同样不推。开关是用户意图，不是「失败」，别绕过它。
+            retry = [r for r in retry
+                     if not (r["kind"] or "").startswith("mr_fill")]
         # bar_ms=NULL 的行不受 UNIQUE 约束（NULL 互不相等），同一故障可能累积多条
         # 失败行 —— 按 (symbol, kind) 只补推最新一条，避免同一告警被连发 N 次。
         _seen: set = set()
