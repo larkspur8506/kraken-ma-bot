@@ -24,7 +24,7 @@
   派生（同一轮重放同键，跨轮重试换键 —— 已用过的 cloid 重试会被拒）。
 - **费用**：Kraken 6 级 taker 2.75bp/边（Tier 1 5bp），净盈亏按 `taker_fee_rate`
   ×名义×边数估算入账（fee_quote 列）；funding 取交易所实际值（Kraken 无资金费
-  流水 → 台账按 0 记，但推送明说「不可用、未计入」，不写 funding 0.0% 冒充已知）。
+  流水 → 净盈亏按 0 计；推送与台账 raw 不出现资金费字段，不写 0 冒充已知）。
 - **对账 fail-closed**、**kill/开关只挡入场不挡离场**、**MR 异常不拖死主腿**
   与 Lighter 侧完全一致。
 - **基金级闸门走 `hl_kill`**（2026-11-02 第五轮核对）：执行器的回撤熔断会
@@ -130,9 +130,8 @@ def _price_is_evidence(source: Any) -> bool:
 #: 推送标题：MR 腿与主腿（执行器）各用各的前缀，Telegram 里一眼分清是谁的单。
 MR_TITLE = "【Kraken·MR】"
 
-#: Kraken 的 `KrInfo.funding_supported=False`（无资金费流水，返回 []）：这种「不可用」
-#: 绝不能折算成 `funding 0.0%` —— 那是在说「没花钱」，而事实是「不知道」。
-FUNDING_UNAVAILABLE = "不可用（交易所未提供资金费流水，未计入净盈亏）"
+#: 资金费不可用（Kraken `KrInfo.funding_supported=False`）时推送里资金费整行不出现：
+#: 写 0 等于说「没花钱」，写「未知」对读者没有信息量（2026-11-24 用户拍板）。
 
 #: 「用户关掉成交推送」的行用 kind 后缀标记（alert_logs 无状态列，也不加迁移）：
 #: sent_successfully=1 只表示「这笔不用再管」，面板据此显示「未推送（已关闭）」，
@@ -220,7 +219,7 @@ def _mr_exit_text(*, coin: str, filled: float, ledger_qty: float,
     """MR 离场成交回报：数量/价格/持仓时长/费用与净利口径一次说清。
 
     - 成交数量与台账数量分开写：部分成交/缺口不许被读成「整笔已平」；
-    - funding 不可用（Kraken 无流水）→ 明说不可用，不写 0.0%；
+    - funding 不可用（Kraken 无流水，funding_paid=None）→ 资金费行整行不出、净盈亏括号也不提；
     - 有值时按 `_funding_paid` 既有契约（正=已付出）写「净付/净收」，不改数值；
     - `complete=False`（估算价或缺成交证据）→ 净利标「未完成」并提示核对。
     """
@@ -240,16 +239,14 @@ def _mr_exit_text(*, coin: str, filled: float, ledger_qty: float,
         lines.append(f"{time_label}  {stamp}")
     if float(gap_qty or 0.0) > 1e-9:
         lines.append(f"缺口      {float(gap_qty):g} 张按标记价估算，未计入成交")
+    fund_tail = "" if funding_paid is None else "，含资金费"
     if complete:
-        pnl_tail = ("估算：已扣估算手续费，"
-                    + ("资金费未计入" if funding_paid is None else "含资金费"))
+        pnl_tail = "估算：已扣估算手续费" + fund_tail
     else:
         pnl_tail = (f"估算，未完成：离场价来自 {price_source}，请核对真实成交价；"
-                    "已扣估算手续费，"
-                    + ("资金费未计入" if funding_paid is None else "含资金费"))
-    if funding_paid is None:
-        funding_line = FUNDING_UNAVAILABLE
-    else:
+                    "已扣估算手续费" + fund_tail)
+    funding_line = None
+    if funding_paid is not None:
         # `_funding_paid` 的既有契约是「已付出为正」（正=我们付出去的钱）。
         # Kraken 无资金费流水，无法独立证实方向 ⇒ 只按该契约写「净付/净收」，
         # 不改数值、不改台账口径。
@@ -263,9 +260,10 @@ def _mr_exit_text(*, coin: str, filled: float, ledger_qty: float,
     lines.extend([
         f"净盈亏    ≈{float(net_pnl):+,.2f} USD（{pnl_tail}）",
         f"费用      ≈{float(fee_est):,.2f} USD（按 taker 费率估算）",
-        f"资金费    {funding_line}",
-        f"信号日    {signal_date}",
     ])
+    if funding_line is not None:
+        lines.append(f"资金费    {funding_line}")
+    lines.append(f"信号日    {signal_date}")
     if note:
         lines.append(f"说明      {note}")
     return "\n".join(lines)
@@ -1112,8 +1110,11 @@ class HlMrLeg:
             "settled_qty": covered, "gap_qty": gap if abs(gap) > tol else 0.0,
             "fee_est": fee_est, "net_pnl": net_pnl,
             "net_pnl_complete": complete,
-            "funding_paid_usdc": float(funding_paid or 0.0),
         })
+        if funding_paid is None:
+            raw.pop("funding_paid_usdc", None)
+        else:
+            raw["funding_paid_usdc"] = float(funding_paid)
         if recon is not None:
             raw["reconciliation"] = recon
         if extra:
@@ -2036,7 +2037,14 @@ class HlMrLeg:
                 # 停用期间过期的信号不补 SKIPPED（第五轮去噪）。
                 continue
             if self.db.mr_trade_by_signal(s.date) is None:
-                self.db.mr_mark_skipped(s.date, "窗口错过（停机/延迟）")
+                reason = SKIP_WINDOW_MISSED
+                try:
+                    trades = self.db.mr_recent_trades(50)
+                except Exception:                             # noqa: BLE001
+                    trades = []
+                if _slot_occupied(trades, s.date):
+                    reason = SKIP_SLOT_OCCUPIED
+                self.db.mr_mark_skipped(s.date, reason)
 
     # ------------------------------------------------------------------ 离场
 
@@ -2524,6 +2532,38 @@ class HlMrLeg:
         except Exception as exc:                              # noqa: BLE001
             logger.warning("mr: funding history failed: %s", exc)
             return None
+
+
+#: SKIPPED 的两种原因：真漏单（停机/延迟）与单槽占用（持仓期间的信号，设计内不开仓）。
+SKIP_WINDOW_MISSED = "窗口错过（停机/延迟）"
+SKIP_SLOT_OCCUPIED = "单槽占用（持仓期间的信号，按设计不开仓）"
+
+
+def _slot_occupied(trades: Any, signal_date: str) -> bool:
+    """信号日是否落在某笔 MR 仓位的持仓区间 [entry_session, exit_signal_date) 内。
+
+    单槽：持仓期间 `_tick_inner` 不评估入场，这些信号平仓后才由 `_mark_expired_signal`
+    补记 SKIPPED —— 不是停机漏单。exit_signal_date 当天的信号不算占用（当晚已平，次日
+    窗口槽位空闲）；OPEN 行右端开放；CLOSED 但缺 exit_signal_date 的行不参与判断
+    （退回旧文案，宁可不归因也不误归因）。只改审计原因文本，不影响任何交易动作。
+    """
+    d = str(signal_date or "")
+    if not d:
+        return False
+    for t in trades or []:
+        try:
+            state = str(t["state"] or "")
+            start = str(t["entry_session"] or "")
+            end = str(t["exit_signal_date"] or "")
+        except (KeyError, IndexError, TypeError):
+            continue
+        if not start:
+            continue
+        if state == "OPEN" and d >= start:
+            return True
+        if state == "CLOSED" and end and start <= d < end:
+            return True
+    return False
 
 
 def _raw_dict(row: Any) -> Dict[str, Any]:
