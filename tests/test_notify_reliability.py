@@ -9,7 +9,7 @@
   * 成交回报（MR 入场/离场）受面板 `fill_push` 控制：关 = 只落库不推送（记成功，
     不进补推队列）；开 = 正常推送，失败进补推队列；
   * 文案：`【Kraken·主腿】` / `【Kraken·MR】` 标题、策略离场与盈亏符号无关、
-    无 Markdown `**`、Kraken funding 明确「不可用」、USD 计价。
+    无 Markdown `**`、Kraken funding 不可用时整行不出现、USD 计价。
 """
 
 from __future__ import annotations
@@ -214,7 +214,7 @@ class TestMrCloseAlertContent(unittest.TestCase):
             equity_at_entry=500.0)
         return leg.tick(now_ms=EXIT_NOW_MS)
 
-    def test_funding_unavailable_is_stated_not_zero_percent(self):
+    def test_funding_unavailable_is_omitted_not_zero_percent(self):
         with tempfile.TemporaryDirectory() as tmp:
             n = FakeNotifier(ok=True)
             leg, db, ex, info = _leg(tmp, notifier=n, mr_szi="2.68", mid=95.5)
@@ -223,9 +223,11 @@ class TestMrCloseAlertContent(unittest.TestCase):
             self.assertEqual(status["state"], "exited")
             msg = n.messages[-1]
             self.assertIn("【Kraken·MR】", msg)
-            self.assertIn("不可用", msg)
-            self.assertIn("未计入", msg)
+            # 2026-11-24 用户拍板：资金费不可用时推送里整行不出现（不写「不可用」也不写 0）
+            self.assertNotIn("资金费", msg)
             self.assertNotIn("0.0%", msg, "不可用不能写成 funding 0.0%")
+            raw = db.mr_recent_trades(1)[0]["raw"] or ""
+            self.assertNotIn("funding_paid_usdc", raw, "不可用时台账 raw 不写 0.0")
             self.assertNotIn("USDC", msg, "Kraken 侧金额用 USD")
             self.assertIn("USD", msg)
 
@@ -309,9 +311,9 @@ class TestMainLegFillTitles(unittest.TestCase):
             self.assertIn("【Kraken·主腿】", txt)
             self.assertNotIn("**", txt)
             self.assertNotIn("USDC", txt)
-            # 主腿净额是估算口径：手续费为估算、资金费未计入
+            # 主腿净额是估算口径：手续费为估算；资金费不可用时推送里不出现
             self.assertIn("已扣估算手续费", txt)
-            self.assertIn("未计资金费", txt)
+            self.assertNotIn("未计资金费", txt)
             self.assertIn("手续费估算", txt)
 
     def test_stop_exit_title_is_main_leg(self):

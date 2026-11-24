@@ -439,9 +439,9 @@ def fmt_exit_alert(coin: str, side: int, entry_px: float, exit_px: float, sz: fl
         "",
         f"离场原因  {why}",
         f"平仓价    {_fmt_u(exit_px)}（开仓 {_fmt_u(entry_px)}）",
-        # 手续费是按费率估的、资金费根本没进这套算法 —— 说清楚，别让「本次盈亏」
-        # 被读成对账后的净额。
-        f"本次盈亏  ≈{net:+,.2f} USD（估算：已扣估算手续费，未计资金费；{r_multiple:+.2f}R）",
+        # 手续费是按费率估的 —— 说清楚，别让「本次盈亏」被读成对账后的净额。
+        # Kraken 无资金费流水：推送里不提资金费（2026-11-24 用户拍板）。
+        f"本次盈亏  ≈{net:+,.2f} USD（估算：已扣估算手续费；{r_multiple:+.2f}R）",
         f"盈亏构成  价差 {gross_pnl:+,.2f} USD · 手续费估算 {_fmt_u(fees)} USD",
     ]
     if hold:
