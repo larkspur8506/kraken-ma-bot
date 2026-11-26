@@ -323,7 +323,7 @@ class TestShortRowWarnGate(unittest.TestCase):
     def test_dense_and_below_ma200_warns(self):
         card = self.short_row(self.render([self.row(dense_cnt=9, price=100_000.0,
                                                     sma200=101_000.0)]))
-        self.assertIn(f"{WARN}+0.4%</b>", card)
+        self.assertIn(f"{WARN}-0.4%</b>", card)
 
     def test_dense_but_price_at_or_above_ma200_never_warns(self):
         # 价格已回到 MA200 上方（距下轨仍 0.4%）→ 不开空 → 不亮琥珀
@@ -332,7 +332,7 @@ class TestShortRowWarnGate(unittest.TestCase):
                 card = self.short_row(self.render([self.row(dense_cnt=9, price=100_000.0,
                                                             sma200=ma200)]))
                 self.assertNotIn('class="warn"', card)
-                self.assertIn("还差 <b>+0.4%</b>", card, "距离照样显示，只是不亮琥珀")
+                self.assertIn("还差 <b>-0.4%</b>", card, "距离照样显示，只是不亮琥珀")
 
     def test_price_equal_ma200_boundary_is_not_short(self):
         # 严格小于：现价 == MA200 不算「在 MA200 下方」（与 strategy 的收盘 < SMA200 同向）
@@ -374,7 +374,7 @@ class TestShortRowWarnGate(unittest.TestCase):
         # ① 离场行不受 MA200 与 dense 影响（持仓只判 4h 收盘破线）
         rows = [self.row(position_side=1, sma20=99_500.0, dense_cnt=None, sma200=101_000.0)]
         html = self.render(rows)
-        self.assertIn(f"{WARN}+0.5%</b>", html[html.index("距自动离场线"):])
+        self.assertIn(f"{WARN}-0.5%</b>", html[html.index("距自动离场线"):])
         self.assertNotIn("下破开空", html, "持仓标的只给离场线")
 
 

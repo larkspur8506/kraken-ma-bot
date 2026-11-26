@@ -164,7 +164,7 @@ TABS: Tuple[Tuple[str, str], ...] = (
 )
 _TAB_KEYS = tuple(k for k, _ in TABS)
 _MODE_TXT = {"off": "只通知", "dry": "影子", "live": "实盘"}
-_MODE_CLS = {"off": "muted", "dry": "warn", "live": "neg"}
+_MODE_CLS = {"off": "muted", "dry": "warn", "live": "live"}   # 与 views 同口径
 _PURPOSE_TXT = {"entry": "开仓", "stop": "止损", "exit": "平仓"}
 _ORDER_ST_TXT = {"intent": "待发", "planned": "计划", "sent": "已发", "resting": "挂单",
                  "filled": "成交", "cancelled": "撤单", "failed": "失败", "skipped": "跳过"}
@@ -1474,10 +1474,10 @@ th,td{padding:6px 8px}
 .chk{display:flex;align-items:center;gap:8px;font-size:13px;margin:7px 0}
 .chk input{width:17px;height:17px;accent-color:var(--btn)}
 .banner.ok{border-color:var(--okb-line);background:var(--okb-bg);color:var(--okb-fg)}
-.card.danger{border:2px solid #b91c1c}
+.card.danger{border:2px solid var(--neg)}
 button{display:inline-block;background:var(--btn);color:#fff;border:0;border-radius:6px;
        padding:9px 15px;font-size:13.5px;cursor:pointer;margin:6px 8px 0 0}
-button.gray{background:var(--btn-gray)}button.red{background:#b91c1c}
+button.gray{background:var(--btn-gray)}button.red{background:var(--neg)}
 @media (max-width:640px){body{padding:9px;font-size:13px}h1{font-size:17px}
    .badge{padding:5px 9px;font-size:11.5px}h2{font-size:13px}
    .grid{grid-template-columns:1fr}table{font-size:13px}th,td{padding:5px 7px}}
@@ -1555,7 +1555,7 @@ def _status_strip(p: dict) -> str:
         # 数据新鲜度（阶段 B）：读数来自调度器快照时标出「几秒/几分钟前」，
         # 实时读取时不渲染（避免正常态多一个恒为「0 秒」的噪音徽章）。
         _panel_age_badge(p.get("panel_age_s")),
-        _badge("muted", "更新", _ts(p.get("ts")), "", "badge-small"),
+        _badge("muted", "更新（北京）", _ts(p.get("ts")), "", "badge-small"),
     ]
     return ("<div class='bar'>"
             + "<span class='bar-primary'>" + "".join(primary) + "</span>"
@@ -2049,6 +2049,10 @@ def _token_of(deps: AdminDeps) -> str:
     return ""
 
 
+#: 总览自动刷新间隔（秒）。
+OVERVIEW_REFRESH_S = 60
+
+
 def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
           theme: str = DEFAULT_THEME, rows_n: int = DEFAULT_ROWS) -> HTMLResponse:
     label = dict(TABS).get(tab, "总览")
@@ -2058,15 +2062,19 @@ def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
     attr = theme_attr(theme)
     attr_html = f" data-theme='{attr}'" if attr else ""
     from app.hl.views import THEME_CSS
+    # 总览零 JS 自动刷新：读数本来就是调度器每 5 分钟一轮的快照，60s 足够；
+    # 设置页（写表单）与记录页（翻页/筛选）不刷，避免打断输入或跳页。
+    refresh_meta = (f"<meta http-equiv='refresh' content='{OVERVIEW_REFRESH_S}'>"
+                    if tab == "overview" else "")
     return HTMLResponse(
         f"<!doctype html><html lang='zh-CN'{attr_html}><head><meta charset='utf-8'>"
         f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"{ICON_LINKS}"
+        f"{refresh_meta}{ICON_LINKS}"
         f"<title>{PRODUCT_NAME} · {label}</title>{THEME_CSS}{DASH_CSS}{ADMIN_CSS}</head>"
         f"<body><div class='wrap'>{H1_BLOCK}"
         f"{strip_html}{_tabs_html(tab, token)}{banner}{body_html}"
         f"{theme_switch_html(tab, theme, token)}"
-        f"{rows_switch_html(tab, rows_n, token)}"
+        f"{rows_switch_html(tab, rows_n, token) if tab == 'records' else ''}"
         "<div class='foot'><span class='muted'>手机可用 · 无外部资源 · "
         "面板只读，不持私钥</span></div></div></body></html>")
 
