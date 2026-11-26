@@ -72,7 +72,8 @@ _DAY = 86400.0
 MAINNET_DEFAULT = "https://futures.kraken.com"   # 线上 venue（Kraken 期货）；HL 只在历史分支里
 
 _MODE_TXT = {"off": "只提醒", "dry": "影子", "live": "实盘"}
-_MODE_CLS = {"off": "muted", "dry": "warn", "live": "neg"}
+# live 用强调蓝 .live（第十三轮：红点 .neg 与「异常」同色，扫一眼像出故障）
+_MODE_CLS = {"off": "muted", "dry": "warn", "live": "live"}
 # 信号表状态 → 中文（_signals_html 用；记录页复用同一映射）
 _ST_TXT = {"pending": "待确认", "open": "持仓中", "closed": "已平仓", "ignored": "已忽略"}
 
@@ -1676,7 +1677,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica N
 h1{font-size:19px;margin:0 0 2px;font-weight:600}
 /* 头部副题（P3 命名重设计）：h1 下一行 muted 小字，一句话说清标的/周期/交易所。 */
 .h1sub{margin:0 0 10px;font-size:12px;color:var(--muted)}
-h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
+h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:.5px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px}
 .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
 .badge{display:inline-flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);
@@ -1692,7 +1693,7 @@ h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
 .badge-small{padding:2px 9px;font-size:11px;gap:5px;color:var(--muted)}
 .badge-small b{font-size:11.5px;color:var(--fg)}
 .badge-small .muted{font-size:11px}
-.sec{font-size:11px;color:var(--muted);letter-spacing:1.5px;margin-bottom:8px}
+.sec{font-size:11px;color:var(--muted);letter-spacing:.5px;margin-bottom:8px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:2px 20px}
 /* 三标的横向对比（P1-1）：三张 .sym 卡在桌面端一行 3 列等宽。
    为什么不直接改 .grid：执行器卡等其它块也用 .grid（auto-fit minmax(220px)），
@@ -1721,7 +1722,7 @@ h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
 /* 卡内的句子行（原因 / 闸门异常 / 待确认提示）：与 .kv 的「键→数字」两列区分开，
    整句折行、不抢现价的视觉重量。 */
 .whyline{margin-top:4px;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
-.pos{color:var(--pos)}.neg{color:var(--neg)}.warn{color:var(--warn)}.muted{color:var(--muted);font-size:12px}
+.pos{color:var(--pos)}.neg{color:var(--neg)}.warn{color:var(--warn)}.live{color:var(--link)}.muted{color:var(--muted);font-size:12px}
 .kv[data-role='sym-conclusion']{margin-top:7px;padding:5px 0;border-top:1px solid var(--line2);border-bottom:1px solid var(--line2)}
 .kv[data-role='sym-conclusion'] .k{font-weight:600;color:var(--fg)}
 .kv[data-role='sym-conclusion'] .v b{font-weight:700}
@@ -1809,10 +1810,6 @@ details.card>summary{font-size:12px;color:var(--h2)}
 /* 横幅窄屏（≤640px）：单独成块，不与下面那块公共窄屏规则混在一起 ——
    横幅的尺寸只属于横幅，改横幅时不必动别的区块的 media query。
    不加任何 nowrap / 固定宽度，靠 .acct-top 的 flex-wrap 自然折行，390px 不横向溢出。 */
-@media (max-width:640px){
-    .acct-banner{padding:9px 11px 5px}
-    .acct-banner .acct-top{gap:0 18px}
-    .acct-banner .acct-top b{font-size:17px}}
 /* 仓位表窄屏适配（P2）：小字行 tr.subm 默认隐藏（宽屏 13 列齐全）；≤640px 时
    隐藏 .hidem 列、显示小字行 —— 显隐只靠 CSS media query，零 JS。 */
 tr.subm{display:none}
@@ -1821,6 +1818,9 @@ tr.subm td{white-space:normal;font-size:11px;line-height:1.4;color:var(--muted);
 /* 空仓引导卡（P0-3）：空仓时替代表格 —— 说清「在等什么、离触发线还差多远」。
    有仓时整块不渲染，所以这些规则不会影响仓位表。 */
 .card-empty-state{text-align:center;padding:24px}
+.empty-line{font-size:13px;line-height:1.6;padding:10px 14px}
+.exec-line{font-size:12.5px;padding:8px 14px}
+.exec-line b{font-variant-numeric:tabular-nums}
 .card-empty-state h3{font-size:15px;margin:0;font-weight:600}
 .empty-icon{font-size:48px;margin-bottom:12px;line-height:1}
 .empty-desc{font-size:13px;color:var(--muted);margin:12px 0}
@@ -1915,7 +1915,7 @@ def _sym_state_word(side: Any, dense: Any) -> tuple:
 
 
 def _sym_row(label: str, title: str, need: Optional[float], line: Any,
-             allow_warn: bool = True) -> str:
+             allow_warn: bool = True, down: bool = False, note: str = "") -> str:
     """距离行：`还差 +X.X%`（0<need<1% 且 allow_warn 时标 warn + 悬停「接近触发」）/
     `待收盘判定`，百分比之后跟触发线价格（价格格式复用面板 _fmt 口径）。
 
@@ -1929,13 +1929,17 @@ def _sym_row(label: str, title: str, need: Optional[float], line: Any,
     口径细节原来靠脚注数字 ①②③ 指向图例行；图例行删除（2026-10-29）后脚注失去
     指向，悬停解释移到行标签自身，数字不再渲染。
     """
-    line_txt = f" <span class=\"muted\">线 {_fmt(line)}</span>"
+    # down=True：触发需要**价格下跌**（持多离场 / 下破开空）→ 显示负号，免得把「还差 +1%」
+    # 读成要涨。_need_pct 仍返回正的「所需幅度」，这里只换展示符号，不改判定与琥珀门槛。
+    # note：行尾补一句前置条件（如 MA200 过滤未满足），纯展示。
+    line_txt = f" <span class=\"muted\">线 {_fmt(line)}</span>{note}"
     if need is None or need <= 0:
         val = f"<span class=\"muted\">待收盘判定</span>{line_txt}"
     else:
         cls = (f" class=\"warn\" title=\"{_NEAR_TITLE}\"" if allow_warn and need < 1.0
                else "")
-        val = f"还差 <b{cls}>{need:+.1f}%</b>{line_txt}"
+        shown = -need if down else need
+        val = f"还差 <b{cls}>{shown:+.1f}%</b>{line_txt}"
     return (f"<div class=\"kv\" data-role=\"sym-conclusion\"><span class=\"k\" title=\"{_esc(title)}\">{label}"
             f"</span><span class=\"v\">{val}</span></div>")
 
@@ -2215,7 +2219,7 @@ def _sym_card(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]] = None,
             need = _need_pct("exit_short" if side < 0 else "exit_long", price, r.get("sma20"))
             if need is not None:
                 o.append(_sym_row("距自动离场线", _EXIT_TITLE[-1 if side < 0 else 1],
-                                  need, r.get("sma20")))
+                                  need, r.get("sma20"), down=side > 0))
         else:
             # 入场行的琥珀门槛：
             #   上破开多：密集满 6 根（做多无 MA200 过滤）。
@@ -2232,8 +2236,12 @@ def _sym_card(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]] = None,
                                   allow_warn=dense_ok))
             need = _need_pct("break_down", price, r.get("short_trigger"))
             if need is not None:
+                # MA200 前置：现价不在 MA200 下方时，跌破下轨也不会开空 —— 写明，
+                # 否则「还差 −1%」会被读成「离开空只差 1%」。ma200 缺失不下结论、不加注。
+                ma_note = (' <span class="muted">· 现价在 MA200 上方，暂不开空</span>'
+                           if ma200 is not None and price >= ma200 else "")
                 o.append(_sym_row("下破开空", _SHORT_TITLE, need, r.get("short_trigger"),
-                                  allow_warn=short_ok))
+                                  allow_warn=short_ok, down=True, note=ma_note))
     o.append(_reason_line(r))
     o.extend(_gate_lines(r))
     # 数据源 / 已处理到小字行（P2 合并）：放在该标的块末尾、原因/闸门异常行之后。
@@ -2776,7 +2784,10 @@ def _perf_line_html(p: dict) -> str:
              if u_txt != "—" else "")
     if n <= 0 or avg_r is None:
         # N=0 不除零、不编数；U 对照仍要出现（「累计已实现」全页唯一出处在这行）。
-        return f"<div class=\"legend\">上线以来：暂无已平仓记录{u_seg}</div>"
+        # 第十三轮：0 笔策略平仓却有累计已实现，口径不同（后者是全部成交的交易所
+        # closedPnl，含验收/演练等非策略单），注明以免读成矛盾。
+        note = (" <span class='muted'>（全部成交口径，含非策略单）</span>" if u_seg else "")
+        return f"<div class=\"legend\">上线以来：暂无已平仓记录{u_seg}{note}</div>"
     total_r = _num(perf.get("total_r"))
     wins = int(_num(perf.get("wins")))
     win_rate = _num(perf.get("win_rate"))
@@ -2857,73 +2868,15 @@ def _empty_positions_html(p: dict, reachable: bool) -> str:
                 "<p>恢复读取后本卡自动换成实时状态 · 信号 / 下单 / 成交见「记录」页</p>"
                 "</div></div>")
 
+    # 第十三轮 UX：空仓引导卡缩成一行。触发距离只在下方「标的动态」三张卡里出现一次
+    # （原先引导卡与标的卡同屏两份同样的数），首屏把位置让给三标的卡。
     rows = [_as_dict(x) for x in _as_list(p.get("symbol_state"))]
-    # 现价同源（N2）：_merged_cards 是「why 现价优先、symbol_state 兜底」的收敛点，
-    # 也就是「标的动态」大字卡显示的那个数 —— 从这里取，同屏才不会出现
-    # 74,407（why） vs 74,416（signal tick 缓存）两个现价。
-    # 触发线仍然只取 symbol_state 的 long/short_trigger（策略唯一出处，不从这里换源）。
-    px_by_sym: Dict[str, Optional[float]] = {}
-    px_by_coin: Dict[str, Optional[float]] = {}
-    for c in _merged_cards(p):
-        cpx = _opt_num(c.get("price"))
-        if cpx is None:
-            continue
-        csym = str(c.get("symbol") or "").strip()
-        ccoin = str(c.get("coin") or "").strip().upper()
-        if csym:
-            px_by_sym[csym] = cpx
-        if ccoin:
-            px_by_coin[ccoin] = cpx
     coins = [str(r.get("coin") or _disp(r.get("symbol")) or "").strip() for r in rows]
     coins = [c for c in coins if c]
     watch = " / ".join(coins) if coins else "—"
-
-    items: List[str] = []
-    for r in rows:
-        coin = str(r.get("coin") or _disp(r.get("symbol")) or "").strip()
-        if not coin:
-            continue
-        # 现价取同源值（N2）：先按 symbol 命中，再按 coin 兜一次，最后才退回本行缓存
-        # （why 行缺这个标的时 _merged_cards 本来就兜到 symbol_state，这里只是双保险）。
-        sym = str(r.get("symbol") or "").strip()
-        px = px_by_sym.get(sym)
-        if px is None:
-            px = px_by_coin.get(coin.upper())
-        if px is None:
-            px = _opt_num(r.get("price"))
-        parts = [f"<span class='coin'>{_esc(coin)}</span>"]
-        # (标签, 到位文案, 颜色, 所需幅度)：上破绿 / 下破红，与全站方向配色一致
-        for label, hit, cls, need in (
-                ("上破还差", "已上破", "pos",
-                 _need_pct("break_up", px, r.get("long_trigger"))),
-                ("下破还差", "已下破", "neg",
-                 _need_pct("break_down", px, r.get("short_trigger")))):
-            parts.append(f"<span class='trigger-label'>{label}</span>")
-            if need is None:
-                # 触发线没算/没缓存：如实「—」，不拿 0 代替
-                parts.append("<span class='trigger-val muted'>—</span>")
-            elif need <= 0:
-                parts.append(f"<span class='trigger-val {cls}'>{hit}</span>")
-            else:
-                parts.append(f"<span class='trigger-val {cls}'>{need:+.1f}%</span>")
-        # 现价不再在引导卡里重复一遍（N3）：三标的大字卡就在下方，同屏出现两个现价
-        # 只是噪音（历史上还因数据源不同打过架）。引导卡只回答「还差多远」。
-        items.append("<div class='trigger-item'>" + "".join(parts) + "</div>")
-
-    trig_html = ("<div class='empty-triggers'>" + "".join(items) + "</div>"
-                 if items else
-                 "<div class='empty-triggers'><span class='muted'>"
-                 "行情缓存暂无记录，下一轮 tick 后显示距离</span></div>")
-    return ("<div class='card card-empty-state'>"
-            "<div class='empty-icon'>&#128269;</div>"
-            f"<h3>正在监控 {_esc(watch)}</h3>"
-            "<div class='empty-desc'>"
-            "<p>策略：4h 密集突破自动开仓</p>"
-            "<p>等待：6 均线密集满 6 根 + 收盘突破触发线</p>"
-            "</div>"
-            + trig_html +
-            "<div class='empty-desc'><p>"
-            "<span class='muted'>信号 / 下单 / 成交见「记录」页</span></p></div>"
+    return ("<div class='card empty-line'>"
+            f"<b>空仓</b> · 正在监控 {_esc(watch)} · 等待 6 均线密集满 6 根 + 4h 收盘突破触发线"
+            "<span class='muted'> · 触发距离见下方各标的卡 · 信号 / 下单 / 成交见「记录」页</span>"
             "</div>")
 
 
@@ -2999,7 +2952,7 @@ def _render_body(p: dict) -> str:
                           lat_title, "badge-small"))
     # API 有效期徽章（P3 R3）：唯一常驻出处（原「API 有效期」卡降级为总览末尾的 details）。
     o.append(_agent_badge_html(p.get("agent"), "badge-small"))
-    o.append(_strip_badge("muted", "更新", _fmt_dt(p.get("ts")),
+    o.append(_strip_badge("muted", "更新（北京）", _fmt_dt(p.get("ts")),
                           "本页数据的生成时刻（北京时间）", "badge-small"))
     o.append("</span>")
     o.append("</div>")
@@ -3313,11 +3266,11 @@ def _render_body(p: dict) -> str:
     # 渲染函数保留为 _signals_html（记录页复用它，两边长得一样）。
     base_txt = str(net.get("base_url") or "—").replace("https://", "").replace("http://", "")
     o.append("<h2>执行器</h2>")
-    o.append("<div class='card'><div class='grid'>")
-    o.append(_kv("执行器最后事件", _fmt_dt(system.get("executor_last_event_at"))))
-    o.append("</div>")
-    o.append(f"<div class='muted'>交易所 {_esc(base_txt)} · "
-             f"{'测试网' if net.get('testnet') else '主网'}</div>")
+    # 第十三轮：只剩一条判活读数，原 grid+kv 两行收成一行，不再占一张高卡。
+    o.append("<div class='card exec-line'>")
+    o.append(f"执行器最后事件 <b>{_esc(_fmt_dt(system.get('executor_last_event_at')))}</b>"
+             f" <span class='muted'>· 交易所 {_esc(base_txt)} · "
+             f"{'测试网' if net.get('testnet') else '主网'}</span>")
     # P2：原「数据源健康」「已处理到」两张表已整块删除（不是折叠）—— 每标的数据源
     # 状态由「标的动态」卡在该标的名下的小字行承载（见 _feed_line，2026-10-29 起
     # 正常态不渲染、仅源失败时出现）。

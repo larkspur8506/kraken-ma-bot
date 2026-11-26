@@ -227,16 +227,16 @@ class TestRenderBlock(unittest.TestCase):
         self.assertIn('<span class="k" title="4h 收盘突破该线即入场（需均线密集满 6 根）">上破开多</span>',
                       card)
         self.assertIn("还差 <b>+5.0%</b> <span class=\"muted\">线 105,000.00</span>", card)
-        # 下破开空 = (100000-94000)/100000 = +6.0%
+        # 下破开空 = (100000-94000)/100000 = +6.0%，展示为 −6.0%（需下跌）
         self.assertIn('<span class="k" title="收盘跌破该线且在 MA200 下方才开空">下破开空</span>', card)
-        self.assertIn("还差 <b>+6.0%</b> <span class=\"muted\">线 94,000.00</span>", card)
+        self.assertIn("还差 <b>-6.0%</b> <span class=\"muted\">线 94,000.00</span>", card)
 
     def test_near_trigger_gets_warn_class_and_title(self):
         # 入场行：密集满 6 根（入场前提成立）→ 0.5% 才标 warn
         card = sym_card(self.render([self.row(dense_cnt=6, long_trigger=100_500.0)]), "BTC")
         self.assertIn('<b class="warn" title="接近触发（按收盘判定）">+0.5%</b>', card)
         # 远的那条不加 warn
-        self.assertIn("还差 <b>+6.0%</b>", card)
+        self.assertIn("还差 <b>-6.0%</b>", card)
 
     def test_entry_row_without_full_squeeze_never_warns(self):
         # 密集不满 6 根（4/0/NULL）时，即使距离 0.5% 也不加 warn：
@@ -247,14 +247,14 @@ class TestRenderBlock(unittest.TestCase):
                                                      long_trigger=100_500.0,
                                                      short_trigger=99_600.0)]), "BTC")
                 self.assertIn("还差 <b>+0.5%</b>", card)          # 上破开多 +0.5%
-                self.assertIn("还差 <b>+0.4%</b>", card)          # 下破开空 +0.4%
+                self.assertIn("还差 <b>-0.4%</b>", card)          # 下破开空 +0.4%
                 self.assertNotIn('class="warn"', card)
 
     def test_position_exit_row_warns_without_dense(self):
         # ① 离场行不受 dense 影响：距自动离场线 0.5% → 仍标 warn（离场只看收盘破线）
         card = sym_card(self.render([self.row(position_side=1, sma20=99_500.0,
                                               dense_cnt=None)]), "BTC")
-        self.assertIn('<b class="warn" title="接近触发（按收盘判定）">+0.5%</b>', card)
+        self.assertIn('<b class="warn" title="接近触发（按收盘判定）">-0.5%</b>', card)
         # 同卡片里没有入场行（持仓标的只给离场线）
         self.assertNotIn("上破开多", card)
 
@@ -293,7 +293,7 @@ class TestRenderBlock(unittest.TestCase):
         long_card = sym_card(self.render([self.row(position_side=1, sma20=97_000.0)]), "BTC")
         self.assertIn("距自动离场线", long_card)
         self.assertIn("按 4h 收盘判定，非盘中触发：收盘跌破该线即自动平仓", long_card)
-        self.assertIn("还差 <b>+3.0%</b> <span class=\"muted\">线 97,000.00</span>", long_card)
+        self.assertIn("还差 <b>-3.0%</b> <span class=\"muted\">线 97,000.00</span>", long_card)
         self.assertNotIn("上破开多", long_card)
         self.assertNotIn("下破开空", long_card)
 
